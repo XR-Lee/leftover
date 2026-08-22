@@ -1,0 +1,123 @@
+# ~/.config/leftover/leftover.toml
+# Everything here is optional - leftover ships working defaults for all four CLIs.
+
+[leftover]
+default_workdir   = "~/code"   # where agents start; change live with /cd
+transcript_turns  = 24         # how much group history each agent sees
+auto_reply        = false      # true = agents answer in groups without an @mention
+stream_edit_interval = 1.5     # seconds between Telegram message edits
+max_parallel      = 4
+debate_rounds     = 1         # one parallel argument round, then a judge
+debate_turn_timeout = 180     # cap each advocate/judge slot in seconds
+debate_judge_key  = "cursor"  # lower-latency default; explicit @names win
+
+[routing]
+# leftover uses lag_waste for the coding pool. agora telegram still defaults
+# to headroom unless you change this.
+#   lag_waste spend the window that is most behind / about to reset unused
+#   headroom  pick whoever has the most quota left
+#   order     always try `order` top to bottom
+#   cheapest  light-tier agents first, escalate on refusal
+#   sticky    stay with whoever answered last
+strategy = "lag_waste"
+order = ["gpt", "grok", "cursor", "claude"]
+coding_keys = ["gpt", "grok", "cursor"]
+plan_key = "claude"
+cu_key = "gpt"
+lag_weight = 0.5
+waste_weight = 1.0
+max_attempts = 3          # quick failures tried; turn/idle timeout stops immediately
+continuation_guard = true # failover prompt: previous agent may have dirty files (usher)
+
+# Circuit breaker for agents that keep breaking (not quota - actual failures).
+trip_after = 2            # consecutive failures before benching it
+base_cooldown = 120       # seconds; doubles on each further trip
+max_cooldown = 3600
+auth_cooldown = 900       # a login problem will not fix itself in a minute
+quota_blind_cooldown = 1800   # "out of quota" with no reset time attached
+
+# Scoring weights for strategy = "headroom".
+headroom_weight = 1.0
+priority_weight = 0.3
+cheap_bonus = 0.0         # raise above 0 to prefer light agents while they last
+latency_weight = 0.2
+failure_penalty = 0.25
+quota_ttl = 300           # seconds to reuse a quota snapshot (5 min)
+quota_probe_timeout = 20  # total per-agent probe budget; timeout keeps cached data
+
+[telegram]
+# Get a token from @BotFather. AGORA_TELEGRAM_TOKEN overrides this.
+token = ""
+# Your numeric Telegram id(s). Leave empty to allow anyone - do not do that.
+allowed_user_ids = []
+
+# --- per-agent overrides -----------------------------------------------------
+# Only the fields you list are overridden; the rest keep their defaults.
+# Run `agora doctor` to see what is actually installed.
+# `timeout` caps the full turn. `acp_idle_timeout` (default 180s) caps silence
+# between ACP updates; every update resets it, and <= 0 disables it.
+# Either timeout stops the request instead of replaying file-changing work on
+# another backend. Normal fast failures still follow `routing.max_attempts`.
+
+[[agent]]
+key = "claude"
+# Pin a model, raise the ceiling for long jobs:
+exec_command = ["claude", "-p", "--output-format", "json", "--model", "opus"]
+timeout = 1800
+tier = "heavy"
+# Who takes over when Claude refuses, before the global ranking applies.
+fallback = ["gpt", "cursor"]
+# Same remaining-quota numbers as `/usage` (OAuth token from Keychain / credentials).
+quota_probe = "claude"
+# Fallback turn ceiling if the usage API is unreadable. Ranking only — never blocks.
+budget_5h_turns = 40
+budget_week_turns = 400
+
+[[agent]]
+key = "gpt"
+# ACP is provided by `npx -y @agentclientprotocol/codex-acp@1.6.2` and drives the
+# installed, logged-in Codex CLI. Force the one-shot path only if needed:
+# transport = "exec"
+timeout = 1800
+acp_idle_timeout = 180
+# Codex 5h/7d: [sub2api] admin when configured, else ~/.codex/sessions.
+quota_probe = "codex"
+fallback = ["claude", "cursor"]
+
+[[agent]]
+key = "grok"
+# Grok Build is the quota-scarce one - keep it on short takes.
+tier = "light"
+timeout = 300
+quota_probe = "grok"          # live ACP if connected, else CLI-proxy /v1/billing
+fallback = ["cursor", "gpt"]
+budget_5h_turns = 15
+budget_week_turns = 120
+persona = "You are the contrarian. Two paragraphs maximum. Attack the weakest assumption."
+
+[[agent]]
+key = "cursor"
+# Cursor's own subscription already fans out to several vendors' models.
+# ACP uses `cursor-agent --model grok-4.6 acp` so this stays on first-party Grok.
+exec_command = ["cursor-agent", "-p", "--output-format", "json"]
+transport = "exec"
+quota_probe = "cursor"        # Cursor dashboard GetCurrentPeriodUsage via local login
+
+# Codex 5h/7d that `codex exec` leaves null in session logs. Admin GET only —
+# this is not a completion proxy. Key stays in this file (chmod 600) or
+# SUB2API_ADMIN_API_KEY. gpt_account is id or name; empty auto-picks the
+# openai oauth account that already has Codex extra.
+# [sub2api]
+# base_url = "https://api.example.com:8443"
+# admin_key = ""
+# gpt_account = "calmabacus"
+
+# A fully custom agent (any ACP-speaking or headless CLI works):
+# [[agent]]
+# key = "gemini"
+# label = "Gemini"
+# emoji = "*"
+# aliases = ["g"]
+# acp_command = ["gemini", "--experimental-acp"]
+# exec_command = ["gemini", "-p"]
+# tier = "light"

@@ -1,0 +1,32 @@
+[project]
+name = "leftover"
+version = "0.1.0"
+description = "Spend leftover coding-CLI quota before the window resets."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Xinrun Li" }]
+dependencies = [
+    "agent-client-protocol>=0.12",
+    "python-telegram-bot>=21.0",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.urls]
+Homepage = "https://github.com/XR-Lee/leftover"
+Repository = "https://github.com/XR-Lee/leftover"
+
+[project.scripts]
+leftover = "leftover.macbot:main"
+macbot = "leftover.macbot:main"
+agora = "leftover.agora_cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["leftover", "leftover.agents", "leftover.transports"]
+
+[tool.setuptools.package-data]
+leftover = ["skills/*/SKILL.md"]
