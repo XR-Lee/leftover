@@ -117,6 +117,64 @@ launch a duplicate.
 5. `observe` classifies error **and** short result text. Quota refusal benches until `resets_at` or `quota_blind_cooldown`.
 6. REPL follow-up on a live ACP session sends the bare user line. First turn on a new session gets WORK/PLAN_ONLY plus trimmed leftover history.
 
+## Turn lifecycle and completion
+
+`AgentPool.submit()` creates a `TurnHandle` before its worker can run. The
+handle moves through `queued`, `running`, and exactly one terminal state:
+`completed`, `error`, `timed_out`, or `cancelled`. Its task deadline begins
+when runner execution starts, not while the request is waiting for that
+agent's serialized slot.
+
+`handle.wait(timeout)` only bounds the observer. It never cancels the agent;
+`handle.cancel()` is the explicit cancellation boundary. Terminal settlement
+and resource cleanup are separate futures, so the parent callback can run as
+soon as the outcome is known while the original worker finishes cancellation,
+process reaping, and lock release. `wait_cleanup()` marks the end of the
+worker's bounded cleanup phase and release of its serialized slot; a low-level
+SDK or OS task may still be detached after its own hard cleanup deadline.
+Cancelling the compatibility `pool.run()` entry point follows the same rule
+and does not wait behind stubborn cleanup.
+
+Published handles enter process-local FIFO completion inboxes isolated by
+`parent_id`. Each owner queue is bounded at 256 entries and drops its oldest
+completion on overflow; `completion_overflows()` exposes that loss. Empty
+owner queues retire after their last waiter, and `discard_completions()` lets a
+finished owner release unconsumed callbacks. These inboxes are callback
+channels, not durable job storage. `pool.run()` keeps its existing `Turn`
+return type and does not publish an inbox entry.
+
+ACP prompts add a second, protocol-level boundary. Each prompt receives an
+epoch, a terminal future, and an update gate before the prompt RPC starts.
+Success, failure, timeout, and cancellation settle that future once; later
+updates captured for the closed epoch are rejected. ACP notifications do not
+carry a prompt id, so an uncertain cancellation still retires the whole
+connection generation before another prompt can use it. One prompt epoch sends
+at most one cancel RPC even when graceful pool cancellation is followed by a
+hard worker cancellation.
+
+Each ACP turn also owns one ordered event pump. The pump snapshots accepted
+text, tools, and terminal error before publishing the `Turn`, so queued output
+survives an immediate RPC failure and later callback cleanup cannot mutate an
+already observed result. Error and cancellation settlement bypass a blocked
+event sink; delivery remains cleanup-owned and preserves event order.
+
+Pool startup cleanup is registered before `runner.start()` can yield. If a
+startup is retired while still running, its finalizer issues one bounded early
+close, waits for startup to become terminal, and closes again to catch resources
+opened after the first race. A transition deadline bounds only its caller: the
+same finalizer continues to own a close that is still cleaning up, repeated
+shutdown does not launch a concurrent duplicate, and a completed close failure
+is retried only by a later explicit transition. Close cancellation is sent
+before the pool deadline so a coroutine that consumes one cancellation cannot
+hold `asyncio.run()` teardown open.
+
+Timeouts remain distinct: queue wait, task deadline, ACP visible-progress idle
+deadline, event-sink delivery, and cleanup grace each have their own boundary.
+Protocol activity without visible thought, tool, or text output does not extend
+the ACP idle deadline. Turn, idle, and event-sink timeouts become visible to
+the parent before ACP abort cleanup; shutdown also owns direct prepare/startup
+tasks so a warmup cannot retain the pool's read gate unnoticed.
+
 ## Built-in agents
 
 Defined in `config.BUILTIN_AGENTS`. Keys are stable: `claude`, `gpt`, `grok`, `cursor`.

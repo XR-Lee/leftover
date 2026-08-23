@@ -344,11 +344,12 @@ class Router:
     def observe(self, spec: AgentSpec, turn: Turn) -> q.Failure | None:
         """Update health and the ledger from a completed turn."""
         health = self.h(spec)
-        if turn.meta.get("shutdown_interrupted"):
-            # The request never reached a backend. Keep it terminal for this
-            # routed request without tripping that backend's health state.
+        if (turn.meta.get("shutdown_interrupted")
+                or turn.meta.get("cancelled")):
+            # Cancellation belongs to the request lifecycle, not backend
+            # health. Keep it terminal without tripping or charging the agent.
             return q.Failure(
-                "transient", detail=turn.error or "pool shutdown interrupted")
+                "transient", detail=turn.error or "request cancelled")
         if turn.meta.get("timeout_kind") == "sink":
             # Delivery failed after the backend produced an event. Do not replay
             # the task or punish the model for a stuck UI/network sink.
@@ -653,8 +654,7 @@ class Router:
             attempted = True
             failure = self.observe(spec, turn)
             timed_out = self._terminal_timeout(turn)
-            terminal = timed_out or bool(
-                turn.meta.get("shutdown_interrupted"))
+            terminal = self._terminal_turn(turn)
             last, last_failure, last_spec = turn, failure, spec
             decision.attempts.append(Attempt(
                 key=spec.key,
@@ -697,6 +697,11 @@ class Router:
         error = (turn.error or "").strip().lower()
         return (error.startswith("timed out after ")
                 or error.startswith("acp idle timed out after "))
+
+    def _terminal_turn(self, turn: Turn) -> bool:
+        """True when retrying this completed request would duplicate work."""
+        return self._terminal_timeout(turn) or bool(
+            turn.meta.get("cancelled"))
 
     def _nobody_home(self, chain: list[AgentSpec], primary: AgentSpec | None,
                      decision: Decision) -> Turn:

@@ -6,6 +6,13 @@ Notable changes per release. Dates are release dates.
 
 ### Added
 
+- **Explicit turn handles and completion callbacks.** `AgentPool.submit()` now
+  returns a one-shot `TurnHandle` with queued/running/terminal states,
+  observational waits, explicit cancellation, a separate cleanup boundary,
+  and bounded completion FIFOs isolated by parent id. Empty owner queues retire
+  automatically; overflow counts and explicit owner cleanup remain observable.
+  The existing `pool.run()` API still returns a `Turn` and does not retain
+  callback entries.
 - **Antigravity (`agy`) as a fifth backend**, last in the coding pool. Google's
   terminal agent has no ACP mode in 1.1.19, so it runs exec-only and never
   holds a sticky session. It is pinned to `--model gemini-3.1-pro-high`: `agy`
@@ -38,6 +45,28 @@ Notable changes per release. Dates are release dates.
 
 ### Fixed
 
+- ACP long sessions now register their terminal waiter before prompt execution,
+  settle each prompt exactly once, and reject updates captured for an older
+  prompt epoch. Timeout/cancellation becomes visible before abort cleanup, and
+  an uncertain prompt still rotates the whole ACP generation because the
+  protocol has no prompt id on updates.
+- ACP event delivery now uses one ordered pump and publishes an immutable
+  text/tool/error snapshot. Text queued before a backend failure is preserved,
+  while failure and cancellation can reach the parent without waiting behind a
+  blocked UI callback.
+- Cancelling a foreground `pool.run()` no longer waits behind stubborn worker
+  cleanup. The caller receives cancellation immediately while the same worker
+  finishes process reaping and lock release in the background.
+- Pool cancellation now covers queued work, direct startup/warmup tasks, and
+  already-settled turns still in cleanup. Cancelled routes cannot restart on a
+  fallback backend, and ACP sink timeouts settle before abort cleanup.
+- Runner startup finalizers now exist before startup can yield, close partial
+  transports immediately, and close again after a late startup becomes
+  terminal. Timed-out cleanup remains owned without duplicate close attempts;
+  failed or self-cancelled closes stay observable and retry on a later explicit
+  shutdown. Pool deadlines also cannot trap `asyncio.run()` during teardown.
+- Debate slots now use a hard observer deadline, so a backend coroutine that
+  delays cancellation cannot postpone the judge or the parent result.
 - The doctor roster and the `--why` table hardcoded an 8-to-10 character agent
   column, so an 11-character label ("Antigravity") broke both alignments. Both
   now size the column from the agents actually being shown.

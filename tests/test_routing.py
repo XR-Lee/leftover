@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -948,6 +949,57 @@ async def test_parallel_fallback_shares_one_ranking() -> None:
           repr([(turn.agent.key, turn.error) for turn in turns]))
 
 
+async def test_group_cancellation_does_not_fallback() -> None:
+    print("\n[7c] cancelled group slots never restart on a spare")
+
+    class CancelledGroupPool:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def run(self, spec: AgentSpec, prompt: str, on_event=None) -> Turn:
+            self.calls.append(spec.key)
+            if spec.key != "spare":
+                return Turn(
+                    agent=spec, error="cancelled",
+                    meta={"cancelled": True})
+            return Turn(agent=spec, text="must not run")
+
+    installed = [sys.executable]
+    agents = [
+        AgentSpec(key="pro", label="Pro", interactive_command=installed),
+        AgentSpec(key="con", label="Con", interactive_command=installed),
+        AgentSpec(key="judge", label="Judge", interactive_command=installed),
+        AgentSpec(key="spare", label="Spare", interactive_command=installed),
+    ]
+
+    async def execute(plan: Plan) -> tuple[list[Turn], list[str]]:
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = CancelledGroupPool()
+            cfg = Config(
+                agents=agents, data_dir=tmp,
+                routing=Routing(
+                    strategy="order", order=[agent.key for agent in agents]))
+            turns = await Orchestrator(
+                cfg, pool, Router(cfg, pool)).execute(plan, None)
+            return turns, pool.calls
+
+    broadcast, broadcast_calls = await execute(
+        Plan("broadcast", "work", agents[:2], {}))
+    check("broadcast cancellation does not claim a spare",
+          {turn.agent.key for turn in broadcast} == {"pro", "con"}
+          and set(broadcast_calls) == {"pro", "con"}
+          and "spare" not in broadcast_calls,
+          repr(broadcast_calls))
+
+    debate, debate_calls = await execute(
+        Plan("debate", "work", agents[:3], {"rounds": "1"}))
+    check("debate sides and judge keep cancellation terminal",
+          {turn.agent.key for turn in debate} == {"pro", "con", "judge"}
+          and set(debate_calls) == {"pro", "con", "judge"}
+          and "spare" not in debate_calls,
+          repr(debate_calls))
+
+
 async def test_group_role_reservations() -> None:
     print("\n[8] debate and relay keep distinct role owners")
 
@@ -1034,16 +1086,23 @@ async def test_debate_turn_timeout_is_bounded() -> None:
     class TimeoutPool:
         def __init__(self) -> None:
             self.cancelled = asyncio.Event()
+            self.release = asyncio.Event()
+            self.stubborn_task: asyncio.Task | None = None
 
         def peek(self, spec: AgentSpec):
             return None
 
         async def run(self, spec: AgentSpec, prompt: str, on_event=None) -> Turn:
             if spec.key == "pro":
+                self.stubborn_task = asyncio.current_task()
                 try:
                     await asyncio.Event().wait()
-                finally:
+                except asyncio.CancelledError:
                     self.cancelled.set()
+                    # Model an SDK call that suppresses task cancellation until
+                    # its own resource completes.
+                    await self.release.wait()
+                    return Turn(agent=spec, text="late pro argument")
             await asyncio.sleep(0.005)
             text = "neutral verdict" if "neutral judge" in prompt else (
                 f"{spec.key} argument")
@@ -1065,18 +1124,24 @@ async def test_debate_turn_timeout_is_bounded() -> None:
         )
         orch = Orchestrator(cfg, pool, Router(cfg, pool))
         started = asyncio.get_running_loop().time()
-        turns = await orch.execute(Plan("debate", "ship", agents, {}), None)
-        elapsed = asyncio.get_running_loop().time() - started
+        try:
+            turns = await orch.execute(Plan("debate", "ship", agents, {}), None)
+            elapsed = asyncio.get_running_loop().time() - started
 
-    check("a stuck advocate is cancelled at the debate deadline",
-          pool.cancelled.is_set() and elapsed < 0.25,
-          f"cancelled={pool.cancelled.is_set()}, elapsed={elapsed:.3f}s")
-    check("the timed-out slot is reported without blocking the verdict",
-          len(turns) == 3
-          and turns[0].error == "debate turn timed out after 0.03s"
-          and turns[0].seconds == 0.03
-          and turns[1].ok and turns[2].ok,
-          repr([(turn.error, turn.seconds) for turn in turns]))
+            check("a stuck advocate is cancelled at the debate deadline",
+                  pool.cancelled.is_set() and elapsed < 0.25,
+                  f"cancelled={pool.cancelled.is_set()}, elapsed={elapsed:.3f}s")
+            check("the timed-out slot is reported without blocking the verdict",
+                  len(turns) == 3
+                  and turns[0].error == "debate turn timed out after 0.03s"
+                  and turns[0].seconds == 0.03
+                  and turns[1].ok and turns[2].ok,
+                  repr([(turn.error, turn.seconds) for turn in turns]))
+        finally:
+            pool.release.set()
+            if pool.stubborn_task is not None:
+                await asyncio.gather(
+                    pool.stubborn_task, return_exceptions=True)
 
 
 async def test_acp_idle_timeout_tracks_all_updates() -> None:
@@ -1215,6 +1280,8 @@ async def test_agent_pool_start_timeout_is_a_hard_boundary() -> None:
                 raise RuntimeError("late startup cleanup failure")
 
         async def close(self) -> None:
+            if state["close_cancelled"]:
+                return
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
@@ -1254,7 +1321,11 @@ async def test_agent_pool_start_timeout_is_a_hard_boundary() -> None:
         await asyncio.wait_for(
             asyncio.gather(start_finished.wait(), close_finished.wait()),
             timeout=0.2)
-        await asyncio.sleep(0)
+        async def wait_for_lifecycle_cleanup() -> None:
+            while pool._startup_tasks or pool._background_tasks:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_lifecycle_cleanup(), timeout=0.2)
         agents_mod.build_runner = original_build
         agents_mod.START_TIMEOUT = original_start_timeout
         agents_mod._RUNNER_CONTROL_TIMEOUT = original_control_timeout
@@ -1760,6 +1831,753 @@ print("asyncio-exited", flush=True)
           f"stdout={output!r}, stderr={stderr.decode()!r}")
 
 
+async def test_acp_turn_epoch_rejects_late_updates() -> None:
+    print("\n[9fa] ACP prompt epochs settle once and isolate late updates")
+    from leftover.agents import acp_runner as acp_mod
+
+    class Result:
+        stop_reason = "end_turn"
+
+    class Content:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+    class Update:
+        session_update = "agent_message_chunk"
+
+        def __init__(self, text: str) -> None:
+            self.content = Content(text)
+
+    bridge = acp_mod._Bridge(asyncio.Queue())
+    prompt_epochs: list[int] = []
+    waiter_ready: list[bool] = []
+    turns: list[object] = []
+    pending_late = None
+
+    class Incoming:
+        value = "incoming"
+
+    class RawEvent:
+        direction = Incoming()
+
+        def __init__(self, session_id: str, text: str) -> None:
+            self.message = {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"text": text},
+                        "fieldMeta": None,
+                    },
+                },
+            }
+
+    class Connection:
+        async def prompt(self, session_id, prompt):
+            nonlocal pending_late
+            turn = runner._active_turn
+            assert turn is not None
+            turns.append(turn)
+            prompt_epochs.append(turn.epoch)
+            waiter_ready.append(
+                bridge._turn is turn and not turn.terminal.done())
+            if len(turns) == 1:
+                await bridge.session_update(session_id, Update("FIRST"))
+                # The raw notification arrives in epoch 1, but its SDK handler
+                # does not begin until epoch 2 is already bound.
+                bridge.observe_stream(RawEvent(session_id, "OLD"))
+                pending_late = Update("OLD")
+            else:
+                assert pending_late is not None
+                await bridge.session_update(session_id, pending_late)
+                await bridge.session_update(session_id, Update("NEW"))
+            return Result()
+
+    runner = acp_mod.AcpRunner(AgentSpec(
+        key="turn-epoch", label="Turn epoch", acp_command=["unused"],
+        timeout=1, acp_idle_timeout=0))
+    runner._conn = Connection()
+    runner._session_id = "session"
+    runner._bridge = bridge
+    try:
+        first = await runner.run("first")
+        first_turn = turns[0]
+        terminal = first_turn.terminal.result()
+        duplicate_settle = runner._settle_turn(first_turn, "error")
+        second = await runner.run("second")
+
+        check("terminal waiter and event gate exist before prompt execution",
+              waiter_ready == [True, True] and prompt_epochs == [1, 2],
+              f"waiters={waiter_ready}, epochs={prompt_epochs}")
+        check("a prompt terminal state is immutable and set exactly once",
+              first.text == "FIRST" and terminal.state == "completed"
+              and terminal.epoch == 1 and not duplicate_settle,
+              f"first={first}, terminal={terminal}, duplicate={duplicate_settle}")
+        check("a delayed old-epoch update cannot enter the next turn",
+              second.text == "NEW" and "OLD" not in second.text
+              and bridge.dropped_updates == 1
+              and not bridge._observed_updates,
+              f"second={second}, dropped={bridge.dropped_updates}, "
+              f"observed={bridge._observed_updates}")
+    finally:
+        await runner.close()
+
+
+async def test_acp_terminal_precedes_abort_cleanup() -> None:
+    print("\n[9fb] ACP terminal state precedes abort cleanup")
+    from leftover.agents import acp_runner as acp_mod
+
+    timeout_turns: list[object] = []
+    state_at_abort: list[str] = []
+
+    class TimeoutConnection:
+        async def prompt(self, session_id, prompt):
+            turn = timeout_runner._active_turn
+            assert turn is not None
+            timeout_turns.append(turn)
+            await asyncio.Event().wait()
+
+        async def cancel(self, session_id):
+            return None
+
+    class TimeoutRunner(acp_mod.AcpRunner):
+        async def _abort_prompt(self, task, turn):
+            turn = self._active_turn
+            assert turn is not None and turn.terminal.done()
+            state_at_abort.append(turn.terminal.result().state)
+            await super()._abort_prompt(task, turn)
+
+    timeout_runner = TimeoutRunner(AgentSpec(
+        key="terminal-timeout", label="Terminal timeout",
+        acp_command=["unused"], timeout=0.01, acp_idle_timeout=0))
+    timeout_runner._conn = TimeoutConnection()
+    timeout_runner._session_id = "timeout-session"
+    original_grace = acp_mod._CANCEL_GRACE_TIMEOUT
+    acp_mod._CANCEL_GRACE_TIMEOUT = 0.01
+    try:
+        timed_out = await timeout_runner.run("wait forever")
+        timeout_terminal = timeout_turns[0].terminal.result()
+        check("timeout settles before cancellation and transport cleanup begin",
+              timed_out.meta.get("timeout_kind") == "turn"
+              and state_at_abort == ["timed_out"]
+              and timeout_terminal.state == "timed_out",
+              f"turn={timed_out}, states={state_at_abort}, "
+              f"terminal={timeout_terminal}")
+    finally:
+        acp_mod._CANCEL_GRACE_TIMEOUT = original_grace
+        await timeout_runner.close()
+
+    error_turns: list[object] = []
+
+    class ErrorConnection:
+        async def prompt(self, session_id, prompt):
+            turn = error_runner._active_turn
+            assert turn is not None
+            error_turns.append(turn)
+            raise ValueError("prompt failed")
+
+    error_runner = acp_mod.AcpRunner(AgentSpec(
+        key="terminal-error", label="Terminal error",
+        acp_command=["unused"], timeout=1, acp_idle_timeout=0))
+    error_runner._conn = ErrorConnection()
+    error_runner._session_id = "error-session"
+    try:
+        failed = await error_runner.run("fail")
+        error_terminal = error_turns[0].terminal.result()
+        check("error settlement survives generation retirement and finally",
+              failed.error == "ValueError: prompt failed"
+              and error_terminal.state == "error"
+              and isinstance(error_terminal.error, ValueError),
+              f"turn={failed}, terminal={error_terminal}")
+    finally:
+        await error_runner.close()
+
+
+async def test_agent_pool_observes_acp_timeout_before_cleanup() -> None:
+    print("\n[9fc] production pool observes ACP timeout before cleanup")
+    from leftover import agents as agents_mod
+    from leftover.agents import acp_runner as acp_mod
+
+    prompt_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+
+    class Connection:
+        async def prompt(self, session_id, prompt):
+            prompt_started.set()
+            await asyncio.Event().wait()
+
+    class SlowCleanupRunner(acp_mod.AcpRunner):
+        async def start(self, workdir: str) -> None:
+            self._workdir = os.path.realpath(workdir)
+            self._conn = Connection()
+            self._session_id = "pool-timeout-session"
+
+        async def _abort_prompt(self, task, turn):
+            cleanup_started.set()
+            try:
+                await cleanup_release.wait()
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    original_build = agents_mod.build_runner
+    agents_mod.build_runner = lambda spec: SlowCleanupRunner(spec)
+    spec = AgentSpec(
+        key="pool-timeout", label="Pool timeout", acp_command=["unused"],
+        timeout=0.01, acp_idle_timeout=0)
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(
+            agents=[spec], default_workdir=tmp, data_dir=tmp))
+        task = asyncio.create_task(pool.run(spec, "wait forever"))
+        handle = None
+        try:
+            await prompt_started.wait()
+            await cleanup_started.wait()
+            handle = next(iter(pool._active_turns.values()))
+            done, _pending = await asyncio.wait({task}, timeout=0.05)
+            turn = task.result() if task in done else None
+            check("Router-facing pool.run receives the timeout before cleanup",
+                  turn is not None
+                  and turn.meta.get("timeout_kind") == "turn"
+                  and handle.state is agents_mod.TurnState.TIMED_OUT,
+                  f"done={task in done}, turn={turn}, state={handle.state}")
+            check("the worker and same-agent slot remain owned during cleanup",
+                  not handle.cleanup_done()
+                  and pool.active_turn(handle.turn_id) is handle)
+
+            await asyncio.wait_for(pool.shutdown(), timeout=0.2)
+            await handle.wait_cleanup(timeout=0.1)
+            check("shutdown stops cleanup after an early terminal result",
+                  handle.cleanup_done()
+                  and pool.active_turn(handle.turn_id) is None
+                  and handle.state is agents_mod.TurnState.TIMED_OUT
+                  and not cleanup_release.is_set())
+        finally:
+            cleanup_release.set()
+            await asyncio.gather(task, return_exceptions=True)
+            if handle is not None:
+                await handle.wait_cleanup(timeout=0.2)
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
+
+
+async def test_agent_pool_observes_sink_timeout_before_acp_cleanup() -> None:
+    print("\n[9fc] production pool observes sink timeout before ACP cleanup")
+    from leftover import agents as agents_mod
+    from leftover.agents import acp_runner as acp_mod
+
+    prompt_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    sink_cancelled = asyncio.Event()
+
+    class Connection:
+        def __init__(self, owner) -> None:
+            self.owner = owner
+
+        async def prompt(self, session_id, prompt):
+            prompt_started.set()
+            await self.owner._queue.put(
+                acp_mod.Event("text", "VISIBLE"))
+            await asyncio.Event().wait()
+
+    class SlowSinkCleanupRunner(acp_mod.AcpRunner):
+        async def start(self, workdir: str) -> None:
+            self._workdir = os.path.realpath(workdir)
+            self._conn = Connection(self)
+            self._session_id = "pool-sink-session"
+
+        async def _abort_prompt(self, task, turn):
+            cleanup_started.set()
+            try:
+                await cleanup_release.wait()
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def stuck_sink(_event) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            sink_cancelled.set()
+            raise
+
+    async def broken_sink(_event) -> None:
+        raise RuntimeError("sink failed")
+
+    original_build = agents_mod.build_runner
+    agents_mod.build_runner = lambda spec: SlowSinkCleanupRunner(spec)
+    spec = AgentSpec(
+        key="pool-sink", label="Pool sink", acp_command=["unused"],
+        timeout=0.02, acp_idle_timeout=0)
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(
+            agents=[spec], default_workdir=tmp, data_dir=tmp))
+        task = asyncio.create_task(
+            pool.run(spec, "wait forever", stuck_sink))
+        handle = None
+        failure_task = None
+        failure_handle = None
+        try:
+            await prompt_started.wait()
+            await cleanup_started.wait()
+            handle = next(iter(pool._active_turns.values()))
+            done, _pending = await asyncio.wait({task}, timeout=0.05)
+            turn = task.result() if task in done else None
+            check("Router-facing pool.run receives the sink failure early",
+                  turn is not None
+                  and turn.meta.get("timeout_kind") == "sink"
+                  and turn.text == "VISIBLE"
+                  and handle.state is agents_mod.TurnState.TIMED_OUT
+                  and sink_cancelled.is_set(),
+                  f"done={task in done}, turn={turn}, state={handle.state}")
+            check("ACP cleanup remains independently observable",
+                  not handle.cleanup_done()
+                  and pool.active_turn(handle.turn_id) is handle)
+
+            cleanup_release.set()
+            await handle.wait_cleanup(timeout=0.1)
+            check("sink-timeout cleanup retires the production handle",
+                  handle.cleanup_done()
+                  and pool.active_turn(handle.turn_id) is None)
+
+            prompt_started.clear()
+            cleanup_started.clear()
+            cleanup_release.clear()
+            failure_task = asyncio.create_task(
+                pool.run(spec, "fail delivery", broken_sink))
+            await prompt_started.wait()
+            await cleanup_started.wait()
+            failure_handle = next(iter(pool._active_turns.values()))
+            done, _pending = await asyncio.wait(
+                {failure_task}, timeout=0.05)
+            failed = failure_task.result() if failure_task in done else None
+            check("an immediate sink exception also settles before cleanup",
+                  failed is not None
+                  and failed.error == "RuntimeError: sink failed"
+                  and failed.meta.get("timeout_kind") == "sink"
+                  and failure_handle.state is agents_mod.TurnState.TIMED_OUT
+                  and not failure_handle.cleanup_done(),
+                  f"done={failure_task in done}, turn={failed}")
+
+            cleanup_release.set()
+            await failure_handle.wait_cleanup(timeout=0.1)
+        finally:
+            cleanup_release.set()
+            pending = [task]
+            if failure_task is not None:
+                pending.append(failure_task)
+            await asyncio.gather(*pending, return_exceptions=True)
+            if handle is not None:
+                await handle.wait_cleanup(timeout=0.2)
+            if failure_handle is not None:
+                await failure_handle.wait_cleanup(timeout=0.2)
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
+
+
+async def test_prompt_failure_retires_when_error_sink_closes() -> None:
+    print("\n[9fc] prompt failure survives error-sink shutdown")
+    from leftover.agents import acp_runner as acp_mod
+
+    class FailedConnection:
+        async def prompt(self, session_id, prompt):
+            raise ValueError("prompt failed")
+
+    async def broken_sink(_event) -> None:
+        raise RuntimeError("sink failed")
+
+    runner = acp_mod.AcpRunner(AgentSpec(
+        key="failed-error-sink", label="Failed error sink",
+        acp_command=["unused"], timeout=1, acp_idle_timeout=0))
+    runner._conn = FailedConnection()
+    runner._session_id = "failed-error-session"
+    try:
+        turn = await runner.run("fail", broken_sink)
+        check("a broken error sink cannot preserve a failed generation",
+              turn.error == "ValueError: prompt failed"
+              and runner._conn is None
+              and runner._session_id is None
+              and runner._active_turn is None,
+              f"turn={turn}, session={runner._session_id}")
+    finally:
+        await runner.close()
+
+
+async def test_prompt_failure_keeps_already_queued_text() -> None:
+    print("\n[9fc] ACP failure settlement keeps already queued text")
+    from leftover.agents import acp_runner as acp_mod
+
+    class FailedConnection:
+        async def prompt(self, session_id, prompt):
+            await runner._queue.put(acp_mod.Event("text", "PREFIX"))
+            raise ValueError("boom after queue")
+
+    runner = acp_mod.AcpRunner(AgentSpec(
+        key="failed-queued-text", label="Failed queued text",
+        acp_command=["unused"], timeout=1, acp_idle_timeout=0))
+    runner._conn = FailedConnection()
+    runner._session_id = "failed-queued-text"
+    try:
+        turn = await runner.run("fail after queue")
+        check("terminal failure includes text accepted before the exception",
+              turn.text == "PREFIX"
+              and turn.error == "ValueError: boom after queue"
+              and not runner.live_session(),
+              repr(turn))
+    finally:
+        await runner.close()
+
+
+async def test_prompt_failure_settles_before_blocked_sink() -> None:
+    print("\n[9fc] ACP failures bypass an already blocked text callback")
+    from leftover import agents as agents_mod
+    from leftover.agents import acp_runner as acp_mod
+
+    prompt_failed = asyncio.Event()
+    sink_entered = asyncio.Event()
+    sink_release = asyncio.Event()
+
+    class FailedConnection:
+        def __init__(self, owner) -> None:
+            self.owner = owner
+
+        async def prompt(self, session_id, prompt):
+            await self.owner._queue.put(acp_mod.Event("text", "PREFIX"))
+            await self.owner._queue.put(acp_mod.Event("tool", "read_file"))
+            await sink_entered.wait()
+            prompt_failed.set()
+            raise ValueError("prompt failed after prefix")
+
+    class FailedRunner(acp_mod.AcpRunner):
+        async def start(self, workdir: str) -> None:
+            self._workdir = os.path.realpath(workdir)
+            self._conn = FailedConnection(self)
+            self._session_id = "failed-before-sink"
+
+    async def blocked_sink(_event) -> None:
+        sink_entered.set()
+        await sink_release.wait()
+
+    original_build = agents_mod.build_runner
+    agents_mod.build_runner = lambda spec: FailedRunner(spec)
+    spec = AgentSpec(
+        key="failed-before-sink", label="Failed before sink",
+        acp_command=["unused"], timeout=1, acp_idle_timeout=0)
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(
+            agents=[spec], default_workdir=tmp, data_dir=tmp))
+        task = asyncio.create_task(pool.run(spec, "fail", blocked_sink))
+        handle = None
+        try:
+            await prompt_failed.wait()
+            handle = next(iter(pool._active_turns.values()))
+            done, _pending = await asyncio.wait({task}, timeout=0.05)
+            turn = task.result() if task in done else None
+            check("a known backend failure reaches the parent before the sink",
+                  turn is not None
+                  and turn.text == "PREFIX"
+                  and turn.tools == ["read_file"]
+                  and turn.error == "ValueError: prompt failed after prefix"
+                  and handle.state is agents_mod.TurnState.ERROR,
+                  f"done={task in done}, turn={turn}, state={handle.state}")
+            check("callback delivery and generation retirement stay in cleanup",
+                  not handle.cleanup_done())
+            published = (
+                turn.text, tuple(turn.tools), turn.error,
+                dict(turn.meta), turn.seconds,
+            )
+
+            sink_release.set()
+            await handle.wait_cleanup(timeout=0.2)
+            check("cleanup cannot mutate an already published terminal turn",
+                  published == (
+                      turn.text, tuple(turn.tools), turn.error,
+                      dict(turn.meta), turn.seconds,
+                  ), repr(turn))
+        finally:
+            sink_release.set()
+            await asyncio.gather(task, return_exceptions=True)
+            if handle is not None:
+                await handle.wait_cleanup(timeout=0.2)
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
+
+
+async def test_acp_cancelled_stop_is_lifecycle_terminal() -> None:
+    print("\n[9fc] ACP cancelled stop reasons stay terminal")
+    from leftover import agents as agents_mod
+    from leftover.agents import acp_runner as acp_mod
+
+    class Result:
+        stop_reason = "cancelled"
+
+    sink_entered = asyncio.Event()
+    sink_release = asyncio.Event()
+
+    class Connection:
+        def __init__(self, owner) -> None:
+            self.owner = owner
+
+        async def prompt(self, session_id, prompt):
+            await self.owner._queue.put(acp_mod.Event("text", "PREFIX"))
+            await sink_entered.wait()
+            return Result()
+
+    class CancelledRunner(acp_mod.AcpRunner):
+        async def start(self, workdir: str) -> None:
+            self._workdir = os.path.realpath(workdir)
+            self._conn = Connection(self)
+            self._session_id = "cancelled-stop"
+
+    async def blocked_sink(_event) -> None:
+        sink_entered.set()
+        await sink_release.wait()
+
+    original_build = agents_mod.build_runner
+    agents_mod.build_runner = lambda spec: CancelledRunner(spec)
+    spec = AgentSpec(
+        key="cancelled-stop", label="Cancelled stop",
+        acp_command=["unused"], timeout=1, acp_idle_timeout=0)
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(
+            agents=[spec], default_workdir=tmp, data_dir=tmp))
+        handle = pool.submit(spec, "cancelled response", blocked_sink)
+        try:
+            await sink_entered.wait()
+            turn = await handle.wait(timeout=0.05)
+            check("server cancellation bypasses a blocked prior callback",
+                  handle.state is agents_mod.TurnState.CANCELLED
+                  and turn.meta.get("cancelled") is True
+                  and turn.text == "PREFIX"
+                  and turn.error == "stopped: cancelled",
+                  f"state={handle.state}, turn={turn}")
+            check("cancelled callback delivery remains cleanup-owned",
+                  not handle.cleanup_done())
+            sink_release.set()
+            await handle.wait_cleanup(timeout=0.2)
+        finally:
+            sink_release.set()
+            handle.cancel()
+            await handle.wait_cleanup(timeout=0.2)
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
+
+
+async def test_acp_abort_retires_prompt_failure_during_grace() -> None:
+    print("\n[9fc] ACP abort retires failures completed during cancel grace")
+    from leftover.agents import acp_runner as acp_mod
+
+    prompt_release = asyncio.Event()
+
+    class Connection:
+        async def prompt(self, session_id, prompt):
+            await prompt_release.wait()
+            raise ConnectionError("connection failed during cancel")
+
+        async def cancel(self, session_id):
+            prompt_release.set()
+
+    original_grace = acp_mod._CANCEL_GRACE_TIMEOUT
+    acp_mod._CANCEL_GRACE_TIMEOUT = 0.05
+    runner = acp_mod.AcpRunner(AgentSpec(
+        key="abort-failed", label="Abort failed", acp_command=["unused"],
+        timeout=0.01, acp_idle_timeout=0))
+    runner._conn = Connection()
+    runner._session_id = "broken-generation"
+    try:
+        turn = await runner.run("time out")
+        check("a prompt exception during grace cannot preserve its session",
+              turn.meta.get("timeout_kind") == "turn"
+              and not runner.live_session(),
+              f"turn={turn}, session={runner.session_id}")
+    finally:
+        acp_mod._CANCEL_GRACE_TIMEOUT = original_grace
+        await runner.close()
+
+
+async def test_old_acp_abort_cannot_retire_replacement_generation() -> None:
+    print("\n[9fc] old ACP abort cannot invalidate a replacement generation")
+    from leftover.agents import acp_runner as acp_mod
+
+    cancel_sent = asyncio.Event()
+
+    class Result:
+        stop_reason = "end_turn"
+
+    class OldConnection:
+        async def prompt(self, session_id, prompt):
+            await asyncio.Event().wait()
+
+        async def cancel(self, session_id):
+            cancel_sent.set()
+
+    class NewConnection:
+        async def prompt(self, session_id, prompt):
+            await runner._queue.put(acp_mod.Event("text", "NEW"))
+            return Result()
+
+    original_grace = acp_mod._CANCEL_GRACE_TIMEOUT
+    acp_mod._CANCEL_GRACE_TIMEOUT = 0.03
+    runner = acp_mod.AcpRunner(AgentSpec(
+        key="abort-generation", label="Abort generation",
+        acp_command=["unused"], timeout=0.01, acp_idle_timeout=0))
+    runner._conn = OldConnection()
+    runner._session_id = "old-session"
+    first_task = asyncio.create_task(runner.run("old prompt"))
+    try:
+        await asyncio.wait_for(cancel_sent.wait(), timeout=0.2)
+        old_generation = runner._generation
+        new_conn = NewConnection()
+        new_queue: asyncio.Queue = asyncio.Queue()
+        new_generation = object()
+        runner._conn = new_conn
+        runner._session_id = "new-session"
+        runner._queue = new_queue
+        runner._bridge = None
+        runner._generation = new_generation
+
+        first = await asyncio.wait_for(first_task, timeout=0.2)
+        check("late old abort preserves the replacement connection identity",
+              first.meta.get("timeout_kind") == "turn"
+              and old_generation is not new_generation
+              and runner._conn is new_conn
+              and runner._session_id == "new-session"
+              and runner._generation is new_generation
+              and runner.live_session(),
+              f"turn={first}, session={runner.session_id}")
+
+        runner.spec.timeout = 1
+        second = await runner.run("new prompt")
+        check("the preserved replacement generation remains usable",
+              second.text == "NEW" and runner._conn is new_conn,
+              f"turn={second}, session={runner.session_id}")
+    finally:
+        first_task.cancel()
+        await asyncio.gather(first_task, return_exceptions=True)
+        acp_mod._CANCEL_GRACE_TIMEOUT = original_grace
+        await runner.close()
+
+
+async def test_session_cancel_retires_before_next_prompt() -> None:
+    print("\n[9fc] session-wide ACP cancellation rotates the generation")
+    from leftover.agents import acp_runner as acp_mod
+
+    prompt_release = asyncio.Event()
+    old_started = asyncio.Event()
+    late_release = asyncio.Event()
+    late_sent = asyncio.Event()
+    server_cancel = asyncio.Event()
+    new_started = asyncio.Event()
+    new_release = asyncio.Event()
+    state = {"cancel_calls": 0, "starts": 0}
+    delayed_tasks: set[asyncio.Task] = set()
+
+    class Result:
+        stop_reason = "end_turn"
+
+    class CancelledResult:
+        stop_reason = "cancelled"
+
+    class OldConnection:
+        def __init__(self) -> None:
+            self.prompts = 0
+
+        async def prompt(self, session_id, prompt):
+            self.prompts += 1
+            if self.prompts == 1:
+                old_started.set()
+                await prompt_release.wait()
+                return Result()
+            new_started.set()
+            await runner._queue.put(acp_mod.Event("text", "OLD-REUSED"))
+            cancelled = asyncio.create_task(server_cancel.wait())
+            released = asyncio.create_task(new_release.wait())
+            done, pending = await asyncio.wait(
+                {cancelled, released}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            return CancelledResult() if cancelled in done else Result()
+
+        async def cancel(self, session_id):
+            state["cancel_calls"] += 1
+            prompt_release.set()
+
+            async def deliver_late() -> None:
+                await late_release.wait()
+                server_cancel.set()
+                late_sent.set()
+
+            task = asyncio.create_task(deliver_late())
+            delayed_tasks.add(task)
+            task.add_done_callback(delayed_tasks.discard)
+
+    class NewConnection:
+        async def prompt(self, session_id, prompt):
+            new_started.set()
+            await runner._queue.put(acp_mod.Event("text", "NEW"))
+            await new_release.wait()
+            return Result()
+
+    class RebuildingRunner(acp_mod.AcpRunner):
+        async def start(self, workdir: str) -> None:
+            state["starts"] += 1
+            self._workdir = os.path.realpath(workdir)
+            self._conn = NewConnection()
+            self._session_id = f"new-session-{state['starts']}"
+
+    original_grace = acp_mod._CANCEL_GRACE_TIMEOUT
+    acp_mod._CANCEL_GRACE_TIMEOUT = 0.05
+    runner = RebuildingRunner(AgentSpec(
+        key="uncertain-cancel", label="Uncertain cancel",
+        acp_command=["unused"], timeout=1, acp_idle_timeout=0))
+    runner._conn = OldConnection()
+    runner._session_id = "old-session"
+    first_task = None
+    second_task = None
+    try:
+        first_task = asyncio.create_task(runner.run("old prompt"))
+        await old_started.wait()
+        delivered = await runner.cancel()
+        first = await asyncio.wait_for(first_task, timeout=0.2)
+        check("a sent cancel retires even after a normal prompt response",
+              delivered and first.error is None
+              and not runner.live_session()
+              and state["cancel_calls"] == 1,
+              f"turn={first}, state={state}")
+
+        second_task = asyncio.create_task(runner.run("new prompt"))
+        await new_started.wait()
+        late_release.set()
+        await asyncio.wait_for(late_sent.wait(), timeout=0.2)
+        await asyncio.sleep(0)
+        check("a late old cancel cannot terminate the fresh prompt",
+              not second_task.done()
+              and runner.session_id == "new-session-1",
+              f"done={second_task.done()}, session={runner.session_id}")
+
+        new_release.set()
+        second = await asyncio.wait_for(second_task, timeout=0.2)
+        check("the fresh generation completes normally after the late cancel",
+              second.text == "NEW" and state["starts"] == 1,
+              f"turn={second}, state={state}")
+    finally:
+        prompt_release.set()
+        late_release.set()
+        new_release.set()
+        if first_task is not None:
+            await asyncio.gather(first_task, return_exceptions=True)
+        if second_task is not None:
+            await asyncio.gather(second_task, return_exceptions=True)
+        await asyncio.gather(*delayed_tasks, return_exceptions=True)
+        await runner.close()
+        acp_mod._CANCEL_GRACE_TIMEOUT = original_grace
+
+
 async def test_acp_prompt_failure_rebuilds_only_next_turn() -> None:
     print("\n[9g] failed ACP prompt retires only its connection generation")
     from leftover.agents import acp_runner as acp_mod
@@ -2053,6 +2871,15 @@ async def test_agent_pool_queue_timeout_is_safe_to_fallback() -> None:
         blocker = asyncio.create_task(pool.run(specs[0], "occupy"))
         try:
             await occupied.wait()
+            rejected = pool.submit(specs[0], "queued handle")
+            rejected_turn = await rejected.wait(timeout=0.1)
+            rejected_completion = await pool.next_completion(timeout=0.1)
+            check("queue saturation is an unexecuted error, not a task timeout",
+                  rejected_completion is rejected
+                  and rejected.state is agents_mod.TurnState.ERROR
+                  and rejected_turn.meta.get("not_executed") is True
+                  and rejected_turn.meta.get("queue_timeout") is True,
+                  f"state={rejected.state}, turn={rejected_turn}")
             turn, decision = await Router(cfg, pool).run(
                 lambda spec: "new work", primary=specs[0],
                 ordered_chain=specs, max_attempts=2)
@@ -2072,6 +2899,873 @@ async def test_agent_pool_queue_timeout_is_safe_to_fallback() -> None:
             await pool.shutdown()
             agents_mod.build_runner = original_build
             agents_mod.RUNNER_QUEUE_TIMEOUT = original_queue_timeout
+
+
+async def test_turn_handle_wait_and_completion_inbox() -> None:
+    print("\n[9k] turn handles separate task settlement from observation")
+    from leftover import agents as agents_mod
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    class HandleRunner(agents_mod.BaseRunner):
+        async def run(self, prompt: str, on_event=None) -> Turn:
+            calls.append(prompt)
+            started.set()
+            await release.wait()
+            if prompt == "timeout":
+                return Turn(
+                    agent=self.spec,
+                    error="timed out",
+                    meta={"timeout_kind": "turn"},
+                )
+            return Turn(agent=self.spec, text=prompt)
+
+    original_build = agents_mod.build_runner
+    agents_mod.build_runner = lambda spec: HandleRunner(spec)
+    spec = AgentSpec(key="handle", label="Handle", timeout=5)
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(
+            agents=[spec], default_workdir=tmp, data_dir=tmp))
+        try:
+            handle = pool.submit(spec, "answer")
+            check("submit registers a queued future before worker execution",
+                  handle.state is agents_mod.TurnState.QUEUED
+                  and handle.started_at is None
+                  and handle.deadline_at is None
+                  and not handle.done()
+                  and pool.active_turn(handle.turn_id) is handle,
+                  f"state={handle.state}, id={handle.turn_id}")
+
+            await started.wait()
+            observation_timed_out = False
+            try:
+                await handle.wait(timeout=0.01)
+            except TimeoutError:
+                observation_timed_out = True
+            check("an observational timeout leaves the agent task running",
+                  observation_timed_out
+                  and handle.state is agents_mod.TurnState.RUNNING
+                  and not handle.done(),
+                  f"state={handle.state}")
+            check("the running handle exposes its absolute task deadline",
+                  handle.started_at is not None
+                  and handle.deadline_at is not None
+                  and abs(handle.deadline_at - handle.started_at - 5) < 0.001,
+                  f"started={handle.started_at}, deadline={handle.deadline_at}")
+
+            release.set()
+            turn = await handle
+            completion = await pool.next_completion(timeout=0.1)
+            check("settlement resolves waiters and the serialized inbox",
+                  turn.text == "answer" and completion is handle
+                  and handle.result is turn
+                  and handle.state is agents_mod.TurnState.COMPLETED
+                  and handle.settled_at is not None,
+                  f"state={handle.state}, result={handle.result}")
+            await handle.wait_cleanup(timeout=0.1)
+
+            duplicate = False
+            try:
+                await pool.next_completion(timeout=0.01)
+            except TimeoutError:
+                duplicate = True
+            check("one settlement enters the completion inbox exactly once",
+                  duplicate)
+
+            timeout_handle = pool.submit(spec, "timeout")
+            timeout_turn = await timeout_handle
+            timeout_completion = await pool.next_completion(timeout=0.1)
+            check("timeout results have an explicit terminal handle state",
+                  timeout_completion is timeout_handle
+                  and timeout_turn.meta.get("timeout_kind") == "turn"
+                  and timeout_handle.state is agents_mod.TurnState.TIMED_OUT,
+                  f"state={timeout_handle.state}, turn={timeout_turn}")
+
+            compatible = await pool.run(spec, "compatible")
+            unpublished = False
+            try:
+                await pool.next_completion(timeout=0)
+            except TimeoutError:
+                unpublished = True
+            check("pool.run remains compatible without retaining inbox entries",
+                  compatible.text == "compatible" and unpublished,
+                  repr(compatible))
+
+            cancelled = pool.submit(spec, "cancel before start")
+            cancelled.cancel()
+            cancelled_turn = await cancelled.wait(timeout=0.1)
+            cancelled_completion = await pool.next_completion(timeout=0.1)
+            await cancelled.wait_cleanup(timeout=0.1)
+            check("pre-start cancellation settles without executing the runner",
+                  cancelled_completion is cancelled
+                  and cancelled_turn.meta.get("cancelled") is True
+                  and "cancel before start" not in calls
+                  and pool.active_turn(cancelled.turn_id) is None,
+                  f"calls={calls}, state={cancelled.state}")
+        finally:
+            release.set()
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
+
+
+async def test_turn_handle_cancel_settles_before_worker_cleanup() -> None:
+    print("\n[9k] cancelled handles notify parents before worker cleanup")
+    from leftover import agents as agents_mod
+
+    started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+
+    class CancellingRunner(agents_mod.BaseRunner):
+        async def run(self, prompt: str, on_event=None) -> Turn:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleanup_started.set()
+                await cleanup_release.wait()
+                raise
+
+    original_build = agents_mod.build_runner
+    agents_mod.build_runner = lambda spec: CancellingRunner(spec)
+    spec = AgentSpec(key="cancel-handle", label="Cancel handle", timeout=5)
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(
+            agents=[spec], default_workdir=tmp, data_dir=tmp))
+        handle = pool.submit(spec, "work")
+        try:
+            await started.wait()
+            first_cancel = handle.cancel()
+            completion = await pool.next_completion(timeout=0.1)
+            cancelled_turn = await handle.wait(timeout=0.1)
+            await cleanup_started.wait()
+            check("cancel is one-shot and publishes a terminal result",
+                  first_cancel
+                  and completion is handle
+                  and cancelled_turn is handle.result
+                  and handle.state is agents_mod.TurnState.CANCELLED
+                  and cancelled_turn.meta.get("cancelled") is True,
+                  f"state={handle.state}, turn={cancelled_turn}")
+            check("the parent can observe cancellation before cleanup finishes",
+                  not handle.cleanup_done())
+
+            cleanup_release.set()
+            await handle.wait_cleanup(timeout=0.1)
+            check("worker cleanup has a separately observable boundary",
+                  handle.cleanup_done()
+                  and pool.active_turn(handle.turn_id) is None
+                  and not handle.cancel())
+        finally:
+            cleanup_release.set()
+            await handle.wait_cleanup(timeout=0.2)
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
+
+
+async def test_agent_pool_run_cancel_does_not_wait_for_cleanup() -> None:
+    print("\n[9k] pool.run cancellation does not wait for worker cleanup")
+    from leftover import agents as agents_mod
+
+    started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+
+    class StubbornCleanupRunner(agents_mod.BaseRunner):
+        async def run(self, prompt: str, on_event=None) -> Turn:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleanup_started.set()
+                await cleanup_release.wait()
+                raise
+
+    original_build = agents_mod.build_runner
+    agents_mod.build_runner = lambda spec: StubbornCleanupRunner(spec)
+    spec = AgentSpec(key="run-cancel", label="Run cancel", timeout=5)
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(
+            agents=[spec], default_workdir=tmp, data_dir=tmp))
+        task = asyncio.create_task(pool.run(spec, "work"))
+        handle = None
+        try:
+            await started.wait()
+            handle = next(iter(pool._active_turns.values()))
+            task.cancel()
+            done, _pending = await asyncio.wait({task}, timeout=0.05)
+            cancelled = False
+            if task in done:
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    cancelled = True
+            await asyncio.wait_for(cleanup_started.wait(), timeout=0.1)
+            check("the compatibility caller receives cancellation immediately",
+                  cancelled and handle.state is agents_mod.TurnState.CANCELLED,
+                  f"done={task in done}, state={handle.state}")
+            check("the same worker continues its bounded cleanup in background",
+                  not handle.cleanup_done()
+                  and pool.active_turn(handle.turn_id) is handle)
+
+            cleanup_release.set()
+            await handle.wait_cleanup(timeout=0.1)
+            check("background cleanup eventually retires the active handle",
+                  handle.cleanup_done()
+                  and pool.active_turn(handle.turn_id) is None)
+        finally:
+            cleanup_release.set()
+            await asyncio.gather(task, return_exceptions=True)
+            if handle is not None:
+                await handle.wait_cleanup(timeout=0.2)
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
+
+
+async def test_agent_pool_cancel_all_covers_queued_and_racing_submits() -> None:
+    print("\n[9k] cancel_all covers queued and concurrently submitted turns")
+    from leftover import agents as agents_mod
+
+    active_started = asyncio.Event()
+    active_release = asyncio.Event()
+    cancel_entered = asyncio.Event()
+    cancel_release = asyncio.Event()
+    calls: list[str] = []
+    state = {"block_cancel": False, "cancel_calls": 0}
+
+    class SweepRunner(agents_mod.BaseRunner):
+        async def run(self, prompt: str, on_event=None) -> Turn:
+            calls.append(prompt)
+            if prompt == "active":
+                active_started.set()
+                await active_release.wait()
+            return Turn(agent=self.spec, text=prompt)
+
+        async def cancel(self) -> None:
+            state["cancel_calls"] += 1
+            cancel_entered.set()
+            if state["block_cancel"]:
+                await cancel_release.wait()
+            active_release.set()
+
+    original_build = agents_mod.build_runner
+    agents_mod.build_runner = lambda spec: SweepRunner(spec)
+    spec = AgentSpec(key="cancel-sweep", label="Cancel sweep", timeout=5)
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(
+            agents=[spec], default_workdir=tmp, data_dir=tmp))
+        active = pool.submit(spec, "active")
+        queued = None
+        racing = None
+        cancel_task = None
+        try:
+            await active_started.wait()
+            queued = pool.submit(spec, "queued")
+            await pool.cancel_all()
+            active_turn, queued_turn = await asyncio.gather(
+                active.wait(), queued.wait())
+            await asyncio.gather(
+                active.wait_cleanup(timeout=0.1),
+                queued.wait_cleanup(timeout=0.1))
+            check("one sweep settles running and queued handles as cancelled",
+                  active_turn.meta.get("cancelled") is True
+                  and queued_turn.meta.get("cancelled") is True
+                  and active.state is agents_mod.TurnState.CANCELLED
+                  and queued.state is agents_mod.TurnState.CANCELLED,
+                  f"active={active.state}, queued={queued.state}")
+            check("a queued turn never reaches the runner after cancellation",
+                  calls == ["active"], repr(calls))
+
+            state["block_cancel"] = True
+            cancel_entered.clear()
+            cancel_task = asyncio.create_task(pool.cancel_all())
+            await cancel_entered.wait()
+            racing = pool.submit(spec, "racing")
+            racing_turn = await racing.wait(timeout=0.1)
+            check("a submit racing an active sweep inherits cancellation",
+                  racing_turn.meta.get("cancelled") is True
+                  and racing.state is agents_mod.TurnState.CANCELLED
+                  and "racing" not in calls,
+                  f"state={racing.state}, calls={calls}")
+
+            cancel_release.set()
+            await cancel_task
+            await racing.wait_cleanup(timeout=0.1)
+            check("cancel epochs close after the sweep and leave no active turn",
+                  not pool._cancel_active
+                  and all(pool.active_turn(handle.turn_id) is None
+                          for handle in (active, queued, racing)))
+        finally:
+            active_release.set()
+            cancel_release.set()
+            if cancel_task is not None:
+                await asyncio.gather(cancel_task, return_exceptions=True)
+            for handle in (active, queued, racing):
+                if handle is not None:
+                    handle.cancel()
+                    await handle.wait_cleanup(timeout=0.2)
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
+
+
+async def test_cancel_all_external_cancel_still_stops_workers() -> None:
+    print("\n[9k] interrupted cancel sweeps still stop owned workers")
+    from leftover import agents as agents_mod
+
+    run_started = asyncio.Event()
+    runner_cancel_started = asyncio.Event()
+    worker_cancelled = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    state = {"block_runner_cancel": True}
+
+    class InterruptedCancelRunner(agents_mod.BaseRunner):
+        async def run(self, prompt: str, on_event=None) -> Turn:
+            run_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                worker_cancelled.set()
+                await cleanup_release.wait()
+                raise
+
+        async def cancel(self) -> None:
+            runner_cancel_started.set()
+            if state["block_runner_cancel"]:
+                await asyncio.Event().wait()
+
+    original_build = agents_mod.build_runner
+    agents_mod.build_runner = lambda spec: InterruptedCancelRunner(spec)
+    spec = AgentSpec(key="cancel-interrupted", label="Cancel interrupted")
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(
+            agents=[spec], default_workdir=tmp, data_dir=tmp))
+        handle = pool.submit(spec, "work")
+        cancel_task = None
+        try:
+            await run_started.wait()
+            cancel_task = asyncio.create_task(pool.cancel_all())
+            await runner_cancel_started.wait()
+            cancel_task.cancel()
+            result = await asyncio.gather(
+                cancel_task, return_exceptions=True)
+            turn = await handle.wait(timeout=0.1)
+            await asyncio.wait_for(worker_cancelled.wait(), timeout=0.1)
+            check("external cancellation propagates after the worker stop",
+                  isinstance(result[0], asyncio.CancelledError)
+                  and turn.meta.get("cancelled") is True
+                  and handle.state is agents_mod.TurnState.CANCELLED
+                  and not handle.cleanup_done()
+                  and not pool._cancel_active
+                  and not pool._cancel_lock.locked(),
+                  f"result={result}, state={handle.state}")
+
+            cleanup_release.set()
+            await handle.wait_cleanup(timeout=0.1)
+            check("the interrupted sweep leaves no cleanup-owned handle",
+                  handle.cleanup_done()
+                  and pool.active_turn(handle.turn_id) is None)
+        finally:
+            state["block_runner_cancel"] = False
+            cleanup_release.set()
+            if cancel_task is not None:
+                await asyncio.gather(cancel_task, return_exceptions=True)
+            handle.cancel()
+            await handle.wait_cleanup(timeout=0.2)
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
+
+
+async def test_base_runner_context_is_task_local() -> None:
+    print("\n[9k] runner settlement context is task-local")
+    from leftover import agents as agents_mod
+
+    entered: list[str] = []
+    both_entered = asyncio.Event()
+    settled: dict[str, Turn] = {}
+
+    class ConcurrentRunner(agents_mod.BaseRunner):
+        async def stream(self, prompt: str, on_event=None):
+            entered.append(prompt)
+            if len(entered) == 2:
+                both_entered.set()
+            await both_entered.wait()
+            yield agents_mod.Event("text", prompt)
+            self._settle_active_turn()
+            yield agents_mod.Event("done")
+
+    runner = ConcurrentRunner(AgentSpec(
+        key="context-local", label="Context local"))
+
+    async def invoke(prompt: str) -> Turn:
+        token = runner._bind_turn_settler(
+            lambda turn: settled.setdefault(prompt, turn))
+        try:
+            return await runner.run(prompt)
+        finally:
+            runner._unbind_turn_settler(token)
+
+    first, second = await asyncio.gather(
+        invoke("FIRST"), invoke("SECOND"))
+    check("concurrent direct runs retain their own text and settler",
+          first.text == "FIRST" and second.text == "SECOND"
+          and settled["FIRST"] is first and settled["SECOND"] is second,
+          f"turns={[first.text, second.text]}, "
+          f"settled={list(settled)}")
+
+    third = await runner.run("THIRD")
+    check("run and settler ContextVars reset after each task",
+          third.text == "THIRD" and len(settled) == 2
+          and runner._run_context.get() is None
+          and runner._turn_settler.get() is None)
+
+    late_release = asyncio.Event()
+    late_tasks: list[asyncio.Task] = []
+    late_settlements: list[Turn] = []
+
+    class ChildRunner(agents_mod.BaseRunner):
+        async def stream(self, prompt: str, on_event=None):
+            async def settle_late() -> None:
+                await late_release.wait()
+                self._settle_active_turn(error="late inherited context")
+
+            late_tasks.append(asyncio.create_task(settle_late()))
+            yield agents_mod.Event("text", "SEALED")
+            yield agents_mod.Event("done")
+
+    child_runner = ChildRunner(AgentSpec(
+        key="context-child", label="Context child"))
+    token = child_runner._bind_turn_settler(late_settlements.append)
+    try:
+        sealed = await child_runner.run("spawn child")
+    finally:
+        child_runner._unbind_turn_settler(token)
+    late_release.set()
+    await asyncio.gather(*late_tasks)
+    check("a late inherited child cannot mutate a finalized turn",
+          sealed.text == "SEALED" and sealed.error is None
+          and not late_settlements,
+          f"turn={sealed}, settlements={len(late_settlements)}")
+
+
+async def test_shutdown_interrupts_prepare_startup() -> None:
+    print("\n[9k] shutdown owns direct prepare startup")
+    from leftover import agents as agents_mod
+
+    start_entered = asyncio.Event()
+    start_cancelled = asyncio.Event()
+    start_release = asyncio.Event()
+    start_finished = asyncio.Event()
+    late_closed = asyncio.Event()
+    state = {"close_calls": 0}
+
+    class PrepareRunner(agents_mod.BaseRunner):
+        async def start(self, workdir: str) -> None:
+            start_entered.set()
+            while not start_release.is_set():
+                try:
+                    await start_release.wait()
+                except asyncio.CancelledError:
+                    start_cancelled.set()
+            start_finished.set()
+
+        async def close(self) -> None:
+            state["close_calls"] += 1
+            if state["close_calls"] >= 2:
+                late_closed.set()
+
+    original_build = agents_mod.build_runner
+    original_timeout = agents_mod.POOL_TRANSITION_TIMEOUT
+    agents_mod.build_runner = lambda spec: PrepareRunner(spec)
+    agents_mod.POOL_TRANSITION_TIMEOUT = 0.03
+    spec = AgentSpec(key="prepare-shutdown", label="Prepare shutdown")
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(
+            agents=[spec], default_workdir=tmp, data_dir=tmp))
+        preparing = asyncio.create_task(pool.prepare(spec))
+        try:
+            await start_entered.wait()
+            first_error = None
+            started = asyncio.get_running_loop().time()
+            try:
+                await pool.shutdown()
+            except agents_mod._PoolTransitionTimeout as exc:
+                first_error = str(exc)
+            elapsed = asyncio.get_running_loop().time() - started
+            result = await asyncio.gather(
+                preparing, return_exceptions=True)
+            check("shutdown cancels startup outside a submitted turn",
+                  isinstance(result[0], asyncio.CancelledError)
+                  and start_cancelled.is_set()
+                  and first_error == (
+                      "agent pool shutdown timed out after 0.03s")
+                  and elapsed < 0.15
+                  and len(pool._startup_tasks) == 1
+                  and not pool._warmup_owners
+                  and pool._operations._readers == 0
+                  and pool.peek(spec) is None
+                  and state["close_calls"] == 1,
+                  f"result={result}, error={first_error!r}, state={state}")
+
+            owned = set(pool._background_tasks)
+            second_error = None
+            try:
+                await pool.shutdown()
+            except agents_mod._PoolTransitionTimeout as exc:
+                second_error = str(exc)
+            check("a repeated shutdown still owns the unfinished finalizer",
+                  second_error == (
+                      "agent pool shutdown timed out after 0.03s")
+                  and owned
+                  and owned <= pool._background_tasks
+                  and len(pool._startup_finalizers) == 1,
+                  f"error={second_error!r}, background={len(owned)}")
+
+            start_release.set()
+            await asyncio.wait_for(start_finished.wait(), timeout=0.2)
+            await asyncio.wait_for(late_closed.wait(), timeout=0.2)
+            while pool._startup_tasks or pool._background_tasks:
+                await asyncio.sleep(0)
+            check("a late startup is closed again before its registry retires",
+                  state["close_calls"] == 2
+                  and not pool._startup_tasks
+                  and not pool._background_tasks,
+                  str(state))
+            await pool.shutdown()
+            task_names = {task.get_name() for task in asyncio.all_tasks()}
+            check("startup lifecycle tasks are gone after terminal cleanup",
+                  not any(name.startswith((
+                      "leftover-start-", "leftover-finalize-start-",
+                      "leftover-close-")) for name in task_names),
+                  repr(sorted(task_names)))
+        finally:
+            start_release.set()
+            preparing.cancel()
+            await asyncio.gather(preparing, return_exceptions=True)
+            agents_mod.POOL_TRANSITION_TIMEOUT = original_timeout
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
+
+
+async def test_cancel_epoch_blocks_racing_prepare() -> None:
+    print("\n[9k] cancel epochs cover racing direct prepare")
+    from leftover import agents as agents_mod
+
+    cancel_entered = asyncio.Event()
+    cancel_release = asyncio.Event()
+    starts: list[str] = []
+
+    class RacingPrepareRunner(agents_mod.BaseRunner):
+        async def start(self, workdir: str) -> None:
+            starts.append(self.spec.key)
+            await super().start(workdir)
+
+        async def cancel(self) -> None:
+            if self.spec.key == "installed":
+                cancel_entered.set()
+                await cancel_release.wait()
+
+    original_build = agents_mod.build_runner
+    agents_mod.build_runner = lambda spec: RacingPrepareRunner(spec)
+    specs = [
+        AgentSpec(key="installed", label="Installed"),
+        AgentSpec(key="racing-prepare", label="Racing prepare"),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(
+            agents=specs, default_workdir=tmp, data_dir=tmp))
+        cancel_task = None
+        racing = None
+        try:
+            await pool.prepare(specs[0])
+            cancel_task = asyncio.create_task(pool.cancel_all())
+            await cancel_entered.wait()
+            racing = asyncio.create_task(pool.prepare(specs[1]))
+            result = await asyncio.gather(
+                racing, return_exceptions=True)
+            check("a prepare racing the sweep cannot start a runner",
+                  isinstance(result[0], asyncio.CancelledError)
+                  and starts == ["installed"]
+                  and pool.peek(specs[1]) is None,
+                  f"result={result}, starts={starts}")
+
+            cancel_release.set()
+            await cancel_task
+        finally:
+            cancel_release.set()
+            pending = [
+                task for task in (cancel_task, racing)
+                if task is not None
+            ]
+            await asyncio.gather(*pending, return_exceptions=True)
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
+
+
+async def test_cancel_rolls_back_inflight_fallback_handoff() -> None:
+    print("\n[9k] cancelled warmups cannot install a late exec fallback")
+    from leftover import agents as agents_mod
+
+    fallback_entered = asyncio.Event()
+    fallback_cancelled = asyncio.Event()
+    fallback_release = asyncio.Event()
+    fallback_finished = asyncio.Event()
+    fallback_reclosed = asyncio.Event()
+    state = {"close_calls": 0}
+
+    class FailedRunner(agents_mod.BaseRunner):
+        async def start(self, workdir: str) -> None:
+            raise RuntimeError("ACP unavailable")
+
+    class RacingFallback(agents_mod.BaseRunner):
+        async def start(self, workdir: str) -> None:
+            fallback_entered.set()
+            while not fallback_release.is_set():
+                try:
+                    await fallback_release.wait()
+                except asyncio.CancelledError:
+                    fallback_cancelled.set()
+            await super().start(workdir)
+            fallback_finished.set()
+
+        async def close(self) -> None:
+            state["close_calls"] += 1
+            if state["close_calls"] >= 2:
+                fallback_reclosed.set()
+
+    original_build = agents_mod.build_runner
+    original_exec = agents_mod.ExecRunner
+    agents_mod.build_runner = lambda spec: FailedRunner(spec)
+    agents_mod.ExecRunner = RacingFallback
+    spec = AgentSpec(key="fallback-race", label="Fallback race")
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(
+            agents=[spec], default_workdir=tmp, data_dir=tmp))
+        preparing = asyncio.create_task(pool.prepare(spec))
+        cancelling = None
+        try:
+            await fallback_entered.wait()
+            cancelling = asyncio.create_task(pool.cancel_all())
+            await cancelling
+            result = await asyncio.gather(
+                preparing, return_exceptions=True)
+            check("cancelled fallback handoff retains cleanup ownership",
+                  isinstance(result[0], asyncio.CancelledError)
+                  and fallback_cancelled.is_set()
+                  and pool.peek(spec) is None
+                  and not pool._warmup_owners
+                  and pool._operations._readers == 0
+                  and len(pool._startup_tasks) == 1
+                  and len(pool._startup_finalizers) == 1
+                  and bool(pool._background_tasks)
+                  and state["close_calls"] in (0, 1),
+                  f"result={result}, runner={pool.peek(spec)}, state={state}")
+
+            fallback_release.set()
+            await asyncio.wait_for(fallback_finished.wait(), timeout=0.2)
+            await asyncio.wait_for(fallback_reclosed.wait(), timeout=0.2)
+            while pool._startup_tasks or pool._background_tasks:
+                await asyncio.sleep(0)
+            check("a late fallback startup is reclosed and fully retired",
+                  state["close_calls"] == 2
+                  and not pool._startup_tasks
+                  and not pool._background_tasks,
+                  str(state))
+        finally:
+            fallback_release.set()
+            preparing.cancel()
+            await asyncio.gather(preparing, return_exceptions=True)
+            if cancelling is not None:
+                await asyncio.gather(cancelling, return_exceptions=True)
+            await pool.shutdown()
+            agents_mod.ExecRunner = original_exec
+            agents_mod.build_runner = original_build
+
+
+async def test_pool_acp_cancel_rpc_is_once_per_turn() -> None:
+    print("\n[9k] pool cancellation sends one ACP cancel RPC per turn")
+    from leftover import agents as agents_mod
+    from leftover.agents import acp_runner as acp_mod
+
+    prompt_started = asyncio.Event()
+    state = {"cancel_calls": 0}
+
+    class Connection:
+        async def prompt(self, session_id, prompt):
+            prompt_started.set()
+            await asyncio.Event().wait()
+
+        async def cancel(self, session_id):
+            state["cancel_calls"] += 1
+
+    class CountingCancelRunner(acp_mod.AcpRunner):
+        async def start(self, workdir: str) -> None:
+            self._workdir = os.path.realpath(workdir)
+            self._conn = Connection()
+            self._session_id = "cancel-once-session"
+
+        async def _abort_prompt(self, task, turn):
+            await self.cancel()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    original_build = agents_mod.build_runner
+    agents_mod.build_runner = lambda spec: CountingCancelRunner(spec)
+    spec = AgentSpec(
+        key="acp-cancel-once", label="ACP cancel once",
+        acp_command=["unused"], timeout=1, acp_idle_timeout=0)
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(
+            agents=[spec], default_workdir=tmp, data_dir=tmp))
+        handle = pool.submit(spec, "work")
+        try:
+            await prompt_started.wait()
+            await pool.cancel_all()
+            turn = await handle.wait(timeout=0.1)
+            await handle.wait_cleanup(timeout=0.1)
+            check("graceful and hard cleanup share one cancel attempt",
+                  turn.meta.get("cancelled") is True
+                  and state["cancel_calls"] == 1,
+                  f"turn={turn}, state={state}")
+        finally:
+            handle.cancel()
+            await handle.wait_cleanup(timeout=0.2)
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
+
+
+async def test_agent_pool_shutdown_cancels_turn_during_startup() -> None:
+    print("\n[9k] shutdown cannot let a startup race begin a prompt")
+    from leftover import agents as agents_mod
+
+    start_entered = asyncio.Event()
+    start_cancelled = asyncio.Event()
+    start_release = asyncio.Event()
+    prompt_calls: list[str] = []
+    state = {"close_calls": 0}
+
+    class SlowStartupRunner(agents_mod.BaseRunner):
+        async def start(self, workdir: str) -> None:
+            start_entered.set()
+            try:
+                await start_release.wait()
+            except asyncio.CancelledError:
+                start_cancelled.set()
+                await start_release.wait()
+            await super().start(workdir)
+
+        async def run(self, prompt: str, on_event=None) -> Turn:
+            prompt_calls.append(prompt)
+            return Turn(agent=self.spec, text=prompt)
+
+        async def close(self) -> None:
+            state["close_calls"] += 1
+
+    original_build = agents_mod.build_runner
+    agents_mod.build_runner = lambda spec: SlowStartupRunner(spec)
+    spec = AgentSpec(key="startup-shutdown", label="Startup shutdown")
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(
+            agents=[spec], default_workdir=tmp, data_dir=tmp))
+        handle = pool.submit(spec, "must not start")
+        shutdown_task = None
+        try:
+            await start_entered.wait()
+            shutdown_task = asyncio.create_task(pool.shutdown())
+            while not pool._shutdown_active:
+                await asyncio.sleep(0)
+            turn = await handle.wait(timeout=0.1)
+            check("shutdown settles a turn that is still starting",
+                  turn.meta.get("cancelled") is True
+                  and handle.state is agents_mod.TurnState.CANCELLED,
+                  f"state={handle.state}, turn={turn}")
+
+            start_release.set()
+            await asyncio.wait_for(shutdown_task, timeout=0.2)
+            await handle.wait_cleanup(timeout=0.1)
+            check("a late startup completion cannot cross the shutdown epoch",
+                  start_cancelled.is_set() and not prompt_calls
+                  and pool.peek(spec) is None
+                  and state["close_calls"] == 2
+                  and not pool._startup_tasks
+                  and not pool._background_tasks,
+                  f"prompts={prompt_calls}, state={state}")
+        finally:
+            start_release.set()
+            if shutdown_task is not None:
+                await asyncio.gather(shutdown_task, return_exceptions=True)
+            handle.cancel()
+            await handle.wait_cleanup(timeout=0.2)
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
+
+
+async def test_turn_completion_inbox_is_bounded_fifo() -> None:
+    print("\n[9k] completion inbox is a bounded process-local FIFO")
+    from leftover import agents as agents_mod
+
+    class ImmediateRunner(agents_mod.BaseRunner):
+        async def run(self, prompt: str, on_event=None) -> Turn:
+            return Turn(agent=self.spec, text=prompt)
+
+    original_build = agents_mod.build_runner
+    agents_mod.build_runner = lambda spec: ImmediateRunner(spec)
+    spec = AgentSpec(key="inbox", label="Inbox")
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(
+            agents=[spec], default_workdir=tmp, data_dir=tmp))
+        count = agents_mod.COMPLETION_INBOX_SIZE + 2
+        handles = [pool.submit(spec, str(index)) for index in range(count)]
+        try:
+            await asyncio.gather(*(handle.wait() for handle in handles))
+            received = [
+                await pool.next_completion(timeout=0)
+                for _ in range(agents_mod.COMPLETION_INBOX_SIZE)
+            ]
+            check("overflow deterministically drops the oldest completions",
+                  received == handles[-agents_mod.COMPLETION_INBOX_SIZE:],
+                  f"first={received[0].result.text}, "
+                  f"last={received[-1].result.text}")
+            check("turn ids remain unique across a full completion window",
+                  len({handle.turn_id for handle in handles}) == count)
+            check("overflow is observable instead of silently losing callbacks",
+                  pool.completion_overflows() == 2,
+                  f"overflows={pool.completion_overflows()}")
+
+            owner_a = pool.submit(spec, "owner-a", parent_id="chat-a")
+            owner_b = pool.submit(spec, "owner-b", parent_id="chat-b")
+            await asyncio.gather(owner_a.wait(), owner_b.wait())
+            completion_a = await pool.next_completion(
+                timeout=0.1, parent_id="chat-a")
+            completion_b = await pool.next_completion(
+                timeout=0.1, parent_id="chat-b")
+            check("completion consumers cannot steal another parent's result",
+                  completion_a is owner_a and completion_b is owner_b
+                  and completion_a.parent_id == "chat-a"
+                  and completion_b.parent_id == "chat-b")
+
+            for index in range(20):
+                try:
+                    await pool.next_completion(
+                        timeout=0, parent_id=f"empty-{index}")
+                except TimeoutError:
+                    pass
+            check("empty and drained owner inboxes retire automatically",
+                  set(pool._completion_inboxes) == {None})
+
+            owner_c = pool.submit(spec, "owner-c", parent_id="chat-c")
+            await owner_c.wait()
+            discarded = pool.discard_completions(parent_id="chat-c")
+            check("owners can release unconsumed callback storage",
+                  discarded == 1
+                  and "chat-c" not in pool._completion_inboxes
+                  and pool.completion_overflows(parent_id="chat-c") == 0)
+            await asyncio.gather(*(
+                handle.wait_cleanup(timeout=0.2)
+                for handle in [*handles, owner_a, owner_b, owner_c]))
+        finally:
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
 
 
 async def test_router_does_not_replay_shutdown_interrupted_turn() -> None:
@@ -2114,6 +3808,26 @@ async def test_router_does_not_replay_shutdown_interrupted_turn() -> None:
               router.h(specs[0]).consecutive == 0
               and router.h(specs[0]).last_error == "",
               router.h(specs[0]).describe())
+
+        calls.clear()
+
+        class CancelledPool:
+            async def run(self, spec, prompt, on_event=None):
+                calls.append(spec.key)
+                return Turn(
+                    agent=spec, error="cancelled",
+                    meta={"cancelled": True})
+
+        router = Router(cfg, CancelledPool())
+        turn, decision = await router.run(
+            lambda spec: "work", primary=specs[0],
+            ordered_chain=specs, max_attempts=2)
+        check("explicit cancellation cannot restart on a fallback backend",
+              calls == ["first"] and decision.tried == ["first"]
+              and turn.meta.get("cancelled") is True
+              and not decision.attempts[0].timed_out
+              and router.h(specs[0]).consecutive == 0,
+              f"calls={calls}, attempts={decision.attempts}")
 
 
 async def test_agent_pool_shutdown_interrupts_queued_runs() -> None:
@@ -2182,10 +3896,13 @@ async def test_agent_pool_shutdown_interrupts_queued_runs() -> None:
                 asyncio.gather(active, queued, shutdown_one, shutdown_two),
                 timeout=0.5)
             check("work queued before shutdown is never executed afterward",
-                  active_turn.ok and calls == ["active"]
+                  calls == ["active"]
+                  and active_turn.meta.get("cancelled") is True
+                  and active_turn.meta.get("shutdown_interrupted") is True
                   and queued_turn.meta.get("not_executed") is True
-                  and queued_turn.meta.get("shutdown_interrupted") is True,
-                  f"calls={calls}, queued={queued_turn}")
+                  and queued_turn.meta.get("shutdown_interrupted") is True
+                  and not active.cancelled() and not queued.cancelled(),
+                  f"calls={calls}, active={active_turn}, queued={queued_turn}")
             check("shutdown closes the runner once and completes",
                   state["close_calls"] == 1, str(state))
         finally:
@@ -2245,8 +3962,11 @@ async def test_agent_pool_cancel_bypasses_pending_workdir_writer() -> None:
             active_turn, _, _ = await asyncio.wait_for(
                 asyncio.gather(active, switching, cancelling), timeout=0.5)
             check("cancel_all does not queue behind the pending writer",
-                  active_turn.ok and state["cancel_calls"] == 1
-                  and pool.workdir == new_dir, str(state))
+                  active_turn.meta.get("cancelled") is True
+                  and not active.cancelled()
+                  and state["cancel_calls"] == 1
+                  and pool.workdir == new_dir,
+                  f"turn={active_turn}, state={state}")
             check("the completed workdir switch closes the old runner",
                   state["close_calls"] == 1, str(state))
         finally:
@@ -2278,7 +3998,12 @@ async def test_agent_pool_transitions_have_hard_deadlines() -> None:
         async def stream(self, prompt: str, on_event=None):
             if self.spec.key == "hold":
                 hold_started.set()
-                await hold_release.wait()
+                try:
+                    await hold_release.wait()
+                except asyncio.CancelledError:
+                    # Model a lower-level SDK call that ignores task
+                    # cancellation until its own resource is released.
+                    await hold_release.wait()
             yield agents_mod.Event("text", f"{self.spec.key}:{self._workdir}")
             yield agents_mod.Event("done")
 
@@ -2429,6 +4154,324 @@ async def test_agent_pool_close_timeout_only_targets_detached_snapshot() -> None
             agents_mod.build_runner = original_build
 
 
+async def test_pool_retains_stubborn_control_cleanup() -> None:
+    print("\n[9n] pool retains stubborn cancel and close cleanup ownership")
+    from leftover import agents as agents_mod
+
+    original_build = agents_mod.build_runner
+    original_control = agents_mod._RUNNER_CONTROL_TIMEOUT
+    original_transition = agents_mod.POOL_TRANSITION_TIMEOUT
+    agents_mod._RUNNER_CONTROL_TIMEOUT = 0.01
+    agents_mod.POOL_TRANSITION_TIMEOUT = 0.03
+    try:
+        for operation in ("cancel", "close"):
+            entered = asyncio.Event()
+            cancelled = asyncio.Event()
+            release = asyncio.Event()
+            finished = asyncio.Event()
+            state = {"calls": 0}
+
+            class StubbornControlRunner(agents_mod.BaseRunner):
+                async def cancel(self):
+                    if operation == "cancel":
+                        await self._block_control()
+
+                async def close(self):
+                    if operation == "close":
+                        await self._block_control()
+
+                async def _block_control(self):
+                    state["calls"] += 1
+                    entered.set()
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        cancelled.set()
+                        await release.wait()
+                    finished.set()
+
+            agents_mod.build_runner = lambda spec: StubbornControlRunner(spec)
+            spec = AgentSpec(
+                key=f"control-{operation}", label=f"Control {operation}")
+            with tempfile.TemporaryDirectory() as tmp:
+                pool = AgentPool(Config(
+                    agents=[spec], default_workdir=tmp, data_dir=tmp))
+                await pool.prepare(spec)
+                try:
+                    first_error = None
+                    started = asyncio.get_running_loop().time()
+                    try:
+                        await pool.shutdown()
+                    except agents_mod._PoolTransitionTimeout as exc:
+                        first_error = str(exc)
+                    elapsed = asyncio.get_running_loop().time() - started
+                    await asyncio.wait_for(entered.wait(), timeout=0.1)
+                    await asyncio.wait_for(cancelled.wait(), timeout=0.1)
+                    owned = set(pool._background_tasks)
+                    check(f"stubborn {operation} obeys the shutdown deadline",
+                          first_error == (
+                              "agent pool shutdown timed out after 0.03s")
+                          and elapsed < 0.15 and len(owned) == 1,
+                          f"elapsed={elapsed:.3f}s, error={first_error!r}, "
+                          f"owned={len(owned)}")
+
+                    second_error = None
+                    try:
+                        await pool.shutdown()
+                    except agents_mod._PoolTransitionTimeout as exc:
+                        second_error = str(exc)
+                    check(f"repeated shutdown retains {operation} ownership",
+                          second_error == (
+                              "agent pool shutdown timed out after 0.03s")
+                          and owned <= pool._background_tasks
+                          and state["calls"] == 1,
+                          f"error={second_error!r}, state={state}")
+
+                    release.set()
+                    await asyncio.wait_for(finished.wait(), timeout=0.2)
+                    while pool._background_tasks:
+                        await asyncio.sleep(0)
+                    await pool.shutdown()
+                    names = {task.get_name() for task in asyncio.all_tasks()}
+                    check(f"released {operation} cleanup retires completely",
+                          not pool._background_tasks
+                          and not any(name.startswith((
+                              "leftover-cancel-", "leftover-close-"))
+                              for name in names),
+                          repr(sorted(names)))
+                finally:
+                    release.set()
+                    await pool.shutdown()
+    finally:
+        agents_mod.build_runner = original_build
+        agents_mod._RUNNER_CONTROL_TIMEOUT = original_control
+        agents_mod.POOL_TRANSITION_TIMEOUT = original_transition
+
+
+async def test_start_finalizer_outer_cancel_wins_child_race() -> None:
+    print("\n[9n] finalizer cancellation wins a child completion race")
+    from leftover import agents as agents_mod
+
+    first_cancelled = asyncio.Event()
+    second_started = asyncio.Event()
+    release = asyncio.Event()
+    state = {"calls": 0, "child": None}
+
+    class RacingCloseRunner(agents_mod.BaseRunner):
+        async def close(self):
+            state["calls"] += 1
+            state["child"] = asyncio.current_task()
+            if state["calls"] > 1:
+                second_started.set()
+                await release.wait()
+                return
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                first_cancelled.set()
+                await asyncio.Event().wait()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(
+            agents=[], default_workdir=tmp, data_dir=tmp))
+        runner = RacingCloseRunner(AgentSpec(
+            key="close-race", label="Close race"))
+        start_task = asyncio.create_task(asyncio.sleep(0))
+        await start_task
+        retire_signal = asyncio.Event()
+        terminal_signal = asyncio.Event()
+        close_signal = asyncio.Event()
+        retire_signal.set()
+        pool._startup_close_timeouts[start_task] = 0.01
+        finalizer = asyncio.create_task(pool._finalize_detached_start(
+            start_task, runner, retire_signal, terminal_signal, close_signal))
+        try:
+            await asyncio.wait_for(first_cancelled.wait(), timeout=0.1)
+            terminal_signal.set()
+            child = state["child"]
+            assert isinstance(child, asyncio.Task)
+            child.cancel()
+            finalizer.cancel()
+            done, _pending = await asyncio.wait({finalizer}, timeout=0.05)
+            check("outer cancellation cannot be mistaken for child cancellation",
+                  finalizer in done and finalizer.cancelled()
+                  and state["calls"] == 1 and not second_started.is_set(),
+                  f"done={finalizer.done()}, cancelled={finalizer.cancelled()}, "
+                  f"calls={state['calls']}, second={second_started.is_set()}")
+        finally:
+            release.set()
+            finalizer.cancel()
+            child = state["child"]
+            if isinstance(child, asyncio.Task):
+                child.cancel()
+            await asyncio.gather(finalizer, return_exceptions=True)
+
+
+def test_pool_close_timeout_cannot_hang_asyncio_run() -> None:
+    print("\n[9n] timed-out pool cleanup cannot hang asyncio.run teardown")
+    child = r'''
+import asyncio
+import tempfile
+
+import leftover.agents as agents
+from leftover.config import AgentSpec, Config
+
+
+class StubbornClose(agents.BaseRunner):
+    async def close(self):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.Event().wait()
+
+
+agents.build_runner = lambda spec: StubbornClose(spec)
+agents.POOL_TRANSITION_TIMEOUT = 0.01
+
+
+async def main():
+    with tempfile.TemporaryDirectory() as tmp:
+        spec = AgentSpec(key="teardown-close", label="Teardown close")
+        pool = agents.AgentPool(Config(
+            agents=[spec], default_workdir=tmp, data_dir=tmp))
+        await pool.prepare(spec)
+        try:
+            await pool.shutdown()
+        except agents._PoolTransitionTimeout:
+            pass
+        print("main-returning", flush=True)
+
+
+asyncio.run(main())
+print("asyncio-run-returned", flush=True)
+'''
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", child], cwd=ROOT, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=1.0, check=False)
+        output = completed.stdout.splitlines()
+        ok = completed.returncode == 0 and output == [
+            "main-returning", "asyncio-run-returned"]
+        detail = (
+            f"returncode={completed.returncode}, stdout={completed.stdout!r}, "
+            f"stderr={completed.stderr!r}")
+    except subprocess.TimeoutExpired as exc:
+        ok = False
+        detail = f"timeout, stdout={exc.stdout!r}, stderr={exc.stderr!r}"
+    check("a close that swallows one cancellation cannot trap loop teardown",
+          ok, detail)
+
+
+async def test_background_failure_before_drain_is_observed_once() -> None:
+    print("\n[9n] completed background failures remain observable once")
+    from leftover import agents as agents_mod
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(agents=[], default_workdir=tmp, data_dir=tmp))
+
+        async def failed_cleanup() -> bool:
+            return False
+
+        task = asyncio.create_task(failed_cleanup())
+        pool._track_background_task(task, expect_true=True)
+        await task
+        await asyncio.sleep(0)
+        error = None
+        try:
+            await pool._drain_background_tasks(
+                time.monotonic() + 0.1, "test drain", 0.1)
+        except agents_mod._PoolTransitionTimeout as exc:
+            error = str(exc)
+        check("a pre-snapshot cleanup failure cannot disappear",
+              error == "agent pool test drain timed out after 0.1s"
+              and not pool._background_tasks,
+              f"error={error!r}, background={pool._background_tasks}")
+
+        await pool._drain_background_tasks(
+            time.monotonic() + 0.1, "test drain", 0.1)
+        check("the observed failure does not poison later clean drains",
+              not pool._background_tasks)
+
+
+async def test_start_finalizer_retries_self_cancelled_close() -> None:
+    print("\n[9n] startup finalizer never treats close cancellation as success")
+    from leftover import agents as agents_mod
+
+    start_entered = asyncio.Event()
+    start_release = asyncio.Event()
+    start_finished = asyncio.Event()
+    first_close = asyncio.Event()
+    resource = {"open": False, "close_calls": 0}
+    close_failure = {"sent": False}
+
+    class RetryCloseRunner(agents_mod.BaseRunner):
+        async def start(self, workdir: str) -> None:
+            start_entered.set()
+            try:
+                await start_release.wait()
+            except asyncio.CancelledError:
+                await start_release.wait()
+            resource["open"] = True
+            start_finished.set()
+
+        async def close(self) -> None:
+            resource["close_calls"] += 1
+            if not resource["open"]:
+                return
+            if not close_failure["sent"]:
+                close_failure["sent"] = True
+                first_close.set()
+                raise asyncio.CancelledError
+            resource["open"] = False
+
+    original_build = agents_mod.build_runner
+    original_timeout = agents_mod.POOL_TRANSITION_TIMEOUT
+    agents_mod.build_runner = lambda spec: RetryCloseRunner(spec)
+    agents_mod.POOL_TRANSITION_TIMEOUT = 0.03
+    spec = AgentSpec(key="retry-close", label="Retry close")
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(
+            agents=[spec], default_workdir=tmp, data_dir=tmp))
+        preparing = asyncio.create_task(pool.prepare(spec))
+        try:
+            await start_entered.wait()
+            with contextlib.suppress(agents_mod._PoolTransitionTimeout):
+                await pool.shutdown()
+            await asyncio.gather(preparing, return_exceptions=True)
+
+            start_release.set()
+            await asyncio.wait_for(start_finished.wait(), timeout=0.2)
+            await asyncio.wait_for(first_close.wait(), timeout=0.2)
+            await asyncio.sleep(0)
+
+            returned_while_open = False
+            try:
+                await pool.shutdown()
+                returned_while_open = resource["open"]
+            except agents_mod._PoolTransitionTimeout:
+                pass
+            check("a cancelled close cannot produce shutdown success",
+                  not returned_while_open,
+                  str(resource))
+
+            if resource["open"]:
+                await pool.shutdown()
+            check("the next explicit shutdown retries and closes the resource",
+                  not resource["open"]
+                  and resource["close_calls"] >= 2
+                  and not pool._background_tasks
+                  and not pool._startup_finalizers,
+                  str(resource))
+        finally:
+            start_release.set()
+            preparing.cancel()
+            await asyncio.gather(preparing, return_exceptions=True)
+            agents_mod.POOL_TRANSITION_TIMEOUT = original_timeout
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
+
+
 async def test_agent_pool_fast_close_error_does_not_mask_answer() -> None:
     print("\n[9o] fast close errors do not masquerade as pool timeouts")
     from leftover import agents as agents_mod
@@ -2442,12 +4485,16 @@ async def test_agent_pool_fast_close_error_does_not_mask_answer() -> None:
 
         async def close(self):
             state[self.spec.key] += 1
+            if state[self.spec.key] > 1:
+                return
             if self.spec.key == "timeout":
                 raise TimeoutError("runner's own cleanup error")
             raise asyncio.CancelledError
 
     original_build = agents_mod.build_runner
+    original_timeout = agents_mod.POOL_TRANSITION_TIMEOUT
     agents_mod.build_runner = lambda spec: BrokenCloseRunner(spec)
+    agents_mod.POOL_TRANSITION_TIMEOUT = 0.03
     specs = [
         AgentSpec(key="timeout", label="Fast timeout error"),
         AgentSpec(key="cancelled", label="Self-cancelled close"),
@@ -2456,23 +4503,31 @@ async def test_agent_pool_fast_close_error_does_not_mask_answer() -> None:
         pool = AgentPool(Config(
             agents=specs, default_workdir=tmp, data_dir=tmp))
 
-        async def run_with_final_cleanup() -> list[Turn]:
-            try:
-                return await asyncio.gather(*(
-                    pool.run(spec, "work") for spec in specs))
-            finally:
-                await pool.shutdown()
-
         try:
-            turns = await run_with_final_cleanup()
+            turns = await asyncio.gather(*(
+                pool.run(spec, "work") for spec in specs))
+            cleanup_error = None
+            try:
+                await pool.shutdown()
+            except agents_mod._PoolTransitionTimeout as exc:
+                cleanup_error = str(exc)
             check("an immediate cleanup error cannot overwrite a good turn",
                   all(turn.ok and turn.text == "completed answer"
-                      for turn in turns)
+                      for turn in turns),
+                  f"turns={turns}")
+            check("failed and self-cancelled close remain observable",
+                  cleanup_error == (
+                      "agent pool shutdown timed out after 0.03s")
                   and state == {"timeout": 1, "cancelled": 1}
                   and all(pool.peek(spec) is None for spec in specs),
-                  f"turns={turns}, state={state}")
+                  f"error={cleanup_error!r}, state={state}")
+            await pool.shutdown()
+            check("a later shutdown retries failed close operations",
+                  state == {"timeout": 2, "cancelled": 2}
+                  and not pool._background_tasks)
         finally:
             agents_mod.build_runner = original_build
+            agents_mod.POOL_TRANSITION_TIMEOUT = original_timeout
             await pool.shutdown()
 
 
@@ -2487,7 +4542,10 @@ async def test_agent_pool_external_cancel_restores_transition_state() -> None:
         async def stream(self, prompt: str, on_event=None):
             if self.spec.key == "hold":
                 hold_started.set()
-                await hold_release.wait()
+                try:
+                    await hold_release.wait()
+                except asyncio.CancelledError:
+                    await hold_release.wait()
             yield agents_mod.Event("text", self.spec.key)
             yield agents_mod.Event("done")
 
@@ -3117,6 +5175,7 @@ async def main() -> int:
     await test_recovery_and_auto()
     await test_group_substitution()
     await test_parallel_fallback_shares_one_ranking()
+    await test_group_cancellation_does_not_fallback()
     await test_group_role_reservations()
     await test_debate_turn_timeout_is_bounded()
     await test_acp_idle_timeout_tracks_all_updates()
@@ -3129,15 +5188,43 @@ async def main() -> int:
     await test_acp_cancelled_close_keeps_one_full_cleanup()
     await test_acp_close_still_closes_stack_after_process_stop_error()
     await test_acp_filesystem_callbacks_do_not_block_loop()
+    await test_acp_turn_epoch_rejects_late_updates()
+    await test_acp_terminal_precedes_abort_cleanup()
+    await test_agent_pool_observes_acp_timeout_before_cleanup()
+    await test_agent_pool_observes_sink_timeout_before_acp_cleanup()
+    await test_prompt_failure_retires_when_error_sink_closes()
+    await test_prompt_failure_keeps_already_queued_text()
+    await test_prompt_failure_settles_before_blocked_sink()
+    await test_acp_cancelled_stop_is_lifecycle_terminal()
+    await test_acp_abort_retires_prompt_failure_during_grace()
+    await test_old_acp_abort_cannot_retire_replacement_generation()
+    await test_session_cancel_retires_before_next_prompt()
     await test_acp_prompt_failure_rebuilds_only_next_turn()
     await test_acp_rebuild_failure_uses_exec_fallback()
     await test_agent_pool_workdir_gate_preserves_parallel_runs()
     await test_agent_pool_queue_timeout_is_safe_to_fallback()
+    await test_turn_handle_wait_and_completion_inbox()
+    await test_turn_handle_cancel_settles_before_worker_cleanup()
+    await test_agent_pool_run_cancel_does_not_wait_for_cleanup()
+    await test_agent_pool_cancel_all_covers_queued_and_racing_submits()
+    await test_cancel_all_external_cancel_still_stops_workers()
+    await test_base_runner_context_is_task_local()
+    await test_shutdown_interrupts_prepare_startup()
+    await test_cancel_epoch_blocks_racing_prepare()
+    await test_cancel_rolls_back_inflight_fallback_handoff()
+    await test_pool_acp_cancel_rpc_is_once_per_turn()
+    await test_agent_pool_shutdown_cancels_turn_during_startup()
+    await test_turn_completion_inbox_is_bounded_fifo()
     await test_router_does_not_replay_shutdown_interrupted_turn()
     await test_agent_pool_shutdown_interrupts_queued_runs()
     await test_agent_pool_cancel_bypasses_pending_workdir_writer()
     await test_agent_pool_transitions_have_hard_deadlines()
     await test_agent_pool_close_timeout_only_targets_detached_snapshot()
+    await test_pool_retains_stubborn_control_cleanup()
+    await test_start_finalizer_outer_cancel_wins_child_race()
+    test_pool_close_timeout_cannot_hang_asyncio_run()
+    await test_background_failure_before_drain_is_observed_once()
+    await test_start_finalizer_retries_self_cancelled_close()
     await test_agent_pool_fast_close_error_does_not_mask_answer()
     await test_agent_pool_external_cancel_restores_transition_state()
     await test_acp_abort_is_hard_bounded_and_rotates_queue()

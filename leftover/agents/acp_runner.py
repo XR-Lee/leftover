@@ -8,11 +8,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import itertools
+import json
 import os
 import queue as thread_queue
 import sys
 import threading
 from collections.abc import Awaitable
+from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
 from acp import PROTOCOL_VERSION, spawn_agent_process, text_block
@@ -50,6 +52,68 @@ _POSIX_SESSION_WRAPPER = (
 
 # Permission kinds we are willing to auto-accept, best first.
 _ALLOW_ORDER = ("allow_always", "allow_once", "allow")
+_OBSERVED_UPDATE_LIMIT = 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _TurnTerminal:
+    """Exactly-once terminal outcome for one ACP prompt epoch."""
+
+    epoch: int
+    state: str
+    result: Any = None
+    error: BaseException | None = None
+
+
+class _TurnGate:
+    """Routes updates to one prompt and closes permanently when it settles."""
+
+    __slots__ = (
+        "epoch", "session_id", "queue", "delivery", "text_chunks", "tools",
+        "event_error", "terminal", "conn", "bridge", "generation",
+        "cancel_requested", "cancel_attempt", "pump_task", "_accepting",
+    )
+
+    def __init__(self, epoch: int, session_id: str,
+                 queue: asyncio.Queue[Any], *, conn: Any,
+                 bridge: _Bridge | None, generation: object) -> None:
+        self.epoch = epoch
+        self.session_id = session_id
+        self.queue = queue
+        self.delivery: asyncio.Queue[Any] = asyncio.Queue()
+        self.text_chunks: list[str] = []
+        self.tools: list[str] = []
+        self.event_error: str | None = None
+        self.conn = conn
+        self.bridge = bridge
+        self.generation = generation
+        self.cancel_requested = False
+        self.cancel_attempt: asyncio.Task[bool] | None = None
+        self.pump_task: asyncio.Task[None] | None = None
+        self.terminal: asyncio.Future[_TurnTerminal] = (
+            asyncio.get_running_loop().create_future())
+        self._accepting = True
+
+    def emit(self, item: Any) -> bool:
+        if not self._accepting:
+            return False
+        self.queue.put_nowait(item)
+        return True
+
+    @property
+    def accepting(self) -> bool:
+        return self._accepting
+
+    def settle(self, state: str, *, result: Any = None,
+               error: BaseException | None = None) -> bool:
+        if self.terminal.done():
+            return False
+        self._accepting = False
+        terminal = _TurnTerminal(
+            epoch=self.epoch, state=state, result=result, error=error)
+        self.terminal.set_result(terminal)
+        self.queue.put_nowait((_DONE, self.epoch))
+        return True
 
 
 def _block_text(content: Any) -> str:
@@ -63,6 +127,52 @@ def _block_text(content: Any) -> str:
     if isinstance(content, dict):
         return content.get("text", "")
     return ""
+
+
+def _update_payload(update: Any) -> Any:
+    if isinstance(update, dict):
+        return update
+    model_dump = getattr(update, "model_dump", None)
+    if callable(model_dump):
+        return model_dump(
+            mode="json", by_alias=True, exclude_none=True,
+            exclude_unset=True)
+    payload: dict[str, Any] = {}
+    kind = getattr(update, "session_update", None)
+    if kind is not None:
+        payload["sessionUpdate"] = kind
+    content = getattr(update, "content", None)
+    if content is not None:
+        text = _block_text(content)
+        payload["content"] = {"text": text} if text else str(content)
+    for attr, key in (
+            ("tool_call_id", "toolCallId"),
+            ("title", "title"),
+            ("kind", "kind")):
+        value = getattr(update, attr, None)
+        if value is not None:
+            payload[key] = value
+    return payload or repr(update)
+
+
+def _canonical_update_payload(value: Any) -> Any:
+    """Normalize raw JSON and parsed ACP models to one fingerprint shape."""
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_update_payload(item)
+            for key, item in value.items()
+            if item is not None
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_update_payload(item) for item in value]
+    return value
+
+
+def _update_fingerprint(update: Any) -> str:
+    return json.dumps(
+        _canonical_update_payload(_update_payload(update)),
+        sort_keys=True, separators=(",", ":"),
+        default=str)
 
 
 def _read_text_file_sync(path: str, line: int | None,
@@ -291,35 +401,98 @@ class _Bridge(Client):
         self.queue = queue
         self.trust_tools = trust_tools
         self._seen_tools: set[str] = set()
+        self._turn: _TurnGate | None = None
+        self._observed_updates: list[
+            tuple[str, str, _TurnGate | None]] = []
+        self.dropped_updates = 0
         self._conn: Any = None
 
     def on_connect(self, conn: Any) -> None:  # acp calls this synchronously
         self._conn = conn
 
-    async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
+    def observe_stream(self, event: Any) -> None:
+        """Capture turn ownership when a raw ACP notification arrives."""
+        direction = getattr(getattr(event, "direction", None), "value", None)
+        if direction != "incoming":
+            return
+        message = getattr(event, "message", None)
+        if not isinstance(message, dict) or message.get("method") != "session/update":
+            return
+        params = message.get("params")
+        if not isinstance(params, dict):
+            return
+        session_id = params.get("sessionId", params.get("session_id", ""))
+        update = params.get("update")
+        self._observed_updates.append((
+            str(session_id), _update_fingerprint(update), self._turn))
+        overflow = len(self._observed_updates) - _OBSERVED_UPDATE_LIMIT
+        if overflow > 0:
+            del self._observed_updates[:overflow]
+
+    def _claim_observed_turn(
+            self, session_id: str, update: Any) -> tuple[bool, _TurnGate | None]:
+        fingerprint = _update_fingerprint(update)
+        for index, (observed_session, observed_update, turn) in enumerate(
+                self._observed_updates):
+            if (observed_session == session_id
+                    and observed_update == fingerprint):
+                del self._observed_updates[index]
+                return True, turn
+        return False, None
+
+    def bind_turn(self, turn: _TurnGate) -> None:
+        active = self._turn
+        if active is not None and not active.terminal.done():
+            raise RuntimeError("cannot replace an active ACP prompt epoch")
+        self._turn = turn
+        self.queue = turn.queue
+        self._seen_tools.clear()
+
+    def settle_turn(self, turn: _TurnGate, state: str, *, result: Any = None,
+                    error: BaseException | None = None) -> bool:
+        settled = turn.settle(state, result=result, error=error)
+        if self._turn is turn:
+            self._turn = None
+        return settled
+
+    def session_update(self, session_id: str, update: Any,
+                       **kwargs: Any) -> Awaitable[None]:
+        # The raw stream observer captures ownership before the SDK schedules
+        # its notification handler. Direct/fake clients fall back to the gate
+        # visible when this method itself is called.
+        observed, turn = self._claim_observed_turn(session_id, update)
+        if not observed:
+            # Direct/fake clients have no raw observer entry. With a real raw
+            # entry, a mismatch is ambiguous and must not bind to a newer turn.
+            turn = None if self._observed_updates else self._turn
+        return self._session_update(turn, session_id, update, **kwargs)
+
+    async def _session_update(self, turn: _TurnGate | None, session_id: str,
+                              update: Any, **kwargs: Any) -> None:
+        if (turn is None or turn.session_id != session_id
+                or not turn.accepting):
+            self.dropped_updates += 1
+            return
         kind = getattr(update, "session_update", "")
-        emitted = False
+        event: Any = _ACTIVITY
         if kind == "agent_message_chunk":
             text = _block_text(getattr(update, "content", None))
             if text:
-                await self.queue.put(Event("text", text))
-                emitted = True
+                event = Event("text", text)
         elif kind == "agent_thought_chunk":
             text = _block_text(getattr(update, "content", None))
             if text:
-                await self.queue.put(Event("thought", text))
-                emitted = True
+                event = Event("thought", text)
         elif kind in ("tool_call", "tool_call_update"):
             tool_id = str(getattr(update, "tool_call_id", ""))
             title = getattr(update, "title", None) or getattr(update, "kind", "") or "tool"
             if tool_id not in self._seen_tools:
                 self._seen_tools.add(tool_id)
-                await self.queue.put(Event("tool", str(title)[:120]))
-                emitted = True
-        if not emitted:
-            # Wake the consumer for protocol activity, but do not treat repeated
-            # or non-renderable updates as user-visible idle progress.
-            await self.queue.put(_ACTIVITY)
+                event = Event("tool", str(title)[:120])
+        # Non-renderable activity wakes the consumer without extending the
+        # user-visible idle deadline. A settled gate rejects all late updates.
+        if not turn.emit(event):
+            self.dropped_updates += 1
 
     async def request_permission(self, session_id: str, tool_call: Any,
                                  options: list[Any], **kwargs: Any
@@ -368,6 +541,10 @@ class AcpRunner(BaseRunner):
         self._conn: Any = None
         self._session_id: str | None = None
         self._queue: asyncio.Queue[Any] = asyncio.Queue()
+        self._bridge: _Bridge | None = None
+        self._generation: object | None = None
+        self._turn_epoch = 0
+        self._active_turn: _TurnGate | None = None
         self._prompt_task: asyncio.Task[Any] | None = None
         self._lifecycle_epoch = 0
         self._lock = asyncio.Lock()
@@ -411,6 +588,7 @@ class AcpRunner(BaseRunner):
                         env={**os.environ, **spec.env},
                         cwd=requested_workdir,
                         transport_kwargs={"stderr": None},
+                        observers=[bridge.observe_stream],
                     )
                 )
                 tree = _capture_process_tree(proc, isolated=isolated)
@@ -456,12 +634,131 @@ class AcpRunner(BaseRunner):
             self._conn = conn
             self._session_id = session.session_id
             self._queue = queue
+            self._bridge = bridge
+            self._generation = object()
+
+    def _begin_turn(self, conn: Any, session_id: str) -> _TurnGate:
+        self._turn_epoch += 1
+        # Tests and embedders may install a fake connection directly. Give that
+        # manually installed transport the same identity guarantees as start().
+        if self._generation is None:
+            self._generation = object()
+        generation = self._generation
+        queue = self._queue
+        turn = _TurnGate(
+            self._turn_epoch, session_id, queue, conn=conn,
+            bridge=self._bridge, generation=generation)
+        self._active_turn = turn
+        if turn.bridge is not None:
+            turn.bridge.bind_turn(turn)
+        turn.pump_task = asyncio.create_task(
+            self._pump_turn_events(turn),
+            name=f"leftover-acp-events-{turn.epoch}",
+        )
+        turn.pump_task.add_done_callback(_consume_task_result)
+        return turn
+
+    def _owns_turn_generation(self, turn: _TurnGate) -> bool:
+        return (
+            self._active_turn is turn
+            and self._generation is turn.generation
+            and self._conn is turn.conn
+            and self._session_id == turn.session_id
+        )
+
+    def _snapshot_turn_events(self, turn: _TurnGate) -> None:
+        """Freeze every result-bearing event that precedes the terminal marker."""
+        context = self._run_context.get()
+        if context is None or context.settled:
+            return
+        context.chunks[:] = turn.text_chunks
+        context.turn.tools[:] = turn.tools
+        if turn.event_error is not None:
+            context.turn.error = turn.event_error
+
+    def _publish_turn_terminal(self, turn: _TurnGate) -> None:
+        """Publish failure/cancellation after the ordered event pump catches up."""
+        terminal = turn.terminal.result()
+        if terminal.epoch != turn.epoch:
+            return
+        if terminal.state == "error":
+            error = terminal.error
+            detail = (f"{type(error).__name__}: {error}"
+                      if error is not None else "ACP prompt failed")
+            self._snapshot_turn_events(turn)
+            self._settle_active_turn(error=detail)
+        elif terminal.state == "cancelled":
+            self._snapshot_turn_events(turn)
+            self._settle_active_turn(
+                error="stopped: cancelled", meta={"cancelled": True})
+
+    async def _pump_turn_events(self, turn: _TurnGate) -> None:
+        """Drain protocol events independently from a potentially blocked sink."""
+        try:
+            while True:
+                item = await turn.queue.get()
+                terminal = (
+                    isinstance(item, tuple)
+                    and len(item) == 2
+                    and item[0] is _DONE
+                    and item[1] == turn.epoch
+                )
+                if isinstance(item, Event):
+                    if item.kind == "text":
+                        turn.text_chunks.append(item.text)
+                    elif item.kind == "tool" and item.text:
+                        turn.tools.append(item.text)
+                    elif item.kind == "error":
+                        turn.event_error = item.text
+                if terminal:
+                    self._publish_turn_terminal(turn)
+                turn.delivery.put_nowait(item)
+                if terminal:
+                    return
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            self._settle_turn(turn, "error", error=exc)
+            self._publish_turn_terminal(turn)
+            turn.delivery.put_nowait((_DONE, turn.epoch))
+
+    def _settle_turn(self, turn: _TurnGate, state: str, *,
+                     result: Any = None,
+                     error: BaseException | None = None) -> bool:
+        if turn.bridge is not None:
+            return turn.bridge.settle_turn(
+                turn, state, result=result, error=error)
+        return turn.settle(state, result=result, error=error)
+
+    async def _execute_prompt(self, conn: Any, session_id: str, prompt: str,
+                              turn: _TurnGate) -> Any:
+        try:
+            result = await conn.prompt(
+                session_id=session_id, prompt=[text_block(prompt)])
+            # Let notification handlers already scheduled by a prompt response
+            # finish against this gate before the terminal boundary closes it.
+            await asyncio.sleep(0)
+        except asyncio.CancelledError as exc:
+            self._settle_turn(turn, "cancelled", error=exc)
+            raise
+        except Exception as exc:
+            self._settle_turn(turn, "error", error=exc)
+            raise
+        state = ("cancelled"
+                 if getattr(result, "stop_reason", "") == "cancelled"
+                 else "completed")
+        self._settle_turn(turn, state, result=result)
+        return result
 
     def _invalidate_transport(
-            self) -> tuple[contextlib.AsyncExitStack | None, Any,
+            self, expected_turn: _TurnGate | None = None
+            ) -> tuple[contextlib.AsyncExitStack | None, Any,
                            ProcessTree | None,
                            asyncio.Task[Any] | None]:
         """Detach one ACP generation before any potentially blocking cleanup."""
+        if (expected_turn is not None
+                and not self._owns_turn_generation(expected_turn)):
+            return None, None, None, None
         self._lifecycle_epoch += 1
         stack = self._stack
         if self._proc is not None:
@@ -472,6 +769,9 @@ class AcpRunner(BaseRunner):
             tree = self._opening_tree
         tree = tree or _capture_process_tree(proc, isolated=False)
         prompt_task = self._prompt_task
+        active_turn = self._active_turn
+        if active_turn is not None:
+            self._settle_turn(active_turn, "cancelled")
         self._stack = None
         self._proc = None
         self._tree = None
@@ -479,15 +779,18 @@ class AcpRunner(BaseRunner):
         self._opening_tree = None
         self._conn = None
         self._session_id = None
+        self._bridge = None
+        self._generation = None
+        self._active_turn = None
         self._prompt_task = None
         self._queue = asyncio.Queue()
         return stack, proc, tree, prompt_task
 
-    async def _retire_generation(self, conn: Any, session_id: str) -> None:
+    async def _retire_generation(self, turn: _TurnGate) -> None:
         """Close a failed prompt's generation without touching a newer one."""
-        if self._conn is not conn or self._session_id != session_id:
+        if not self._owns_turn_generation(turn):
             return
-        stack, proc, tree, _prompt_task = self._invalidate_transport()
+        stack, proc, tree, _prompt_task = self._invalidate_transport(turn)
         try:
             await _close_transport(stack, proc, tree)
         except asyncio.CancelledError:
@@ -506,18 +809,16 @@ class AcpRunner(BaseRunner):
             assert self._conn is not None and self._session_id is not None
             conn = self._conn
             session_id = self._session_id
-            queue = self._queue
-            while not queue.empty():               # drop anything stale
-                queue.get_nowait()
-
-            done_token = object()
+            turn = self._begin_turn(conn, session_id)
+            queue = turn.delivery
+            # The terminal future and bridge gate exist before the prompt task
+            # can execute, so even an immediate response cannot lose wake-up.
+            terminal_waiter = turn.terminal
             task = asyncio.create_task(
-                conn.prompt(session_id=session_id, prompt=[text_block(prompt)])
+                self._execute_prompt(conn, session_id, prompt, turn)
             )
+            task.add_done_callback(_consume_task_result)
             self._prompt_task = task
-            task.add_done_callback(
-                lambda _t, token=done_token, target=queue: target.put_nowait(
-                    (_DONE, token)))
 
             try:
                 loop = asyncio.get_running_loop()
@@ -551,7 +852,7 @@ class AcpRunner(BaseRunner):
                             raise TimeoutError from None
                     if (isinstance(item, tuple) and len(item) == 2
                             and item[0] is _DONE):
-                        if item[1] is done_token:
+                        if item[1] == turn.epoch:
                             break
                         continue
                     if item is _ACTIVITY:
@@ -563,46 +864,93 @@ class AcpRunner(BaseRunner):
                         idle_deadline = loop.time() + idle_timeout
                     yield item
 
-                try:
-                    result = await task
-                except Exception as exc:               # noqa: BLE001
-                    error = f"{type(exc).__name__}: {exc}"
-                    await self._retire_generation(conn, session_id)
+                terminal = terminal_waiter.result()
+                if terminal.state == "error":
+                    exc = terminal.error
+                    error = (f"{type(exc).__name__}: {exc}"
+                             if exc is not None else "ACP prompt failed")
                     yield Event("error", error)
-                else:
-                    reason = getattr(result, "stop_reason", "")
-                    if reason in ("refusal", "cancelled"):
-                        yield Event("error", f"stopped: {reason}")
+                    yield Event("done")
+                    # BaseRunner has now consumed every queued event. Publish
+                    # the failure before retiring this connection generation.
+                    await self._retire_generation(turn)
+                    return
+                if terminal.state == "cancelled":
+                    yield Event("error", "stopped: cancelled")
+                elif terminal.state != "completed":
+                    raise RuntimeError(
+                        f"ACP prompt settled as {terminal.state} without "
+                        "raising")
+                elif getattr(terminal.result, "stop_reason", "") == "refusal":
+                    yield Event("error", "stopped: refusal")
                 yield Event("done")
-            except BaseException:
-                await self._abort_prompt(task)
+                if turn.cancel_requested:
+                    # A cancel notification has no server acknowledgement. Even
+                    # if this prompt happened to finish normally, retire before
+                    # releasing the session lock so delayed handling cannot hit
+                    # the next prompt.
+                    await self._retire_generation(turn)
+            except BaseException as exc:
+                if isinstance(exc, TimeoutError):
+                    state = "timed_out"
+                elif isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+                    state = "cancelled"
+                else:
+                    state = "error"
+                self._settle_turn(turn, state, error=exc)
+                if isinstance(exc, AcpIdleTimeout):
+                    self._settle_active_turn(
+                        error=str(exc), timeout_kind="idle")
+                elif isinstance(exc, TimeoutError):
+                    self._settle_active_turn(
+                        error=f"timed out after {self.spec.timeout}s",
+                        timeout_kind="turn")
+                await self._abort_prompt(task, turn)
                 raise
             finally:
+                self._settle_turn(turn, "cancelled")
+                if self._active_turn is turn:
+                    self._active_turn = None
+                if self._queue is turn.queue:
+                    self._queue = asyncio.Queue()
                 if self._prompt_task is task:
                     self._prompt_task = None
 
-    async def _abort_prompt(self, task: asyncio.Task[Any]) -> None:
+    async def _abort_prompt(
+            self, task: asyncio.Task[Any], turn: _TurnGate) -> None:
         """Establish a clean turn boundary before another prompt can start."""
         invalidated = False
+        cancel_attempted = False
         stack: contextlib.AsyncExitStack | None = None
         proc: Any = None
         tree: ProcessTree | None = None
         try:
-            if not task.done():
+            attempted = turn.cancel_requested
+            if attempted or not task.done():
                 try:
-                    await self.cancel()
+                    await self._cancel_turn(turn)
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # noqa: BLE001
                     pass
+                cancel_attempted = turn.cancel_requested
 
             if not task.done():
                 await asyncio.wait({task}, timeout=_CANCEL_GRACE_TIMEOUT)
 
-            if not task.done():
+            task_failed = task.cancelled()
+            if task.done() and not task_failed:
+                task_failed = task.exception() is not None
+
+            owns_generation = self._owns_turn_generation(turn)
+            if (owns_generation
+                    and (cancel_attempted or not task.done() or task_failed)):
                 # ACP updates carry no prompt id. Detaching the generation and
-                # rotating its queue prevents late chunks entering the next turn.
-                stack, proc, tree, _prompt = self._invalidate_transport()
+                # rotating its queue prevents late chunks or a late cancel RPC
+                # from entering the next turn. ACP cancel is a session-wide
+                # notification with no server acknowledgement, so even a
+                # successful send makes the generation unsafe to reuse.
+                stack, proc, tree, _prompt = self._invalidate_transport(turn)
                 invalidated = True
                 try:
                     await _close_transport(stack, proc, tree)
@@ -611,8 +959,9 @@ class AcpRunner(BaseRunner):
                 except Exception:  # noqa: BLE001
                     pass
         except asyncio.CancelledError:
-            if not invalidated:
-                stack, proc, tree, _prompt = self._invalidate_transport()
+            owns_generation = self._owns_turn_generation(turn)
+            if not invalidated and owns_generation:
+                stack, proc, tree, _prompt = self._invalidate_transport(turn)
                 cleanup = asyncio.create_task(
                     _close_transport(stack, proc, tree))
                 cleanup.add_done_callback(_consume_task_result)
@@ -623,17 +972,47 @@ class AcpRunner(BaseRunner):
             else:
                 await _cancel_task_bounded(task, _CANCEL_GRACE_TIMEOUT)
 
-    async def cancel(self) -> None:
-        conn = self._conn
-        session_id = self._session_id
-        if conn is not None and session_id:
-            try:
-                await _await_hard(
-                    conn.cancel(session_id=session_id), _CANCEL_RPC_TIMEOUT)
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001
-                pass
+    async def _send_cancel(self, conn: Any, session_id: str) -> bool:
+        try:
+            await _await_hard(
+                conn.cancel(session_id=session_id), _CANCEL_RPC_TIMEOUT)
+        except asyncio.CancelledError:
+            return False
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
+    async def _cancel_turn(self, turn: _TurnGate) -> bool:
+        if turn.cancel_requested:
+            attempt = turn.cancel_attempt
+            if attempt is None:
+                return False
+            return await asyncio.shield(attempt)
+        if not self._owns_turn_generation(turn):
+            return False
+        # A completed prompt already establishes its boundary. A session-wide
+        # cancel sent afterward can arrive during the next prompt.
+        if self._prompt_task is not None and self._prompt_task.done():
+            return True
+        # Pool and stream cleanup share one bounded RPC and its certainty
+        # outcome. False means the generation must be retired before reuse.
+        turn.cancel_requested = True
+        if turn.conn is None or not turn.session_id:
+            return False
+        turn.cancel_attempt = asyncio.create_task(
+            self._send_cancel(turn.conn, turn.session_id),
+            name=f"leftover-acp-cancel-{turn.epoch}",
+        )
+        attempt = turn.cancel_attempt
+        if attempt is None:
+            return False
+        return await asyncio.shield(attempt)
+
+    async def cancel(self) -> bool:
+        turn = self._active_turn
+        if turn is None:
+            return True
+        return await self._cancel_turn(turn)
 
     async def close(self) -> None:
         stack, proc, tree, prompt_task = self._invalidate_transport()

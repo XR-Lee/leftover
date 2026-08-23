@@ -1120,7 +1120,7 @@ async def test_acp_cancel_then_prompt_ignores_stale_done() -> None:
     first_release = asyncio.Event()
     second_started = asyncio.Event()
     second_release = asyncio.Event()
-    state = {"cancel_calls": 0, "first_prompt_finished": False}
+    state = {"cancel_calls": 0, "first_prompt_finished": False, "starts": 0}
 
     class Result:
         stop_reason = "end_turn"
@@ -1142,7 +1142,14 @@ async def test_acp_cancel_then_prompt_ignores_stale_done() -> None:
             state["cancel_calls"] += 1
             first_release.set()
 
-    runner = acp_mod.AcpRunner(AgentSpec(
+    class RebuildingRunner(acp_mod.AcpRunner):
+        async def start(self, workdir: str) -> None:
+            state["starts"] += 1
+            self._workdir = os.path.realpath(workdir)
+            self._conn = Connection()
+            self._session_id = f"session-{state['starts']}"
+
+    runner = RebuildingRunner(AgentSpec(
         key="cancel", label="Cancel", acp_command=["unused"], timeout=2))
     runner._conn = Connection()
     runner._session_id = "session"
@@ -1151,27 +1158,34 @@ async def test_acp_cancel_then_prompt_ignores_stale_done() -> None:
     async def collect(prompt: str):
         return [event async for event in runner.stream(prompt)]
 
-    first = asyncio.create_task(collect("first"))
-    await first_started.wait()
-    first.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await first
+    try:
+        first = asyncio.create_task(collect("first"))
+        await first_started.wait()
+        first.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await first
 
-    second = asyncio.create_task(collect("second"))
-    await second_started.wait()
-    await runner._queue.put((acp_mod._DONE, object()))
-    await asyncio.sleep(0)
-    check("a stale completion token cannot finish the new prompt",
-          not second.done())
-    second_release.set()
-    events = await second
-    check("cancel requests and awaits the remote prompt boundary",
-          state == {"cancel_calls": 1, "first_prompt_finished": True},
-          str(state))
-    check("the next prompt contains only its own output and completion",
-          [(event.kind, event.text) for event in events]
-          == [("text", "SECOND"), ("done", "")],
-          repr([(event.kind, event.text) for event in events]))
+        second = asyncio.create_task(collect("second"))
+        await second_started.wait()
+        await runner._queue.put((acp_mod._DONE, object()))
+        await asyncio.sleep(0)
+        check("a stale completion token cannot finish the new prompt",
+              not second.done())
+        second_release.set()
+        events = await second
+        check("cancel retires the old session before rebuilding",
+              state == {
+                  "cancel_calls": 1, "first_prompt_finished": True,
+                  "starts": 1,
+              }, str(state))
+        check("the next prompt contains only its own output and completion",
+              [(event.kind, event.text) for event in events]
+              == [("text", "SECOND"), ("done", "")],
+              repr([(event.kind, event.text) for event in events]))
+    finally:
+        first_release.set()
+        second_release.set()
+        await runner.close()
 
 
 async def test_acp_cancel_rpc_is_bounded() -> None:

@@ -342,7 +342,7 @@ class Orchestrator:
                     primary=spec, sink=None, max_attempts=1,
                     ordered_chain=[spec])
 
-            if not turn.ok and not self.router._terminal_timeout(turn):
+            if not turn.ok and not self.router._terminal_turn(turn):
                 ranked = await ranked_agents()
                 guarded = bool(decision.tried) \
                     and self.config.routing.continuation_guard
@@ -445,13 +445,13 @@ class Orchestrator:
 
         async def invoke(spec: AgentSpec, prompt_builder) -> Turn:
             try:
-                return await asyncio.wait_for(
+                return await await_bounded(
                     self._speak(
                         spec, prompt_builder, None, attempts=1, record=False,
                         ordered_chain=[spec]),
-                    timeout=timeout,
+                    timeout,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 turn = Turn(
                     agent=spec,
                     error=f"debate turn timed out after {timeout:g}s",
@@ -485,9 +485,9 @@ class Orchestrator:
                         -> tuple[int, str, Turn]:
                     prompt_builder = builder(side, round_no, floor)
                     turn = await invoke(specs[side], prompt_builder)
-                    if not turn.ok and not self.router._terminal_timeout(turn):
+                    if not turn.ok and not self.router._terminal_turn(turn):
                         while (not turn.ok
-                               and not self.router._terminal_timeout(turn)):
+                               and not self.router._terminal_turn(turn)):
                             async with fallback_lock:
                                 replacement = spare(
                                     round_reserved, attempted_spares)
@@ -536,7 +536,7 @@ class Orchestrator:
                     blocked.add(judge.key)
                     attempted_spares: set[str] = set()
                     while (not verdict.ok
-                           and not self.router._terminal_timeout(verdict)):
+                           and not self.router._terminal_turn(verdict)):
                         replacement = spare(blocked, attempted_spares)
                         if replacement is None:
                             break
