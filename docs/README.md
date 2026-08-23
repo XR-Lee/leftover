@@ -8,6 +8,8 @@ leftover is a thin local router: classify a task, pick a subscription CLI, hand 
 | [Architecture](architecture.md) | Module map and data flow. |
 | [Maintenance](maintenance.md) | Invariants, test gates. |
 | [Decisions](history/decisions.md) | Why those invariants exist. |
+| [Security](../SECURITY.md) | What leftover reads, sends, and writes. |
+| [Changelog](../CHANGELOG.md) | What changed per release. |
 | [Platform notes](history/platform-notes.md) | Vendor CLI / quota probe details. |
 | [Prior art](history/prior-art.md) | What not to rewrite. |
 | [Naming](history/naming-proposal.md) | Why leftover, not MacBot / agora. |

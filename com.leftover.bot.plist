@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Optional, frozen path: the Telegram transport (`agora bot`).
+     Needs the extra:  pip install 'leftover[telegram]'
+     Install: cp com.leftover.bot.plist ~/Library/LaunchAgents/
+     then:    launchctl load ~/Library/LaunchAgents/com.leftover.bot.plist
+     Edit every REPLACE_ME first. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.leftover.bot</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>REPLACE_ME/.venv/bin/agora</string>
+    <string>bot</string>
+  </array>
+  <key>WorkingDirectory</key><string>REPLACE_ME</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- launchd starts with a bare PATH; the CLIs must be findable. -->
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:REPLACE_ME_HOME/.local/bin</string>
+    <key>LEFTOVER_TELEGRAM_TOKEN</key><string>REPLACE_ME_TOKEN</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>REPLACE_ME_HOME/Library/Logs/leftover-bot.log</string>
+  <key>StandardErrorPath</key><string>REPLACE_ME_HOME/Library/Logs/leftover-bot.err.log</string>
+</dict>
+</plist>

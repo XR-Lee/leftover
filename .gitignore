@@ -9,4 +9,3 @@ __pycache__/
 dist/
 build/
 *.log
-scripts/rename_to_leftover.py

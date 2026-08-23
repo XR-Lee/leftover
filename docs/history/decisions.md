@@ -6,6 +6,29 @@
 
 ---
 
+## D16 — 开源面：英文 /quota、本机时区、SECURITY.md、telegram 变 extra
+
+**2026-08-23 · 生效**
+
+准备公开前的一次 review。四个真问题，加一次开源面收拾。
+
+**修的 bug：**
+
+- `leftover doctor|quota --config PATH` 静默丢掉 `--config`（`rest[:2] == ["--config"]` 对二元素切片永远为假），缺值时抛 IndexError。
+- `rhythm.render` 的 `tz_name` 默认写死 `Europe/London`，`/quota` 又从不传。非伦敦用户看到的全是伦敦时间。默认改成本机时区，`[leftover] timezone` 可覆盖。
+- 刷新后的 Claude OAuth token 当 argv 传给 `security add-generic-password -w`，调用期间同机 `ps` 可见。改走 stdin。**新不变量：密钥不进 argv。**
+- 测试夹具里有真实账号名和邮箱。公开仓不留身份。
+
+**产品决定：**
+
+- `/quota` 视图改英文（`▾behind` / `▴ahead`、`widening` / `narrowing`、`calendar` / `used`）。README、docs、CLI 全英文，最核心的一屏不该是唯一的中文。`/cu` 的中文触发词（`点界面`）保留——那是输入，不是输出。
+- `python-telegram-bot` 挪到 `[telegram]` extra。D7 说 Telegram 是冻结面，冻结面不该让所有人付安装成本。`AGORA_TELEGRAM_TOKEN` → `LEFTOVER_TELEGRAM_TOKEN`（旧的仍读）。
+- `com.agora.bot.plist` 跑的是 `python -m agora`，这个模块在 D15 改名后就不存在了。改名 `com.leftover.bot.plist`，跑 `agora bot` 入口。
+- `SECURITY.md` 是开源当天的信任前提：leftover 要读四家 CLI 的本地凭证、会刷新 Claude 的 OAuth token、给每个 subagent 关掉权限确认。这三件事必须写在明面上，不能靠读源码发现。
+- 仓库暂不转 public。改动先推私有仓。
+
+---
+
 ## D15 — 公开名 leftover 已落地，仓是 XR-Lee/leftover
 
 **2026-08-22 · 生效**
