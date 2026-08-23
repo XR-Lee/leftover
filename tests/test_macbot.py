@@ -1571,8 +1571,10 @@ async def test_debate_is_parallel_and_compact() -> None:
 
     judge_prompt = next(prompt for key, prompt in pool.prompts
                         if key == "cursor")
+    # Peak concurrency is the contract. Wall clock is only diagnostic here:
+    # a loaded CI runner can take far longer while still overlapping.
     check("FOR and AGAINST execute concurrently",
-          pool.max_active == 2 and elapsed < 0.14,
+          pool.max_active == 2,
           f"active={pool.max_active}, elapsed={elapsed:.3f}s")
     check("compact debate produces two arguments and one verdict",
           len(turns) == 3

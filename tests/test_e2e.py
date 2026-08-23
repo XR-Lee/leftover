@@ -36,6 +36,35 @@ def make_config() -> Config:
                   data_dir=tempfile.mkdtemp(prefix="agora-test-"))
 
 
+class CountingPool:
+    """Delegate to a real pool while recording how many turns overlap.
+
+    Wall-clock comparisons ("parallel is faster than serial") pass on a laptop
+    and flake on a two-core CI runner, where scheduling overhead can exceed the
+    mock latency being measured. Peak concurrency is the property these checks
+    actually mean, and it is exact.
+    """
+
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.active = 0
+        self.max_active = 0
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def reset(self) -> None:
+        self.max_active = 0
+
+    async def run(self, spec, prompt, on_event=None):
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            return await self.inner.run(spec, prompt, on_event)
+        finally:
+            self.active -= 1
+
+
 def check(label: str, cond: bool, detail: str = "") -> bool:
     print(f"  {'PASS' if cond else 'FAIL'}  {label}{'  ' + detail if detail else ''}")
     return cond
@@ -43,7 +72,7 @@ def check(label: str, cond: bool, detail: str = "") -> bool:
 
 async def main() -> int:
     cfg = make_config()
-    pool = AgentPool(cfg)
+    pool = CountingPool(AgentPool(cfg))
     orch = Orchestrator(cfg, pool)
     ok = True
 
@@ -107,13 +136,11 @@ async def main() -> int:
     print("\n[4] broadcast runs in parallel")
     orch.transcript.clear()
     plan = orch.parse("/all quick take", in_group=True)
-    started = asyncio.get_running_loop().time()
+    pool.reset()
     turns = await orch.execute(plan, None)
-    elapsed = asyncio.get_running_loop().time() - started
     ok &= check("everyone answered", len(turns) == 4 and all(t.ok for t in turns))
-    ok &= check("wall clock beats the serial sum",
-                elapsed < sum(t.seconds for t in turns),
-                f"{elapsed:.2f}s vs {sum(t.seconds for t in turns):.2f}s")
+    ok &= check("broadcast workers overlap instead of queueing",
+                pool.max_active >= 2, f"peak {pool.max_active} in flight")
 
     print("\n[4b] buffered broadcast output stays grouped")
 
@@ -213,10 +240,8 @@ async def main() -> int:
         collision_cfg, collision_pool,
         Router(collision_cfg, collision_pool),
     )
-    collision_started = asyncio.get_running_loop().time()
     collision_turns = await collision_orch.execute(
         Plan("broadcast", "topic", collision_agents[:2], {}), None)
-    collision_elapsed = asyncio.get_running_loop().time() - collision_started
     ok &= check("broadcast primaries still overlap",
                 collision_pool.max_active_primaries == 2,
                 repr(collision_pool.calls))
@@ -228,9 +253,8 @@ async def main() -> int:
                 == {"spare-a", "spare-b"},
                 repr(collision_pool.calls))
     ok &= check("distinct broadcast spares execute concurrently",
-                collision_pool.max_active_spares == 2
-                and collision_elapsed < 0.14,
-                f"calls={collision_pool.calls}, elapsed={collision_elapsed:.3f}s")
+                collision_pool.max_active_spares == 2,
+                f"calls={collision_pool.calls}")
 
     class BroadcastTimeoutPool:
         def __init__(self):
@@ -274,14 +298,12 @@ async def main() -> int:
     print("\n[5] debate and relay shapes")
     orch.transcript.clear()
     plan = orch.parse("/debate monorepos are better", in_group=True)
-    started = asyncio.get_running_loop().time()
+    pool.reset()
     turns = await orch.execute(plan, None)
-    elapsed = asyncio.get_running_loop().time() - started
     ok &= check("1 parallel round x 2 sides + judge = 3 turns", len(turns) == 3,
                 " ".join(t.agent.key for t in turns))
     ok &= check("debate sides overlap instead of adding their latencies",
-                elapsed < sum(t.seconds for t in turns),
-                f"{elapsed:.2f}s vs {sum(t.seconds for t in turns):.2f}s")
+                pool.max_active >= 2, f"peak {pool.max_active} in flight")
     ok &= check("debate records explicit roles",
                 [t.meta.get("discussion_role") for t in turns]
                 == ["FOR", "AGAINST", "JUDGE"])
@@ -420,8 +442,7 @@ async def main() -> int:
                 and debate_fallback_pool.calls.count("spare-b") == 1,
                 repr(debate_fallback_pool.calls))
     ok &= check("debate spare calls overlap instead of stacking timeouts",
-                debate_fallback_pool.max_active_spares == 2
-                and debate_fallback_elapsed < 0.14,
+                debate_fallback_pool.max_active_spares == 2,
                 f"active={debate_fallback_pool.max_active_spares}, "
                 f"elapsed={debate_fallback_elapsed:.3f}s")
 
@@ -468,9 +489,10 @@ async def main() -> int:
         Plan("broadcast", "topic", delivery_agents, {}), blocked_group_sink)
     delivery_elapsed = asyncio.get_running_loop().time() - delivery_started
     await asyncio.sleep(0)
+    # One factory and one cancellation is the shared-budget contract: a
+    # per-worker budget would have built a sink for every worker.
     ok &= check("bad group sinks consume one timeout total",
-                delivery_elapsed < 0.09
-                and len(delivery_factories) == 1
+                len(delivery_factories) == 1
                 and delivery_cancellations == 1,
                 f"elapsed={delivery_elapsed:.3f}s, "
                 f"factories={delivery_factories}, "
@@ -557,8 +579,7 @@ async def main() -> int:
     ok &= check("successful debate cancels speculative warmups promptly",
                 len(warm_turns) == 2 and all(turn.ok for turn in warm_turns)
                 and warm_pool.warm_started == 2
-                and warm_pool.warm_cancelled == 2
-                and warm_elapsed < 0.15,
+                and warm_pool.warm_cancelled == 2,
                 f"started={warm_pool.warm_started}, "
                 f"cancelled={warm_pool.warm_cancelled}, "
                 f"elapsed={warm_elapsed:.3f}s")

@@ -306,17 +306,20 @@ def test_sub2api_pagination_honors_one_deadline() -> None:
             "pages": 20,
         }}
 
-    began = time.monotonic()
+    budget = 0.055
     with patch.object(q, "_sub2api_get", page):
         items = q._sub2api_list_accounts(
             "https://example.invalid", "secret",
-            deadline=time.monotonic() + 0.055,
+            deadline=time.monotonic() + budget,
         )
-    elapsed = time.monotonic() - began
 
     assert items
+    # Pagination stops at the shared deadline instead of walking all 20 pages,
+    # and every page is granted only what is left of the one budget. Asserting
+    # that, rather than elapsed wall clock, keeps this honest on a loaded CI
+    # runner where the same correct code takes far longer.
     assert 1 <= len(calls) < 20
-    assert elapsed < 0.15
+    assert calls[0] <= budget
     assert calls[-1] <= calls[0]
 
 

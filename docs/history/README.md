@@ -1,5 +1,8 @@
-# notes
+# history
 
-Decision log for MacBot. Newest first: [decisions.md](decisions.md).
+Decision log for leftover, newest first: [decisions.md](decisions.md). It
+records *why*, in the language it was thought in. Entries are not rewritten
+when a decision is later overturned; a newer entry says so.
 
-The maintenance inventory (what to keep in a future git repo) lives in [`agora/docs/`](../agora/docs/README.md). Do not treat this folder as the product tree.
+The maintenance inventory — what this repo must keep — is one level up in
+[`docs/`](../README.md).
