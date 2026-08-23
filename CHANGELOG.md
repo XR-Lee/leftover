@@ -2,6 +2,49 @@
 
 Notable changes per release. Dates are release dates.
 
+## Unreleased
+
+### Added
+
+- **Antigravity (`agy`) as a fifth backend**, last in the coding pool. Google's
+  terminal agent has no ACP mode in 1.1.19, so it runs exec-only and never
+  holds a sticky session. It is pinned to `--model gemini-3.1-pro-high`: `agy`
+  also offers Claude Opus/Sonnet and GPT-OSS, and routing there would spend
+  Antigravity's third-party allowance instead of the Google pool — the same
+  rule Cursor has always had for `grok-4.6`.
+  - `agy` exits 0 even when it fails; the JSON body carries `status: "ERROR"`
+    and `error`, which the exec runner already classifies, so no shared code
+    needed a vendor special case.
+  - `--print-timeout 15m` is passed explicitly. Without it `agy` abandons the
+    turn at its own 5-minute default while leftover is still waiting.
+  - No vendor usage endpoint is known, so ranking uses the local ledger against
+    `budget_5h_turns` / `budget_week_turns`. `/quota` says "no vendor number"
+    rather than inventing one.
+  - Known constraint: two concurrent `agy -p` runs share one background
+    language server and cancel or cross-wire each other. leftover already
+    serializes turns per agent, but a second leftover — or the Antigravity
+    IDE open beside it — will break turns.
+  - Known flakiness: on tool-using turns `agy` often reports the turn as
+    failed *after* it has already applied its edits. Its own log shows
+    `ReplaceFileContent` auto-approved and written, the file on disk is
+    correct, and the envelope then comes back `status: "ERROR"` with
+    `error: "context canceled"` at around 90 seconds. Two of three
+    file-editing turns ended that way, including one run with nothing else
+    touching `agy`, so this is not the concurrency issue above. leftover
+    treats it as a failure and fails over, so a second backend redoes work
+    that was already done. leftover is not special-casing it: the routing is
+    correct given what the CLI reports, and swallowing a vendor's own error
+    would hide real partial failures.
+
+### Fixed
+
+- The doctor roster and the `--why` table hardcoded an 8-to-10 character agent
+  column, so an 11-character label ("Antigravity") broke both alignments. Both
+  now size the column from the agents actually being shown.
+- `leftover.example.toml` still carried a real account name in the `sub2api`
+  comment, and its `[routing]` keys would have silently dropped the new backend
+  out of the pool for anyone copying the file.
+
 ## 0.1.0 — 2026-08-23
 
 First public snapshot. leftover is a thin local router: it classifies a task,

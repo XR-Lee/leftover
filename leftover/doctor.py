@@ -18,6 +18,7 @@ INSTALL_HINTS = {
     "gpt": "npm install -g @openai/codex",
     "grok": "curl -fsSL https://x.ai/cli/install.sh | bash",
     "cursor": "curl https://cursor.com/install -fsS | bash",
+    "antigravity": "curl -fsSL https://antigravity.google/cli/install.sh | bash",
 }
 
 
@@ -82,8 +83,8 @@ async def check(spec: AgentSpec) -> str:
     return "\n".join(lines)
 
 
-async def _roster_line(spec: AgentSpec, cached: dict) -> str:
-    name = f"{spec.label:<10}"
+async def _roster_line(spec: AgentSpec, cached: dict, width: int = 10) -> str:
+    name = f"{spec.label:<{width}}"
     if not spec.enabled:
         return ui.dim(f"  {name} disabled")
     if not spec.installed:
@@ -123,8 +124,9 @@ def _paths(config: Config) -> list[str]:
 async def run(config: Config, cached: dict | None = None) -> str:
     cached = cached if isinstance(cached, dict) else {}
     lines = ["leftover doctor"]
+    width = max([10, *(len(spec.label) for spec in config.agents)])
     for spec in config.agents:
-        lines.append(await _roster_line(spec, cached))
+        lines.append(await _roster_line(spec, cached, width))
     on = [a.label for a in config.agents if a.enabled and a.installed]
     if on:
         lines.append(ui.dim("  on: " + " · ".join(on)))

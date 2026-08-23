@@ -45,6 +45,11 @@ This directory is the leftover git root (`github.com/XR-Lee/leftover`). Do not i
 ### Transport
 
 - `transport = "auto"`: ACP if the command exists, else exec; ACP start failure closes the process and retries exec.
+- `agy` has no ACP mode, and two concurrent `agy -p` runs share one
+  background language server: one adopts the other's workspace, or one dies
+  with `context canceled`. leftover serializes turns per agent, so it is
+  safe on its own — but a second leftover, or the Antigravity IDE running
+  beside it, will cancel turns. Do not add parallel antigravity slots.
 - ACP start, cancel, close, full-turn timeout, and idle timeout must all have finite caller-visible bounds. Cleanup order is process first, SDK transport second.
 - ACP and exec subprocesses use isolated POSIX process groups. Timeout, cancellation, close, and failed startup terminate the whole tree with TERM then KILL while draining inherited stdout/stderr pipes; killing only the leader is not sufficient.
 - ACP filesystem callbacks use a bounded daemon pool so blocked OS I/O cannot hold the event loop or interpreter open. A queued write that has not started is skipped after timeout. A write already inside synchronous OS I/O cannot be revoked; its timeout must say the outcome is uncertain and the write may complete later, so callers inspect the file before retrying.

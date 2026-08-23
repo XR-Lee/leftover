@@ -955,7 +955,8 @@ async def test_group_routes_survive_cli_handoff() -> None:
 
 def test_builtin_acp_commands() -> None:
     print("\n[macbot.12] built-in ACP commands match current CLIs")
-    commands = {agent["key"]: agent["acp_command"] for agent in BUILTIN_AGENTS}
+    commands = {agent["key"]: agent.get("acp_command", [])
+                for agent in BUILTIN_AGENTS}
     check("Codex uses the maintained ACP adapter",
           commands["gpt"] == [
               "npx", "-y", "@agentclientprotocol/codex-acp@1.6.2"],
@@ -967,6 +968,62 @@ def test_builtin_acp_commands() -> None:
     grok = next(agent for agent in BUILTIN_AGENTS if agent["key"] == "grok")
     check("Grok leaves -p adjacent to the appended fallback prompt",
           grok["exec_command"][-1] == "-p", str(grok["exec_command"]))
+
+
+def test_antigravity_is_exec_only_and_stays_first_party() -> None:
+    print("\n[macbot.12c] Antigravity spec matches the real `agy` CLI")
+    from leftover.agents.exec_runner import _error_from_json, _text_from_json
+    from leftover.config import Routing, _agent_from_dict
+
+    spec_dict = next(agent for agent in BUILTIN_AGENTS
+                     if agent["key"] == "antigravity")
+    argv = spec_dict["exec_command"]
+    check("agy 1.1.19 has no ACP mode, so this one is exec-only",
+          spec_dict["transport"] == "exec" and not spec_dict.get("acp_command"),
+          str(spec_dict.get("acp_command")))
+    check("-p stays adjacent to the appended prompt",
+          argv[-1] == "-p", str(argv))
+    check("tool permissions are auto-approved like every other backend",
+          "--dangerously-skip-permissions" in argv, str(argv))
+    check("answers are read out of the JSON `response` field",
+          spec_dict["exec_output"] == "json"
+          and spec_dict["exec_json_path"] == "response")
+
+    model = argv[argv.index("--model") + 1]
+    check("pinned to first-party Gemini, never Claude or GPT",
+          model.startswith("gemini-")
+          and not any(token in model for token in ("claude", "gpt")), model)
+
+    # agy defaults to a 5m print timeout and would abandon the turn while
+    # leftover was still waiting on its own deadline.
+    print_timeout = argv[argv.index("--print-timeout") + 1]
+    check("agy's own print deadline covers the leftover turn timeout",
+          print_timeout == "15m" and spec_dict["timeout"] <= 15 * 60,
+          f"{print_timeout} vs {spec_dict['timeout']}s")
+
+    routing = Routing()
+    check("in the coding pool, but last",
+          routing.coding_keys[-1] == "antigravity"
+          and routing.order[-1] == "antigravity",
+          f"{routing.coding_keys} / {routing.order}")
+    check("not the planner and not the computer-use backend",
+          routing.plan_key == "claude" and routing.cu_key == "gpt")
+
+    # Envelopes captured from agy 1.1.19. It answers 0 even when it fails, so
+    # the JSON body is the only failure signal.
+    spec = _agent_from_dict(spec_dict)
+    ok_envelope = {"conversation_id": "abc", "status": "SUCCESS",
+                   "response": "PINNED\n", "duration_seconds": 7.28,
+                   "num_turns": 1, "usage": {"total_tokens": 14154}}
+    err_envelope = {"conversation_id": "", "status": "ERROR", "response": "",
+                    "error": "invalid model selection (--model \"nope\")",
+                    "duration_seconds": 0, "num_turns": 0}
+    check("a successful envelope yields the answer",
+          _text_from_json(ok_envelope, spec) == "PINNED\n"
+          and _error_from_json(ok_envelope) == "")
+    check("a failed envelope yields the error even though agy exited 0",
+          _error_from_json(err_envelope).startswith("invalid model selection"),
+          _error_from_json(err_envelope))
 
 
 async def test_acp_start_failure_closes_transport() -> None:
@@ -1996,6 +2053,7 @@ def main() -> int:
     asyncio.run(test_progress_is_visible_and_output_stays_clean())
     asyncio.run(test_group_routes_survive_cli_handoff())
     test_builtin_acp_commands()
+    test_antigravity_is_exec_only_and_stays_first_party()
     asyncio.run(test_acp_start_failure_closes_transport())
     asyncio.run(test_acp_concurrent_start_is_singleton())
     asyncio.run(test_acp_cancel_then_prompt_ignores_stale_done())

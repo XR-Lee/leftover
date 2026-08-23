@@ -2,7 +2,7 @@
 
 This is the maintenance inventory. If a change does not serve one of these features, it does not belong in the future repo.
 
-leftover is the parent conversation. Codex / Grok Build / Cursor Agent / Claude Code are subagents it spawns. The user is not switching chat products.
+leftover is the parent conversation. Codex / Grok Build / Cursor Agent / Antigravity CLI / Claude Code are subagents it spawns. The user is not switching chat products.
 
 ## What it is
 
@@ -29,7 +29,7 @@ It does not draw a pager, sandbox, diff viewer, or subagent tree. Those stay ins
 | Vendor TUI | `macbot --tui "…"` | `_exec` / `spawn_argv` | ACP command pins |
 | Plan | `/plan` or `--plan` | intent + `plan_key=claude` | `test_pick_plan_and_cu` |
 | Computer use | `/cu` or `--cu` or explicit “点界面” | always Codex (`gpt`) | same + no fallback past Codex |
-| Named backend | `@codex` `@grok` `@cursor` `@claude` | `intent.named` | intent + `--use` |
+| Named backend | `@codex` `@grok` `@cursor` `@antigravity` `@claude` | `intent.named` | intent + `--use` |
 | Group: roundtable | `/rt` or two+ `@` mentions | `orchestrator._run_sequence` | group pick JSON + e2e |
 | Group: broadcast | `/all` | `_run_parallel` | e2e |
 | Group: debate | `/debate` (needs 3 CLIs) | `_run_debate` | `test_debate_is_parallel_and_compact` |
@@ -45,7 +45,7 @@ It does not draw a pager, sandbox, diff viewer, or subagent tree. Those stay ins
 | Rule | Why |
 |---|---|
 | Default task is coding | Claude is not in the lag race |
-| Coding pool = `gpt`, `grok`, `cursor` | Cursor pinned to `--model grok-4.6` (Ultra first-party) |
+| Coding pool = `gpt`, `grok`, `cursor`, `antigravity` | Cursor pinned to `--model grok-4.6`, Antigravity pinned to `--model gemini-3.1-pro-high` — both first-party |
 | Score = `0.5 * lag + 1.0 * waste` | Overdue windows rise; fresh short windows do not starve them |
 | `waste = 0` on `estimated` | Turn budgets must not fake a 5h emergency |
 | `/plan` → Claude first, coding pool as fallback | Planning is the only default Claude job |
@@ -77,6 +77,7 @@ It does not draw a pager, sandbox, diff viewer, or subagent tree. Those stay ins
 | Claude | `GET /api/oauth/usage` with the CLI's own OAuth | observed (`You've hit your weekly limit` as body) |
 | Grok | CLI-proxy `/v1/billing`; live ACP `x.ai/billing` only if already connected | local signals, then estimated |
 | Cursor | dashboard `GetCurrentPeriodUsage` via IDE `state.vscdb` token | plan name is not remaining quota |
+| Antigravity (`agy`) | none known | local ledger against `budget_5h_turns` / `budget_week_turns` |
 
 Probes reuse the vendor login. They must not spawn a Grok ACP session just to read billing, and must not hit grok.com gRPC-web.
 
@@ -89,6 +90,7 @@ Probes reuse the vendor login. They must not spawn a Grok ACP session just to re
 | Fork / wrap Grok or Codex TUI | — | D8: vendors do not take PRs; harness is vendor-owned |
 | Reverse proxy / OpenAI-compatible gateway | — | D1: loses the agent loop, ToS risk |
 | Cursor on Claude/GPT models | — | Spends Cursor third-party pool |
+| Antigravity on Claude/GPT models | — | Same: `agy` offers Claude Opus/Sonnet and GPT-OSS, which spend Antigravity's third-party pool |
 | Guessing computer-use from generic text | `intent.py` | Only `/cu` and the explicit phrases |
 | leftover-drawn fullscreen UI | `ui.py` is chrome only | Want a pager → `--tui` |
 

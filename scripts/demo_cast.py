@@ -21,40 +21,44 @@ CAPTURED_AT = "2026-08-23"
 
 DOCTOR = """\
 leftover doctor
-  Claude     2.1.241          remaining ██████░░░░  55%  weekly
-  Codex      codex-cli 0.149. remaining ██████░░░░  59%  weekly
-  Grok       grok 1.0.5       remaining ███░░░░░░░  30%  weekly
-  Cursor     2026.08.11-e8db8 remaining ██░░░░░░░░  15%  monthly
-  on: Claude · Codex · Grok · Cursor
+  Claude      2.1.241          remaining █████░░░░░  52%  weekly
+  Codex       codex-cli 0.149. remaining ██████░░░░  58%  weekly
+  Grok        grok 1.0.5       remaining ███░░░░░░░  30%  weekly
+  Cursor      2026.08.11-e8db8 remaining █░░░░░░░░░  13%  monthly
+  Antigravity 1.1.19           remaining —
+  on: Claude · Codex · Grok · Cursor · Antigravity
   config: ~/.config/leftover/leftover.toml
   state:  ~/.local/share/leftover/leftover-state.json"""
 
 WHY = """\
 task: coding  axis: lag+waste
 
-  agent       lag   waste   total  remaining         window
-  grok       0.21   0.015   0.121  ███░░░░░░░  30%   weekly 70% · 14.6h left  ← launching
-  cursor     0.07   0.000   0.037  █████████░  87%   monthly auto 13% · 590.8h left
-  gpt        0.00   0.000   0.000  ██████░░░░  59%   weekly 41% · 99.3h left
-  claude        —       —       —  —                 (not scored)
+  agent          lag   waste   total  remaining         window
+  grok          0.22   0.017   0.127  ███░░░░░░░  30%   weekly 70% · 13.4h left  ← launching
+  cursor        0.07   0.000   0.036  █████████░  86%   monthly auto 14% · 589.6h left
+  antigravity   0.02   0.000   0.008  ██████████ 100%   5h budget 0% · 4.9h left
+  gpt           0.00   0.000   0.000  ██████░░░░  58%   weekly 42% · 98.1h left
+  claude           —       —       —  —                 (not scored)
 
-→ Grok  (weekly 70% used, 14.6h left, lag 0.21 waste 0.015 (reported))"""
+→ Grok  (weekly 70% used, 13.4h left, lag 0.22 waste 0.017 (reported))"""
 
 QUOTA = """\
-usage rhythm  ·  23 Aug 2026 02:11 BST
+usage rhythm  ·  23 Aug 2026 03:24 BST
 ▾behind / ▴ahead = vs calendar  ·  ↑ same-window increase  ·  new window from 0
 
-Claude · you  ·  7d ▾behind  ·  ↑1% · narrowing
-7d 46% vs calendar 95.3% · resets in 7.8h · resets 23 Aug 10:00
-calendar ███████████████░ 95.3%
-used     ███████░░░░░░░░░ 46%
+Claude · you  ·  7d ▾behind
+7d 48% vs calendar 96.1% · resets in 6.6h · resets 23 Aug 10:00
+calendar ███████████████░ 96.1%
+used     ████████░░░░░░░░ 48%
 
-official weekly pool · SuperGrok Heavy · ▾behind
-used 70% · left 30% · calendar 91.3% · resets in 14.6h
-calendar ███████████████░ 91.3%
-used     ███████████░░░░░ 70%
+official weekly pool · SuperGrok Heavy · ▾behind · ↑1% · narrowing
+used 71% · left 29% · calendar 92.1% · resets in 13.4h
+calendar ███████████████░ 92.1%
+used     ███████████░░░░░ 71%
 
-strategy: lag_waste  order: claude, gpt, cursor, grok"""
+Antigravity · no vendor number
+
+strategy: lag_waste  order: claude, gpt, cursor, grok, antigravity"""
 
 SCREENS = [
     ("leftover doctor", DOCTOR, 3.4),

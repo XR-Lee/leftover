@@ -97,8 +97,11 @@ class Routing:
     # headroom | order | cheapest | sticky | lag_waste
     strategy: str = "headroom"
     # Tie-breaker and the fallback order when nothing reports quota.
-    order: list[str] = field(default_factory=lambda: ["claude", "gpt", "cursor", "grok"])
-    coding_keys: list[str] = field(default_factory=lambda: ["gpt", "grok", "cursor"])
+    order: list[str] = field(
+        default_factory=lambda: ["claude", "gpt", "cursor", "grok",
+                                 "antigravity"])
+    coding_keys: list[str] = field(
+        default_factory=lambda: ["gpt", "grok", "cursor", "antigravity"])
     plan_key: str = "claude"
     cu_key: str = "gpt"
     max_attempts: int = 3            # agents tried before giving up on a turn
@@ -274,6 +277,35 @@ BUILTIN_AGENTS: list[dict[str, Any]] = [
         "persona": "You are Cursor Agent on Grok 4.6 (Ultra first-party). "
                    "Implement in the working directory. Do not switch to "
                    "Claude or GPT models.",
+    },
+    {
+        "key": "antigravity",
+        "label": "Antigravity",
+        "emoji": "A",
+        "aliases": ["agy", "antigrav", "google"],
+        # agy 1.1.19 has no ACP mode, so this one is exec-only. That also
+        # means it never holds a live session and never sticks.
+        "transport": "exec",
+        "interactive_command": ["agy"],
+        # `agy` answers 0 even when it fails; the JSON carries `error`, which
+        # the exec runner already classifies. `--print-timeout` must cover the
+        # spec timeout or agy gives up at its own 5m default first.
+        "exec_command": ["agy", "--output-format", "json",
+                         "--dangerously-skip-permissions",
+                         "--print-timeout", "15m",
+                         "--model", "gemini-3.1-pro-high", "-p"],
+        "exec_output": "json",
+        "exec_json_path": "response",
+        "tier": "heavy",
+        "timeout": 900,
+        "fallback": ["gpt", "cursor"],
+        # No vendor usage endpoint is known, so ranking uses the local ledger
+        # against these budgets. They are a starting guess: set yours in toml.
+        "budget_5h_turns": 30,
+        "budget_week_turns": 300,
+        "persona": "You are Antigravity CLI on first-party Gemini. Implement "
+                   "in the working directory with your tools. Do not switch "
+                   "to Claude or GPT models.",
     },
 ]
 

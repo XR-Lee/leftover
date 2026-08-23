@@ -12,8 +12,8 @@
 
 </div>
 
-You pay for four coding subscriptions. Each one meters a window — 5 hours, a
-week, a month — and every window you underuse is money that expires quietly.
+You pay for several coding subscriptions. Each one meters a window — 5 hours,
+a week, a month — and every window you underuse is money that expires quietly.
 
 ```
 leftover "migrate sessions onto JWT"
@@ -31,17 +31,20 @@ Closest analog is [usher](https://github.com/theodorebeaupre-prog/usher) (launch
 
 | Task | Who |
 |---|---|
-| Default coding | Highest lag+waste among `codex`, `grok`, `cursor-agent --model grok-4.6`. A successful in-process coding session stays on its backend; independent commands re-rank. |
+| Default coding | Highest lag+waste among `codex`, `grok`, `cursor-agent --model grok-4.6`, `agy --model gemini-3.1-pro-high`. A successful in-process coding session stays on its backend; independent commands re-rank. |
 | `/plan` | Claude first. Coding pool if Claude is out. |
 | `/cu` or “computer use / 点界面” | Codex CLI only. |
-| `@codex` `@grok` `@cursor` `@claude` | Named beat scores. |
+| `@codex` `@grok` `@cursor` `@antigravity` `@claude` | Named beat scores. |
 
-Cursor Ultra coding stays on first-party Grok. Do not send Cursor onto Claude/GPT models.
+Cursor Ultra coding stays on first-party Grok; Antigravity stays on
+first-party Gemini. Neither gets sent onto another vendor's models — that
+spends their third-party pool instead of the subscription you are trying
+to use up.
 
 ## Install
 
 ```bash
-# official CLIs, already logged in: claude / codex / grok / cursor-agent
+# official CLIs, already logged in: claude / codex / grok / cursor-agent / agy
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 
@@ -50,12 +53,14 @@ leftover install-skills
 ```
 
 Copy `leftover.example.toml` to `~/.config/leftover/leftover.toml` if you want
-overrides. Built-in four agents work with no config. The frozen Telegram
+overrides. The five built-in agents work with no config; any CLI you have not
+installed simply shows as `not installed` and is skipped. The frozen Telegram
 transport is an extra: `pip install -e '.[telegram]'`.
 
 ## Usage
 
-You are talking to **leftover**. Codex / Grok / Cursor / Claude are subagents it spawns.
+You are talking to **leftover**. Codex / Grok / Cursor / Antigravity / Claude
+are subagents it spawns.
 
 ```bash
 cd your-repo

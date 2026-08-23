@@ -21,8 +21,8 @@ debate_judge_key  = "cursor"  # lower-latency default; explicit @names win
 #   cheapest  light-tier agents first, escalate on refusal
 #   sticky    stay with whoever answered last
 strategy = "lag_waste"
-order = ["gpt", "grok", "cursor", "claude"]
-coding_keys = ["gpt", "grok", "cursor"]
+order = ["gpt", "grok", "cursor", "claude", "antigravity"]
+coding_keys = ["gpt", "grok", "cursor", "antigravity"]  # last = loses every tie
 plan_key = "claude"
 cu_key = "gpt"
 lag_weight = 0.5
@@ -107,6 +107,20 @@ exec_command = ["cursor-agent", "-p", "--output-format", "json", "--model", "gro
 # transport = "exec"               # opt into one-shot mode only for diagnosis
 quota_probe = "cursor"        # Cursor dashboard GetCurrentPeriodUsage via local login
 
+[[agent]]
+key = "antigravity"
+# `agy` has no ACP mode yet, so this one is exec-only and never sticks.
+# It also offers Claude and GPT-OSS models: staying on gemini-* is what keeps
+# this spending Google's pool instead of Antigravity's third-party allowance.
+# `--print-timeout` must cover `timeout`, or agy quits at its own 5m default.
+exec_command = ["agy", "--output-format", "json", "--dangerously-skip-permissions",
+                "--print-timeout", "15m", "--model", "gemini-3.1-pro-high", "-p"]
+timeout = 900
+# No vendor usage endpoint is known, so ranking counts your own turns against
+# these. Replace them with your real plan limits if you know them.
+budget_5h_turns = 30
+budget_week_turns = 300
+
 # Codex 5h/7d that `codex exec` leaves null in session logs. Admin GET only —
 # this is not a completion proxy. Key stays in this file (chmod 600) or
 # SUB2API_ADMIN_API_KEY. gpt_account is id or name; empty auto-picks the
@@ -114,7 +128,7 @@ quota_probe = "cursor"        # Cursor dashboard GetCurrentPeriodUsage via local
 # [sub2api]
 # base_url = "https://api.example.com:8443"
 # admin_key = ""
-# gpt_account = "calmabacus"
+# gpt_account = "my-openai-account"
 
 # A fully custom agent (any ACP-speaking or headless CLI works):
 # [[agent]]
@@ -122,6 +136,6 @@ quota_probe = "cursor"        # Cursor dashboard GetCurrentPeriodUsage via local
 # label = "Gemini"
 # emoji = "*"
 # aliases = ["g"]
-# acp_command = ["gemini", "--experimental-acp"]
+# acp_command = ["gemini", "--acp"]        # --experimental-acp on older builds
 # exec_command = ["gemini", "-p"]
 # tier = "light"

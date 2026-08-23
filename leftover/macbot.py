@@ -242,8 +242,9 @@ def format_why(pick: Pick) -> str:
         if pick.reason:
             lines.append(f"  {pick.reason}")
         return "\n".join(lines)
+    width = max([8, *(len(key) for key in pick.chain)])
     lines.append(
-        f"  {'agent':<8} {'lag':>6} {'waste':>7} {'total':>7}  "
+        f"  {'agent':<{width}} {'lag':>6} {'waste':>7} {'total':>7}  "
         f"{'remaining':<16}  window")
     for key in pick.chain:
         score = pick.scores.get(key)
@@ -251,7 +252,7 @@ def format_why(pick: Pick) -> str:
                 if pick.spec is not None and pick.spec.key == key else "")
         if score is None:
             lines.append(
-                f"  {key:<8} {'—':>6} {'—':>7} {'—':>7}  "
+                f"  {key:<{width}} {'—':>6} {'—':>7} {'—':>7}  "
                 f"{'—':<16}  (not scored){mark}")
             continue
         if score.windows:
@@ -264,7 +265,7 @@ def format_why(pick: Pick) -> str:
             remain = "—"
             window = score.detail or "no live window"
         lines.append(
-            f"  {key:<8} {score.lag:6.2f} {score.waste:7.3f} "
+            f"  {key:<{width}} {score.lag:6.2f} {score.waste:7.3f} "
             f"{score.total:7.3f}  {remain:<16}  {window}{mark}")
     lines.append("")
     if pick.spec is not None:

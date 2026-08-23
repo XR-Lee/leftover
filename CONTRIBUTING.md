@@ -24,7 +24,8 @@ Python 3.10 through 3.13.
 - `--agent` is caller identity; `--use` forces routing.
 - Coding pick uses lag+waste; estimated windows have `waste = 0`.
 - `/cu` is Codex only.
-- Cursor stays on `--model grok-4.6`.
+- Cursor stays on `--model grok-4.6`; Antigravity stays on a first-party
+  `gemini-*` model. Neither may be pointed at another vendor's models.
 - `leftover --pick --json` `run` is `leftover --print …`, never a vendor TUI.
 - Classified quota text is a failure, not an answer.
 - `install-skills` writes symlinks.

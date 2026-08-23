@@ -6,6 +6,50 @@
 
 ---
 
+## D17 — Antigravity 进 coding pool，排最后，钉死在 first-party Gemini
+
+**2026-08-23 · 生效**
+
+第五个后端：Google 的 `agy`（Antigravity CLI 1.1.19，`~/.local/bin/agy`）。
+
+**为什么钉模型**：`agy models` 里有 Claude Opus 4.6 / Sonnet 4.6 / GPT-OSS 120B。
+把 leftover 的编码任务路由到那些模型上，花的是 Antigravity 的第三方额度，而不是
+Google 自己的池子——而 Claude 那份订阅用户本来就单独付着。这和 D 系列里 Cursor
+钉 `grok-4.6` 是同一条规则，不是新规则。`--model gemini-3.1-pro-high`。
+
+**为什么 exec 而不是 ACP**：`agy --help` 里没有 ACP 模式。所以它走 exec 传输，
+一次一问，不持有 live session，因此永远不 sticky。这是 CLI 的事实，不是选择。
+
+**三个必须记住的坑**：
+
+- `agy` 失败时 **exit code 仍是 0**，信封里是 `{"status":"ERROR","error":"..."}`。
+  exec runner 的 `_error_from_json` 本来就认 `error` 键，所以共享代码没为它开特例。
+- `--print-timeout` 默认 5m，比 leftover 的 900s turn timeout 短。不显式传
+  `15m` 的话，agy 会在 leftover 还在等的时候自己放弃。
+- 没有已知的用量接口。`quota_probe` 留空，排序靠本地 ledger 对 `budget_*_turns`
+  估算，`/quota` 显示 "no vendor number" 而不是编一个数字出来。
+
+**实测发现的两个 agy 行为**（不是 leftover 的问题，但用它就会撞上）：
+
+- 两个并发的 `agy -p` 共用一个后台 language server，会互相顶掉工作区或
+  `context canceled`。leftover 每个 agent 串行，单用安全；旁边开着 Antigravity
+  IDE 或第二个 leftover 就会断。
+- 动工具的回合里，agy 经常**把活干完了才报失败**：日志显示
+  `ReplaceFileContent` 已自动批准并写盘、磁盘上的文件是对的，信封却在 ~90s 时
+  返回 `{"status":"ERROR","error":"context canceled"}`。三次编辑测试里两次如此，
+  其中一次是完全没有其它 agy 在跑的隔离环境，所以**不是**上面那条并发问题。
+  leftover 照它上报的结果判失败并回退，第二家把已经做完的活重做一遍。
+  不为这个在共享代码里开特例——路由行为对得起 CLI 给的信息，而吞掉厂商自己报的
+  错误会掩盖真实的半途失败。要不要放宽，等 agy 修了再说。
+
+**排位**：`coding_keys` 和 `order` 都放末尾——平局时它最后。但 estimated 窗口的
+lag 会随时间涨（waste 恒为 0），所以闲置久了它照样会被选中去花配额，这正是产品目的。
+
+**顺带修的**：doctor 名册和 `--why` 表的 agent 列宽是写死的 8/10 字符，
+"Antigravity" 11 个字符把两处对齐都撑破了。改成按实际展示的 agent 算宽度。
+
+---
+
 ## D16 — 开源面：英文 /quota、本机时区、SECURITY.md、telegram 变 extra
 
 **2026-08-23 · 生效**

@@ -67,6 +67,7 @@ claude       -p --dangerously-skip-permissions
 codex        exec --dangerously-bypass-approvals-and-sandbox
 grok         --always-approve --permission-mode bypassPermissions
 cursor-agent -p --force
+agy          -p --dangerously-skip-permissions
 ```
 
 Over ACP, `request_permission` is auto-accepted the same way.
