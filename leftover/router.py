@@ -43,7 +43,7 @@ CONTINUATION_GUARD = (
     "partial edits. Inspect `git status` before continuing.\n\n"
 )
 
-log = logging.getLogger("agora.router")
+log = logging.getLogger("leftover.router")
 
 
 def _consume_async_result(task: asyncio.Future[Any]) -> None:
@@ -85,7 +85,7 @@ class _DaemonProbePool:
         for index in range(workers):
             threading.Thread(
                 target=self._worker,
-                name=f"agora-quota-{index + 1}",
+                name=f"leftover-quota-{index + 1}",
                 daemon=True,
             ).start()
 
@@ -226,6 +226,7 @@ class Health:
     ewma_seconds: float = 0.0
     quota: q.Quota | None = None
     quota_checked: float = 0.0
+    quota_observation_epoch: int = 0
 
     def refresh(self) -> None:
         """Cooldowns expire on their own; a tripped breaker goes half-open."""
@@ -296,6 +297,9 @@ class Router:
         }
         self.ledger = q.Ledger(Path(config.data_dir) / "ledger.json")
         self.last_success: str | None = None
+        # Process-local provenance for conversation continuity. Disk history
+        # cannot prove that an arbitrary live runner owns this coding thread.
+        self.conversation_success: str | None = None
         self.last_scores: dict = {}
 
     # -- health ---------------------------------------------------------------
@@ -328,6 +332,7 @@ class Router:
         health.last_error = failure.detail or failure.kind
         # Fold the refusal into the quota view so `/quota` shows why.
         if failure.kind == "quota":
+            health.quota_observation_epoch += 1
             health.quota = q.Quota(
                 agent=spec.key,
                 windows=[q.Window(name=failure.window or "limit", used_percent=100.0,
@@ -339,6 +344,11 @@ class Router:
     def observe(self, spec: AgentSpec, turn: Turn) -> q.Failure | None:
         """Update health and the ledger from a completed turn."""
         health = self.h(spec)
+        if turn.meta.get("shutdown_interrupted"):
+            # The request never reached a backend. Keep it terminal for this
+            # routed request without tripping that backend's health state.
+            return q.Failure(
+                "transient", detail=turn.error or "pool shutdown interrupted")
         if turn.meta.get("timeout_kind") == "sink":
             # Delivery failed after the backend produced an event. Do not replay
             # the task or punish the model for a stuck UI/network sink.
@@ -433,6 +443,7 @@ class Router:
             return health.quota
 
         previous = health.quota
+        observation_epoch = health.quota_observation_epoch
         found: q.Quota | None = None
         try:
             budget = max(0.0, float(self.config.routing.quota_probe_timeout))
@@ -449,17 +460,24 @@ class Router:
         result = found if found_real or not cached.windows else cached
         if result is None:
             result = cached
-        # Keep an observed refusal visible until its reset passes.
-        if previous:
+        # Keep refusals observed while this probe was in flight. Router health
+        # is shared across conversations, so observe() may have replaced the
+        # cached quota after `previous` was captured above.
+        concurrent_quota = (health.quota
+                            if health.quota_observation_epoch != observation_epoch
+                            else None)
+        if concurrent_quota is not None:
             existing = {
                 (w.name, w.source, w.resets_at, w.detail)
                 for w in result.windows
             }
-            result.windows += [
-                w for w in previous.windows
-                if (w.source == q.OBSERVED and not w.expired
-                    and (w.name, w.source, w.resets_at, w.detail) not in existing)
-            ]
+            for window in concurrent_quota.windows:
+                identity = (window.name, window.source,
+                            window.resets_at, window.detail)
+                if (window.source == q.OBSERVED and not window.expired
+                        and identity not in existing):
+                    result.windows.append(window)
+                    existing.add(identity)
         # Do not invent a 0% "5h budget" and print it as quota. Estimated
         # turn counts are not vendor remaining. Ranking ignores them anyway.
         result.agent = spec.key
@@ -635,6 +653,8 @@ class Router:
             attempted = True
             failure = self.observe(spec, turn)
             timed_out = self._terminal_timeout(turn)
+            terminal = timed_out or bool(
+                turn.meta.get("shutdown_interrupted"))
             last, last_failure, last_spec = turn, failure, spec
             decision.attempts.append(Attempt(
                 key=spec.key,
@@ -652,11 +672,12 @@ class Router:
                 return turn, decision
             decision.reasons.append(
                 f"{spec.key}: {failure.kind if failure else 'empty'}")
-            if timed_out:
+            if terminal:
                 # A configured turn/idle deadline means this was real work that
                 # ran too long. Starting the same job on another vendor doubles
-                # latency and cost; quick refusals and transport failures still
-                # continue through the normal fallback chain.
+                # latency and cost. A pool shutdown boundary likewise means this
+                # routed request has been cancelled and must not restart later.
+                # Quick refusals and queue saturation still use normal fallback.
                 return turn, decision
         if last is None:
             return self._nobody_home(chain, primary, decision), decision
@@ -669,6 +690,8 @@ class Router:
 
     @staticmethod
     def _terminal_timeout(turn: Turn) -> bool:
+        if turn.meta.get("shutdown_interrupted"):
+            return True
         if turn.meta.get("timeout_kind") in {"turn", "idle", "sink"}:
             return True
         error = (turn.error or "").strip().lower()
@@ -703,4 +726,5 @@ class Router:
         return rhythm.render(
             entries, now=now,
             strategy=self.config.routing.strategy,
-            order=self.config.routing.order)
+            order=self.config.routing.order,
+            tz_name=self.config.timezone)

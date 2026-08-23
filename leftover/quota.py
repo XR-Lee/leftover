@@ -427,11 +427,13 @@ def _keychain_account(service: str) -> str | None:
 
 
 def _keychain_set_password(service: str, account: str, password: str) -> bool:
+    # `-w` with no value reads the secret from stdin. Passing it as an argv
+    # element would publish the token in `ps` output for the whole call.
     try:
         proc = subprocess.run(
             ["security", "add-generic-password", "-U",
-             "-s", service, "-a", account, "-w", password],
-            capture_output=True, text=True, timeout=15)
+             "-s", service, "-a", account, "-w"],
+            input=password, capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.TimeoutExpired):
         return False
     return proc.returncode == 0
@@ -597,7 +599,7 @@ def pick_sub2api_account(items: list[Any], pin: str = "") -> dict[str, Any] | No
 
 
 def _sub2api_window(name: str, used: float, *, resets_at: float | None,
-                    remaining: float | None, detail: str) -> Window:
+                    remaining: float | None, detail: str) -> Window | None:
     now = time.time()
     length = _SUB2API_WINDOW_SECONDS.get(name)
     started_at = None
@@ -606,20 +608,17 @@ def _sub2api_window(name: str, used: float, *, resets_at: float | None,
         if length:
             started_at = resets_at - length
     elif remaining is not None and remaining <= 0:
-        # remaining 0 is last-reset, not next-reset (Codex 5h just flipped)
-        if used <= 0 and length:
-            started_at = now
-            resets_at = now + length
-        elif resets_at is None or resets_at <= now:
+        # Sub2API emits a 0% / 0-second shell for windows that are not active.
+        # Its reset timestamp tracks the observation time, so treating it as a
+        # completed reset would invent a fresh reported window.
+        if used <= 0 and (resets_at is None or resets_at <= now):
+            return None
+        if resets_at is None or resets_at <= now:
             resets_at = None
         elif length:
             started_at = resets_at - length
     elif resets_at is not None and resets_at <= now:
-        if used <= 0 and length:
-            started_at = now
-            resets_at = now + length
-        else:
-            resets_at = None
+        return None
     elif resets_at is not None and length:
         started_at = resets_at - length
     return Window(
@@ -632,8 +631,24 @@ def _sub2api_window(name: str, used: float, *, resets_at: float | None,
     )
 
 
+def _sub2api_window_disabled(extra: dict[str, Any], name: str) -> bool:
+    key = "codex_5h_window_minutes" if name == "5h" else "codex_7d_window_minutes"
+    minutes = extra.get(key)
+    return (isinstance(minutes, (int, float)) and not isinstance(minutes, bool)
+            and minutes <= 0)
+
+
+def _sub2api_inactive_shell(used: float, remaining: float | None,
+                            resets_at: float | None) -> bool:
+    """True only for the empty, expired bucket emitted for an inactive window."""
+    return (used <= 0
+            and remaining is not None and remaining <= 0
+            and (resets_at is None or resets_at <= time.time()))
+
+
 def parse_sub2api_usage(payload: Any, *, account_name: str = "",
-                        agent: str = "gpt") -> Quota | None:
+                        agent: str = "gpt",
+                        account_extra: dict[str, Any] | None = None) -> Quota | None:
     data = _sub2api_data(payload)
     if not isinstance(data, dict):
         data = payload if isinstance(payload, dict) else None
@@ -647,15 +662,24 @@ def parse_sub2api_usage(payload: Any, *, account_name: str = "",
             continue
         pct = bucket.get("utilization")
         if pct is None:
-            pct = bucket.get("used_percent") or bucket.get("used_percentage")
+            pct = bucket.get("used_percent")
+        if pct is None:
+            pct = bucket.get("used_percentage")
         if not isinstance(pct, (int, float)):
             continue
         remaining = bucket.get("remaining_seconds")
         rem = float(remaining) if isinstance(remaining, (int, float)) else None
+        resets_at = _parse_ts(bucket.get("resets_at"))
+        if (account_extra is not None
+                and _sub2api_window_disabled(account_extra, name)
+                and _sub2api_inactive_shell(float(pct), rem, resets_at)):
+            continue
         window = _sub2api_window(
             name, float(pct),
-            resets_at=_parse_ts(bucket.get("resets_at")),
+            resets_at=resets_at,
             remaining=rem, detail=detail)
+        if window is None:
+            continue
         stats = bucket.get("window_stats") if isinstance(bucket.get("window_stats"), dict) else {}
         req = stats.get("requests")
         if isinstance(req, (int, float)):
@@ -685,15 +709,19 @@ def parse_sub2api_account(account: dict[str, Any], *,
              "codex_5h_reset_after_seconds", "5h"),
             ("codex_7d_used_percent", "codex_7d_reset_at",
              "codex_7d_reset_after_seconds", "weekly")):
+        if _sub2api_window_disabled(extra, label):
+            continue
         pct = extra.get(used_key)
         if not isinstance(pct, (int, float)):
             continue
         remaining = extra.get(remain_key)
         rem = float(remaining) if isinstance(remaining, (int, float)) else None
-        windows.append(_sub2api_window(
+        window = _sub2api_window(
             label, float(pct),
             resets_at=_parse_ts(extra.get(reset_key)),
-            remaining=rem, detail=detail))
+            remaining=rem, detail=detail)
+        if window is not None:
+            windows.append(window)
     if not windows:
         return None
     return Quota(
@@ -780,7 +808,8 @@ def probe_sub2api(sub2api: Any, *, agent: str = "gpt",
                 f"/api/v1/admin/accounts/{account_id}/usage?source=active",
                 timeout=request_timeout)
             parsed = parse_sub2api_usage(
-                payload, account_name=account_name, agent=agent)
+                payload, account_name=account_name, agent=agent,
+                account_extra=extra_blob)
             if status == 200 and parsed is not None:
                 return _named(parsed)
         request_timeout = _probe_request_timeout(deadline, 12.0)
@@ -989,7 +1018,7 @@ def parse_grok_billing(payload: dict[str, Any], *, plan: str = "") -> Quota | No
     note = "grok cli-proxy /v1/billing"
     if plan:
         note = f"{plan} · {note}"
-    title = f"官方周池 · {plan}" if plan else "官方周池"
+    title = f"official weekly pool · {plan}" if plan else "official weekly pool"
     return Quota(
         agent="grok",
         windows=[Window(

@@ -40,7 +40,7 @@ human / Warp / Cursor / Claude / Grok skill
                                 cursor-agent -p
 ```
 
-The package still ships `agora bot` (Telegram) on the same orchestrator. That path is leftover. Do not add Telegram-only features.
+The package still ships `agora bot` (Telegram) on the same orchestrator, behind the optional `[telegram]` extra. That path is leftover. Do not add Telegram-only features.
 
 ## Runtime pieces
 
@@ -62,7 +62,7 @@ The package still ships `agora bot` (Telegram) on the same orchestrator. That pa
 
 State on disk:
 
-- `~/.local/share/leftover/leftover-state.json` — sticky cwd, health, last quota snapshot
+- `~/.local/share/leftover/leftover-state.json` — route history, health, last quota snapshot
 - `~/.local/share/leftover/ledger.json` — turn counts for estimated budgets
 - `~/.local/share/leftover/history` — REPL readline
 
@@ -82,16 +82,36 @@ Config search order: `~/.config/leftover/leftover.toml`, `~/.config/macbot/macbo
 | `announce` | the one line the human should see (`leftover · Cursor`) |
 | `chain` | fallback order for this request |
 | `reason` | why this pick (debug; do not print to the human) |
-| `run` | argv the skill should exec (`leftover --print …`), never a TUI |
+| `run` | foreground argv the skill should execute, or null when unavailable; never synthesize it or use the TUI `spawn` argv |
+| `completion` | process-exit wait contract for the parent execution handle |
 | `spawn` | vendor TUI argv; skills must not run this |
 | `self` | echo of `--agent` |
 
 `--agent` is who is asking. `--use` is who should go first.
 
+### Parent handoff wait contract
+
+Both the initial `--pick --json` query and the argv in `run` are synchronous and
+foreground. If either yields an execution handle, the parent waits on that same
+handle instead of starting another pick or handoff. The `leftover --print`
+process writes progress to stderr, writes the final answer to stdout, then
+exits. Process exit is the only completion callback across this boundary; a
+stderr heartbeat cannot wake a parent agent that is not waiting on the command
+handle.
+
+When an execution tool yields a still-running `session_id`, `cell_id`, or job
+handle, the parent must immediately use the host's blocking wait on that same
+handle; a correct wait returns as soon as the process exits. If the host only
+offers non-blocking polling, the `completion.max_poll_interval_seconds` value
+bounds the gap at 10 seconds. The parent must not schedule the next poll from a
+model-generated runtime estimate, sleep for minutes, detach the command, or
+launch a duplicate.
+
 ## Request path
 
 1. `intent.parse` — tags beat scoring; `@any` is unnamed.
-2. `decide` forces `strategy = lag_waste`. Sticky cwd only for unnamed coding.
+2. `decide` forces `strategy = lag_waste`. Only an unnamed coding follow-up
+   with process-local success provenance and a live session is sticky.
 3. Group modes build a panel (`discussion_panel` / `debate_panel`) and stop. They do not pick one agent.
 4. `Router.run` walks `ordered_chain` (the pick), skipping benched keys. It does not re-inject per-agent `fallback` when the chain is pinned.
 5. `observe` classifies error **and** short result text. Quota refusal benches until `resets_at` or `quota_blind_cooldown`.

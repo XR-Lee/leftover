@@ -25,7 +25,7 @@ from ..config import AgentSpec, Config
 from ..orchestrator import Orchestrator, summarise
 from ..router import Router
 
-log = logging.getLogger("agora.telegram")
+log = logging.getLogger("leftover.telegram")
 
 HELP = """<b>agora</b> - your local CLI agents, in this chat.
 
@@ -299,7 +299,8 @@ class Bot:
 def main(config: Config) -> None:
     if not config.telegram_token:
         raise SystemExit(
-            "no Telegram token - set AGORA_TELEGRAM_TOKEN or [telegram].token")
+            "no Telegram token - set LEFTOVER_TELEGRAM_TOKEN "
+            "or [telegram].token")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s")

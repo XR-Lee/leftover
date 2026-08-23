@@ -11,13 +11,14 @@ relay       plan -> implement -> review pipeline for actual heavy work
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Iterable, Sequence
 
 from .agents import AgentPool, Event, Turn
 from .config import AgentSpec, Config
-from .router import CONTINUATION_GUARD, Decision, Router
+from .router import CONTINUATION_GUARD, Decision, Router, await_bounded
 from .transcript import Transcript
 
 MENTION_RE = re.compile(r"(?:^|\s)@([A-Za-z][\w-]*)")
@@ -62,6 +63,21 @@ class Plan:
 TurnSink = Callable[[AgentSpec], Awaitable[Callable[[object], Awaitable[None]] | None]]
 
 _CANCEL_DRAIN_SECONDS = 0.25
+log = logging.getLogger("leftover.orchestrator")
+
+
+@dataclass
+class _DeliveryBudget:
+    """Cumulative time allowed inside buffered delivery callbacks."""
+
+    timeout: float
+    spent: float = 0.0
+
+    def remaining(self) -> float:
+        return self.timeout - self.spent
+
+    def consume(self, seconds: float) -> None:
+        self.spent += max(0.0, seconds)
 
 
 def _consume_future(future: asyncio.Future) -> None:
@@ -250,20 +266,45 @@ class Orchestrator:
             self.transcript.add(turn.agent.label, turn.text)
         return turn
 
-    async def _emit_turn(self, turn: Turn, sink: TurnSink | None) -> None:
+    async def _emit_turn(self, turn: Turn, sink: TurnSink | None,
+                         budget: _DeliveryBudget | None = None) -> None:
         """Flush one buffered parallel debate answer without interleaving text."""
         if sink is None:
             return
-        on_event = await sink(turn.agent)
-        if on_event is None:
-            return
-        for tool in turn.tools:
-            await on_event(Event("tool", tool))
-        if turn.text:
-            await on_event(Event("text", turn.text))
-        if turn.error:
-            await on_event(Event("error", turn.error))
-        await on_event(Event("done"))
+        timeout = self.config.routing.event_sink_timeout
+        delivery = budget or _DeliveryBudget(timeout)
+
+        async def deliver(factory: Callable[[], Awaitable[object]]) -> object:
+            remaining = delivery.remaining()
+            if remaining <= 0:
+                raise TimeoutError
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            try:
+                return await await_bounded(factory(), remaining)
+            finally:
+                delivery.consume(loop.time() - started)
+
+        try:
+            on_event = await deliver(lambda: sink(turn.agent))
+            if on_event is None:
+                return
+            for tool in turn.tools:
+                await deliver(lambda tool=tool: on_event(Event("tool", tool)))
+            if turn.text:
+                await deliver(lambda: on_event(Event("text", turn.text)))
+            if turn.error:
+                await deliver(lambda: on_event(Event("error", turn.error)))
+            await deliver(lambda: on_event(Event("done")))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - do not strand group work
+            detail = (f"timed out after {timeout:g}s"
+                      if isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+                      else f"{type(exc).__name__}: {exc}")
+            turn.meta = dict(turn.meta)
+            turn.meta["delivery_error"] = detail
+            log.warning("%s event delivery failed: %s", turn.agent.label, detail)
 
     async def _run_sequence(self, plan: Plan, sink: TurnSink | None) -> list[Turn]:
         turns: list[Turn] = []
@@ -284,6 +325,15 @@ class Orchestrator:
         named = {s.key for s in plan.agents}
         claimed_spares: set[str] = set()
         fallback_lock = asyncio.Lock()
+        delivery = _DeliveryBudget(self.config.routing.event_sink_timeout)
+        rank_task: asyncio.Task[list[AgentSpec]] | None = None
+
+        async def ranked_agents() -> list[AgentSpec]:
+            nonlocal rank_task
+            if rank_task is None:
+                rank_task = asyncio.create_task(
+                    self.router.rank(self.config.enabled_agents()))
+            return await asyncio.shield(rank_task)
 
         async def one(index: int, spec: AgentSpec) -> tuple[int, Turn]:
             async with sem:
@@ -293,12 +343,24 @@ class Orchestrator:
                     ordered_chain=[spec])
 
             if not turn.ok and not self.router._terminal_timeout(turn):
-                # Primaries remain parallel. The rare fallback phase is
-                # serialized so an unnamed spare can occupy at most one slot.
-                async with fallback_lock:
-                    guarded = bool(decision.tried) \
-                        and self.config.routing.continuation_guard
+                ranked = await ranked_agents()
+                guarded = bool(decision.tried) \
+                    and self.config.routing.continuation_guard
 
+                # Only spare ownership is serialized. Calls to distinct
+                # replacements remain parallel under the shared semaphore.
+                async with fallback_lock:
+                    chain = self.router.chain_for(
+                        spec, ranked, exclude=named | claimed_spares)
+                    replacement = next(
+                        (candidate for candidate in chain
+                         if self.router.h(candidate).usable),
+                        None,
+                    )
+                    if replacement is not None:
+                        claimed_spares.add(replacement.key)
+
+                if replacement is not None:
                     def fallback_prompt(replacement: AgentSpec) -> str:
                         prompt = self._compose(replacement, plan.prompt)
                         return CONTINUATION_GUARD + prompt if guarded else prompt
@@ -306,12 +368,11 @@ class Orchestrator:
                     async with sem:
                         fallback_turn, fallback_decision = await self.router.run(
                             fallback_prompt,
-                            primary=spec,
+                            primary=replacement,
                             sink=None,
                             max_attempts=1,
-                            exclude=named | claimed_spares,
+                            ordered_chain=[replacement],
                         )
-                    claimed_spares.update(fallback_decision.tried)
                     if guarded:
                         for attempt in fallback_decision.attempts:
                             attempt.continuation_guard = True
@@ -334,9 +395,12 @@ class Orchestrator:
             for completed in asyncio.as_completed(tasks):
                 index, turn = await completed
                 slots[index] = turn
-                await self._emit_turn(turn, sink)
+                await self._emit_turn(turn, sink, delivery)
         except BaseException:
-            await _cancel_and_drain(tasks)
+            cleanup = list(tasks)
+            if rank_task is not None:
+                cleanup.append(rank_task)
+            await _cancel_and_drain(cleanup)
             raise
 
         turns = [turn for turn in slots if turn is not None]
@@ -363,6 +427,7 @@ class Orchestrator:
         warm = getattr(self.pool, "prepare", None)
         warm_tasks = [asyncio.create_task(warm(spec)) for spec in plan.agents] \
             if callable(warm) else []
+        delivery = _DeliveryBudget(self.config.routing.event_sink_timeout)
 
         def builder(side: str, round_no: int, floor: list[Turn]):
             if round_no == 1:
@@ -386,7 +451,7 @@ class Orchestrator:
                         ordered_chain=[spec]),
                     timeout=timeout,
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 turn = Turn(
                     agent=spec,
                     error=f"debate turn timed out after {timeout:g}s",
@@ -421,17 +486,16 @@ class Orchestrator:
                     prompt_builder = builder(side, round_no, floor)
                     turn = await invoke(specs[side], prompt_builder)
                     if not turn.ok and not self.router._terminal_timeout(turn):
-                        # A whole fallback chain owns the lock so no other role
-                        # can claim one of its attempted spares.
-                        async with fallback_lock:
-                            while (not turn.ok
-                                   and not self.router._terminal_timeout(turn)):
+                        while (not turn.ok
+                               and not self.router._terminal_timeout(turn)):
+                            async with fallback_lock:
                                 replacement = spare(
                                     round_reserved, attempted_spares)
-                                if replacement is None:
-                                    break
-                                attempted_spares.add(replacement.key)
-                                turn = await invoke(replacement, prompt_builder)
+                                if replacement is not None:
+                                    attempted_spares.add(replacement.key)
+                            if replacement is None:
+                                break
+                            turn = await invoke(replacement, prompt_builder)
                     turn.meta = dict(turn.meta)
                     turn.meta.update(
                         discussion_role=side, discussion_round=round_no)
@@ -448,7 +512,7 @@ class Orchestrator:
                         round_turns[index] = turn
                         if turn.ok:
                             assigned[side] = turn.agent
-                        await self._emit_turn(turn, sink)
+                        await self._emit_turn(turn, sink, delivery)
                 except BaseException:
                     await _cancel_and_drain(round_tasks)
                     raise
@@ -481,14 +545,9 @@ class Orchestrator:
                 verdict.meta = dict(verdict.meta)
                 verdict.meta.update(discussion_role="JUDGE")
                 turns.append(verdict)
-                await self._emit_turn(verdict, sink)
-        except BaseException:
+                await self._emit_turn(verdict, sink, delivery)
+        finally:
             await _cancel_and_drain(warm_tasks)
-            raise
-        else:
-            if warm_tasks:
-                # Normal completion retrieves any speculative startup errors.
-                await asyncio.gather(*warm_tasks, return_exceptions=True)
 
         for turn in turns:
             if not turn.ok:
@@ -531,7 +590,9 @@ class Orchestrator:
 def summarise(turns: Iterable[Turn]) -> str:
     lines = []
     for t in turns:
-        status = "ok" if t.ok else (t.error or "empty")
+        delivery_error = t.meta.get("delivery_error")
+        status = (f"delivery failed: {delivery_error}" if delivery_error
+                  else "ok" if t.ok else (t.error or "empty"))
         role = t.meta.get("discussion_role")
         label = f"{t.agent.label}/{str(role).lower()}" if role else t.agent.label
         lines.append(f"{label}: {status} ({t.seconds:.0f}s)")

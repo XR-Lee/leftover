@@ -13,11 +13,17 @@ from typing import Any, AsyncIterator
 
 from ..config import AgentSpec
 from .base import BaseRunner, Event, OnEvent
+from .process_tree import (
+    ProcessTree,
+    isolated_subprocess_kwargs,
+    terminate_process_tree,
+)
 
 
 _TERMINATE_TIMEOUT = 1.0
 _STDERR_CAPTURE_LIMIT = 64 * 1024
 _PIPE_READ_SIZE = 64 * 1024
+_PROCESS_POLL_INTERVAL = 0.01
 
 
 def _remaining(deadline: float) -> float:
@@ -47,6 +53,57 @@ async def _drain_bounded_tail(
         if overflow > 0:
             del tail[:overflow]
         tail.extend(chunk)
+
+
+async def _feed_stdin(
+        writer: asyncio.StreamWriter, payload: bytes) -> None:
+    """Write stdin while treating an early CLI exit like communicate()."""
+    try:
+        writer.write(payload)
+        await writer.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    finally:
+        writer.close()
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            await writer.wait_closed()
+
+
+async def _wait_for_returncode(proc: asyncio.subprocess.Process) -> int:
+    """Observe leader exit without waiting for inherited pipes to reach EOF."""
+    while proc.returncode is None:
+        await asyncio.sleep(_PROCESS_POLL_INTERVAL)
+    return proc.returncode
+
+
+async def _await_task_before(
+        task: asyncio.Task[Any], deadline: float) -> Any:
+    if task.done():
+        return task.result()
+    done, _pending = await asyncio.wait(
+        {task}, timeout=_remaining(deadline))
+    if task not in done:
+        raise TimeoutError
+    return task.result()
+
+
+async def _readline_unbounded(reader: asyncio.StreamReader) -> bytes:
+    """Read one line without StreamReader's default 64 KiB record limit."""
+    chunks: list[bytes] = []
+    while True:
+        try:
+            part = await reader.readuntil(b"\n")
+        except asyncio.LimitOverrunError as exc:
+            # readuntil leaves the oversized prefix buffered. Consume that
+            # prefix and continue looking for the same record's newline.
+            part = await reader.readexactly(exc.consumed)
+            chunks.append(part)
+        except asyncio.IncompleteReadError as exc:
+            chunks.append(exc.partial)
+            return b"".join(chunks)
+        else:
+            chunks.append(part)
+            return b"".join(chunks)
 
 
 def _dig(obj: Any, dotted: str) -> Any:
@@ -105,7 +162,12 @@ class ExecRunner(BaseRunner):
     def __init__(self, spec: AgentSpec) -> None:
         super().__init__(spec)
         self._proc: asyncio.subprocess.Process | None = None
+        self._tree: ProcessTree | None = None
         self._proc_lock = asyncio.Lock()
+        self._pipe_readers: dict[
+            asyncio.subprocess.Process,
+            dict[asyncio.StreamReader, asyncio.Task[bytes] | None],
+        ] = {}
         self._closed = False
         self.last_meta: dict[str, Any] = {}
 
@@ -127,22 +189,36 @@ class ExecRunner(BaseRunner):
             proc = self._proc
             if proc is None:
                 return
+            tree = self._tree or ProcessTree.capture(
+                proc, isolated=False)
             try:
-                await self._reap(proc)
+                await self._reap(proc, tree, finalize_pipes=False)
             finally:
                 if self._proc is proc:
                     self._proc = None
+                    self._tree = None
 
-    async def _release(self, proc: asyncio.subprocess.Process) -> None:
+    async def _release(
+            self, proc: asyncio.subprocess.Process, tree: ProcessTree) -> None:
         async with self._proc_lock:
             try:
-                await self._reap(proc)
+                await self._reap(proc, tree, finalize_pipes=True)
             finally:
+                self._pipe_readers.pop(proc, None)
                 if self._proc is proc:
                     self._proc = None
+                    self._tree = None
 
-    async def _reap(self, proc: asyncio.subprocess.Process) -> None:
-        cleanup = asyncio.create_task(self._terminate_and_wait(proc))
+    async def _reap(
+            self, proc: asyncio.subprocess.Process, tree: ProcessTree,
+            *, finalize_pipes: bool, graceful: bool = True) -> None:
+        cleanup = asyncio.create_task(
+            self._terminate_and_wait(
+                proc,
+                tree,
+                finalize_pipes=finalize_pipes,
+                graceful=graceful,
+            ))
         try:
             await asyncio.shield(cleanup)
         except BaseException:
@@ -151,37 +227,98 @@ class ExecRunner(BaseRunner):
                 await cleanup
             raise
 
-    async def _terminate_and_wait(self, proc: asyncio.subprocess.Process) -> None:
-        if proc.returncode is not None:
-            await proc.wait()
-            return
+    def _register_pipe_task(
+            self, proc: asyncio.subprocess.Process,
+            reader: asyncio.StreamReader,
+            task: asyncio.Task[bytes]) -> None:
+        self._pipe_readers.setdefault(proc, {})[reader] = task
 
-        with contextlib.suppress(ProcessLookupError):
-            proc.terminate()
-        waiter = asyncio.create_task(proc.wait())
+    def _register_inline_reader(
+            self, proc: asyncio.subprocess.Process,
+            reader: asyncio.StreamReader) -> None:
+        self._pipe_readers.setdefault(proc, {})[reader] = None
+
+    def _finish_inline_reader(
+            self, proc: asyncio.subprocess.Process,
+            reader: asyncio.StreamReader) -> asyncio.Task[bytes]:
+        readers = self._pipe_readers.setdefault(proc, {})
+        if readers.get(reader) is None:
+            readers.pop(reader, None)
+        return self._ensure_pipe_task(proc, reader)
+
+    def _ensure_pipe_task(
+            self, proc: asyncio.subprocess.Process,
+            reader: asyncio.StreamReader) -> asyncio.Task[bytes]:
+        readers = self._pipe_readers.setdefault(proc, {})
+        task = readers.get(reader)
+        if task is None and reader not in readers:
+            task = asyncio.create_task(_drain_bounded_tail(reader))
+            readers[reader] = task
+        if task is None:
+            raise RuntimeError("cannot drain a pipe with an active inline reader")
+        return task
+
+    def _ensure_pipe_drains(
+            self, proc: asyncio.subprocess.Process) -> list[asyncio.Task[bytes]]:
+        readers = self._pipe_readers.setdefault(proc, {})
+        for reader in (proc.stdout, proc.stderr):
+            if reader is not None and reader not in readers:
+                readers[reader] = asyncio.create_task(
+                    _drain_bounded_tail(reader))
+        return [task for task in readers.values() if task is not None]
+
+    @staticmethod
+    def _close_stdin(proc: asyncio.subprocess.Process) -> None:
+        if proc.stdin is not None and not proc.stdin.is_closing():
+            proc.stdin.close()
+
+    async def _settle_pipe_drains(
+            self, proc: asyncio.subprocess.Process) -> None:
+        tasks = self._ensure_pipe_drains(proc)
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(
+            tasks, timeout=max(_TERMINATE_TIMEOUT, 0.0))
+        for task in done:
+            _consume_future(task)
+        for task in pending:
+            task.cancel()
+            task.add_done_callback(_consume_future)
+
+    async def _terminate_and_wait(
+            self, proc: asyncio.subprocess.Process, tree: ProcessTree,
+            *, finalize_pipes: bool, graceful: bool) -> None:
+        self._close_stdin(proc)
+        self._ensure_pipe_drains(proc)
         try:
-            await asyncio.wait_for(
-                asyncio.shield(waiter), timeout=_TERMINATE_TIMEOUT)
-        except asyncio.TimeoutError:
-            if proc.returncode is None:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-            done, _pending = await asyncio.wait(
-                {waiter}, timeout=_TERMINATE_TIMEOUT)
-            if waiter not in done:
-                waiter.cancel()
-                waiter.add_done_callback(_consume_future)
+            await terminate_process_tree(
+                tree,
+                term_timeout=_TERMINATE_TIMEOUT if graceful else 0.0,
+                kill_timeout=_TERMINATE_TIMEOUT,
+            )
+        finally:
+            if finalize_pipes:
+                await self._settle_pipe_drains(proc)
 
     async def _spawn(self, *argv: str, stdin, stdout, stderr, cwd: str,
-                     env: dict[str, str]) -> asyncio.subprocess.Process:
+                     env: dict[str, str]
+                     ) -> tuple[asyncio.subprocess.Process, ProcessTree]:
         async with self._proc_lock:
             if self._closed:
                 raise RuntimeError(f"{self.spec.label}: exec runner is closed")
             if self._proc is not None and self._proc.returncode is None:
                 raise RuntimeError(f"{self.spec.label}: exec process is already running")
 
+            isolated = os.name == "posix"
             spawn = asyncio.create_task(asyncio.create_subprocess_exec(
-                *argv, stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd, env=env))
+                *argv,
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr,
+                cwd=cwd,
+                env=env,
+                **isolated_subprocess_kwargs(),
+            ))
             try:
                 proc = await asyncio.shield(spawn)
             except BaseException:
@@ -189,10 +326,18 @@ class ExecRunner(BaseRunner):
                 # create_subprocess_exec returns it to us. Reap it if that race wins.
                 with contextlib.suppress(BaseException):
                     proc = await spawn
-                    await self._reap(proc)
+                    tree = ProcessTree.capture(proc, isolated=isolated)
+                    try:
+                        await self._reap(
+                            proc, tree, finalize_pipes=True)
+                    finally:
+                        self._pipe_readers.pop(proc, None)
                 raise
+            tree = ProcessTree.capture(proc, isolated=isolated)
             self._proc = proc
-            return proc
+            self._tree = tree
+            self._pipe_readers[proc] = {}
+            return proc, tree
 
     async def stream(self, prompt: str, on_event: OnEvent | None = None
                      ) -> AsyncIterator[Event]:
@@ -207,7 +352,7 @@ class ExecRunner(BaseRunner):
             argv.append(prompt)
 
         env = {**os.environ, **spec.env}
-        proc = await self._spawn(
+        proc, tree = await self._spawn(
             *argv,
             stdin=(asyncio.subprocess.PIPE
                    if stdin_data else asyncio.subprocess.DEVNULL),
@@ -217,24 +362,51 @@ class ExecRunner(BaseRunner):
             env=env,
         )
 
-        stderr_task: asyncio.Task[bytes] | None = None
-        stdout_cleanup: asyncio.Task[bytes] | None = None
+        auxiliary_tasks: list[asyncio.Task[Any]] = []
+        inline_stdout = False
         try:
+            leader_task = asyncio.create_task(_wait_for_returncode(proc))
+            auxiliary_tasks.append(leader_task)
+            if stdin_data and proc.stdin is not None:
+                stdin_task = asyncio.create_task(
+                    _feed_stdin(proc.stdin, stdin_data))
+                auxiliary_tasks.append(stdin_task)
+
             if spec.exec_output == "stream-json":
+                assert proc.stdout is not None
                 assert proc.stderr is not None
                 stderr_task = asyncio.create_task(
                     _drain_bounded_tail(proc.stderr))
+                self._register_pipe_task(proc, proc.stderr, stderr_task)
+                self._register_inline_reader(proc, proc.stdout)
+                inline_stdout = True
                 async for ev in self._read_stream_json(
-                        proc, stdin_data, deadline, stderr_task):
+                        proc, tree, deadline, stderr_task, leader_task):
                     yield ev
                 return
 
-            try:
-                remaining = _remaining(deadline)
-                out, err = await asyncio.wait_for(
-                    proc.communicate(stdin_data), timeout=remaining)
-            except asyncio.TimeoutError:
-                raise TimeoutError from None
+            assert proc.stdout is not None
+            assert proc.stderr is not None
+            stdout_task = asyncio.create_task(proc.stdout.read())
+            stderr_task = asyncio.create_task(proc.stderr.read())
+            self._register_pipe_task(proc, proc.stdout, stdout_task)
+            self._register_pipe_task(proc, proc.stderr, stderr_task)
+
+            await _await_task_before(leader_task, deadline)
+            # Process.wait() can remain pending after the leader exits while a
+            # descendant retains inherited pipes. Reap the saved process group
+            # at the returncode boundary, then collect the already-produced data.
+            await self._reap(
+                proc, tree, finalize_pipes=False, graceful=False)
+            _done, pending = await asyncio.wait(
+                {stdout_task, stderr_task},
+                timeout=max(_TERMINATE_TIMEOUT, 0.0),
+            )
+            if pending:
+                raise TimeoutError
+
+            out = stdout_task.result()
+            err = stderr_task.result()
 
             stdout = out.decode(errors="replace").strip()
             stderr = err.decode(errors="replace").strip()
@@ -261,58 +433,61 @@ class ExecRunner(BaseRunner):
                 yield Event("error", stderr or f"exit code {proc.returncode}")
             yield Event("done")
         finally:
-            if spec.exec_output == "stream-json" and proc.stdout is not None:
+            if inline_stdout and proc.stdout is not None:
                 # A timeout or malformed overlong NDJSON line can leave stdout
                 # paused with unread bytes. Keep draining while terminate/kill
                 # waits for the subprocess transport to reach EOF.
-                stdout_cleanup = asyncio.create_task(
-                    _drain_bounded_tail(proc.stdout))
+                self._finish_inline_reader(proc, proc.stdout)
             try:
-                await self._release(proc)
+                await self._release(proc, tree)
             finally:
-                for drain in (stdout_cleanup, stderr_task):
-                    if drain is None:
-                        continue
-                    if not drain.done():
-                        drain.cancel()
-                    with contextlib.suppress(BaseException):
-                        await drain
+                for task in auxiliary_tasks:
+                    if not task.done():
+                        task.cancel()
+                        task.add_done_callback(_consume_future)
+                    else:
+                        _consume_future(task)
 
     async def _read_stream_json(self, proc: asyncio.subprocess.Process,
-                                stdin_data: bytes | None, deadline: float,
-                                stderr_task: asyncio.Task[bytes]
+                                tree: ProcessTree, deadline: float,
+                                stderr_task: asyncio.Task[bytes],
+                                leader_task: asyncio.Task[int]
                                 ) -> AsyncIterator[Event]:
         """Consume newline-delimited JSON events (Codex-style `exec --json`)."""
         assert proc.stdout is not None
-        if stdin_data and proc.stdin:
-            try:
-                proc.stdin.write(stdin_data)
-                try:
-                    remaining = _remaining(deadline)
-                    await asyncio.wait_for(
-                        proc.stdin.drain(), timeout=remaining)
-                except asyncio.TimeoutError:
-                    raise TimeoutError from None
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            finally:
-                proc.stdin.close()
-            try:
-                remaining = _remaining(deadline)
-                await asyncio.wait_for(
-                    proc.stdin.wait_closed(), timeout=remaining)
-            except asyncio.TimeoutError:
-                raise TimeoutError from None
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-
+        residual_group_reaped = False
         while True:
+            line_task = asyncio.create_task(
+                _readline_unbounded(proc.stdout))
             try:
-                remaining = _remaining(deadline)
-                line = await asyncio.wait_for(
-                    proc.stdout.readline(), timeout=remaining)
-            except asyncio.TimeoutError:
-                raise TimeoutError from None
+                wait_timeout = (max(_TERMINATE_TIMEOUT, 0.0)
+                                if leader_task.done()
+                                else _remaining(deadline))
+                done, _pending = await asyncio.wait(
+                    {line_task, leader_task},
+                    timeout=wait_timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    raise TimeoutError
+                if leader_task in done and not residual_group_reaped:
+                    leader_task.result()
+                    await self._reap(
+                        proc, tree, finalize_pipes=False, graceful=False)
+                    residual_group_reaped = True
+                if line_task not in done:
+                    done, _pending = await asyncio.wait(
+                        {line_task}, timeout=max(_TERMINATE_TIMEOUT, 0.0))
+                    if line_task not in done:
+                        raise TimeoutError
+                line = line_task.result()
+            except BaseException:
+                if not line_task.done():
+                    line_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await line_task
+                raise
+
             if not line:
                 break
             try:
@@ -325,22 +500,19 @@ class ExecRunner(BaseRunner):
             for ev in _codex_event(evt):
                 yield ev
 
-        if proc.returncode is None:
-            try:
-                remaining = _remaining(deadline)
-                await asyncio.wait_for(
-                    proc.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
-                raise TimeoutError from None
+        if not leader_task.done():
+            await _await_task_before(leader_task, deadline)
         else:
-            await proc.wait()
+            leader_task.result()
+        if not residual_group_reaped:
+            await self._reap(
+                proc, tree, finalize_pipes=False, graceful=False)
 
-        try:
-            remaining = _remaining(deadline)
-            err = await asyncio.wait_for(
-                asyncio.shield(stderr_task), timeout=remaining)
-        except asyncio.TimeoutError:
-            raise TimeoutError from None
+        done, _pending = await asyncio.wait(
+            {stderr_task}, timeout=max(_TERMINATE_TIMEOUT, 0.0))
+        if stderr_task not in done:
+            raise TimeoutError
+        err = stderr_task.result()
         if proc.returncode not in (0, None):
             stderr = err.decode(errors="replace").strip()
             yield Event("error", stderr or f"exit code {proc.returncode}")
@@ -348,7 +520,7 @@ class ExecRunner(BaseRunner):
 
 
 def _codex_event(evt: dict[str, Any]) -> list[Event]:
-    """Map a Codex/agent stream-json record onto agora Events."""
+    """Map a Codex/agent stream-json record onto leftover Events."""
     etype = evt.get("type") or evt.get("msg", {}).get("type", "")
     msg = evt.get("msg", evt)
 

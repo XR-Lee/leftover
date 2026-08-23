@@ -15,6 +15,10 @@ Before doing a non-trivial coding, planning, computer-use, or multi-agent discus
 leftover --pick --json --agent "$LEFTOVER_SELF" "$TASK"
 ```
 
+This pick is also a foreground command. If the execution tool returns a live
+handle before the JSON arrives, immediately block on that same handle; do not
+estimate when routing will finish and do not start a second pick.
+
 If `leftover` is not on PATH, try `macbot --pick --json --agent "$LEFTOVER_SELF" "$TASK"` or `python3 -m leftover`.
 
 `--agent` is **who you already are**. It is not an `@` mention and does not force routing.
@@ -38,11 +42,29 @@ If `leftover` is not on PATH, try `macbot --pick --json --agent "$LEFTOVER_SELF"
 - `agent` is someone else: show `announce`, then run the `run` argv from the JSON (headless). Wait for it to finish. Give the human the stdout. If stderr has a `routed:` line, mention that quietly. **Do not exec `spawn`** — that is a TUI and the answer will not come back to this chat.
 - Show the human exactly `announce` from the JSON, as one quiet line (example: `leftover · Cursor`). That is the routing entry — which subagent is doing this turn. Do not print `chain`, `reason`, arrows, or a preamble like "我来对齐". Never silently switch voices.
 
-If `run` is missing, the equivalent is:
+### Waiting for a handoff
 
-```bash
-leftover --print --use <agent> "$TASK"
-```
+`run` is a foreground command. Its process exit is the completion signal;
+leftover cannot push a callback into this parent conversation. The JSON
+`completion` field records this contract.
+
+- Start `run` in the foreground. Do not detach it with `&`.
+- If the execution tool says the command is still running and returns a handle
+  (`session_id`, `cell_id`, or job id), immediately invoke the native blocking
+  wait on that **same** handle. In Codex, use empty `write_stdin` calls for a
+  returned `session_id`, or `wait` for a yielded exec cell. These waits return
+  early when the process exits. If a host only offers non-blocking polling,
+  poll at least every `completion.max_poll_interval_seconds` (10 seconds).
+- Never choose the next poll from your estimate of task duration, and never
+  sleep for one to five minutes before checking. The worker may have already
+  finished. Do not start a duplicate `run` while its handle is live.
+- stderr route, tool, failover, and `still working` lines are progress only.
+  stdout is the answer. Keep waiting through quiet polls; treat process exit as
+  success/failure and then return captured stdout to the human.
+
+Do not synthesize a command when `run` is null or missing. That response has no
+runnable handoff; report `reason` and stop. In particular, never use `spawn` or
+reconstruct `leftover --print` after a handoff handle has already been returned.
 
 ## User tags (do not guess)
 

@@ -62,7 +62,7 @@ def _quota_from_cache(spec: AgentSpec, cached: dict) -> Quota | None:
 
 
 async def check(spec: AgentSpec) -> str:
-    """Verbose per-agent probe. Kept for `agora doctor` leftover callers."""
+    """Verbose per-agent probe. Kept for legacy `agora doctor` callers."""
     lines = [f"{spec.emoji} {spec.label} ({spec.key})"]
     if not spec.enabled:
         return lines[0] + "  [disabled]"

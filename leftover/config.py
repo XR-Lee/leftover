@@ -119,8 +119,8 @@ class Routing:
     cheap_bonus: float = 0.0         # raise to prefer light agents when free
     latency_weight: float = 0.2
     failure_penalty: float = 0.25
-    # lag_waste: waste (unused quota / hours-to-reset) must beat raw lag so a
-    # fat monthly pool does not starve a 5-hour window about to reset.
+    # lag_waste: catch-up rate (lag / hours-to-reset) lets an overdue short
+    # window rise quickly without making every fresh 5-hour window urgent.
     lag_weight: float = 0.5
     waste_weight: float = 1.0
 
@@ -153,6 +153,8 @@ class Config:
     allowed_user_ids: list[int] = field(default_factory=list)
     default_workdir: str = str(Path.home())
     data_dir: str = str(DEFAULT_DATA_DIR)
+    # IANA name for the /quota clock. Empty = this machine's timezone.
+    timezone: str = ""
     source_path: str = ""  # toml that loaded; empty = defaults
     transcript_turns: int = 24          # how much history each agent sees
     auto_reply: bool = False            # respond in groups without an @mention
@@ -313,11 +315,14 @@ def load(path: str | os.PathLike[str] | None = None) -> Config:
     gpt_account = os.environ.get("SUB2API_GPT_ACCOUNT", s2.get("gpt_account", ""))
     return Config(
         agents=agents,
-        telegram_token=os.environ.get("AGORA_TELEGRAM_TOKEN", tg.get("token", "")),
+        telegram_token=(os.environ.get("LEFTOVER_TELEGRAM_TOKEN")
+                        or os.environ.get("AGORA_TELEGRAM_TOKEN")
+                        or tg.get("token", "")),
         allowed_user_ids=[int(x) for x in tg.get("allowed_user_ids", [])],
         default_workdir=os.path.expanduser(gen.get("default_workdir", str(Path.home()))),
         data_dir=os.path.expanduser(
             gen.get("data_dir", str(DEFAULT_DATA_DIR))),
+        timezone=str(gen.get("timezone", "") or "").strip(),
         transcript_turns=int(gen.get("transcript_turns", 24)),
         auto_reply=bool(gen.get("auto_reply", False)),
         stream_edit_interval=float(gen.get("stream_edit_interval", 1.5)),

@@ -3,6 +3,7 @@
 
 [leftover]
 default_workdir   = "~/code"   # where agents start; change live with /cd
+# timezone        = "Europe/London"  # clock for `leftover quota`; unset = this machine
 transcript_turns  = 24         # how much group history each agent sees
 auto_reply        = false      # true = agents answer in groups without an @mention
 stream_edit_interval = 1.5     # seconds between Telegram message edits
@@ -12,8 +13,8 @@ debate_turn_timeout = 180     # cap each advocate/judge slot in seconds
 debate_judge_key  = "cursor"  # lower-latency default; explicit @names win
 
 [routing]
-# leftover uses lag_waste for the coding pool. agora telegram still defaults
-# to headroom unless you change this.
+# leftover uses lag_waste for the coding pool. The frozen Telegram transport
+# still defaults to headroom unless you change this.
 #   lag_waste spend the window that is most behind / about to reset unused
 #   headroom  pick whoever has the most quota left
 #   order     always try `order` top to bottom
@@ -44,9 +45,11 @@ latency_weight = 0.2
 failure_penalty = 0.25
 quota_ttl = 300           # seconds to reuse a quota snapshot (5 min)
 quota_probe_timeout = 20  # total per-agent probe budget; timeout keeps cached data
+event_sink_timeout = 30   # max sink setup/buffered delivery; never strand a route
 
 [telegram]
-# Get a token from @BotFather. AGORA_TELEGRAM_TOKEN overrides this.
+# Frozen path; needs `pip install 'leftover[telegram]'`.
+# Get a token from @BotFather. LEFTOVER_TELEGRAM_TOKEN overrides this.
 token = ""
 # Your numeric Telegram id(s). Leave empty to allow anyone - do not do that.
 allowed_user_ids = []
@@ -55,7 +58,8 @@ allowed_user_ids = []
 # Only the fields you list are overridden; the rest keep their defaults.
 # Run `agora doctor` to see what is actually installed.
 # `timeout` caps the full turn. `acp_idle_timeout` (default 180s) caps silence
-# between ACP updates; every update resets it, and <= 0 disables it.
+# between visible ACP text/thought/new-tool updates. Internal protocol activity
+# does not reset it, and <= 0 disables it.
 # Either timeout stops the request instead of replaying file-changing work on
 # another backend. Normal fast failures still follow `routing.max_attempts`.
 
@@ -97,10 +101,10 @@ persona = "You are the contrarian. Two paragraphs maximum. Attack the weakest as
 
 [[agent]]
 key = "cursor"
-# Cursor's own subscription already fans out to several vendors' models.
-# ACP uses `cursor-agent --model grok-4.6 acp` so this stays on first-party Grok.
-exec_command = ["cursor-agent", "-p", "--output-format", "json"]
-transport = "exec"
+# Native ACP is the default and keeps one Cursor session across explicit turns.
+# Both ACP and the one-shot fallback stay pinned to first-party Grok 4.6.
+exec_command = ["cursor-agent", "-p", "--output-format", "json", "--model", "grok-4.6", "--force"]
+# transport = "exec"               # opt into one-shot mode only for diagnosis
 quota_probe = "cursor"        # Cursor dashboard GetCurrentPeriodUsage via local login
 
 # Codex 5h/7d that `codex exec` leaves null in session logs. Admin GET only —

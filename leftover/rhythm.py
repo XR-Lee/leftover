@@ -1,8 +1,8 @@
 """Quota rhythm view: calendar vs usage bars, same-window deltas.
 
-▾滞后 / ▴提前 = used vs calendar elapsed.
-↑ = same-window increase; 新窗从 0 = reset then usage from empty.
-加深 / 收窄 = |calendar - used| vs the previous snapshot of that same window.
+▾behind / ▴ahead = used vs calendar elapsed.
+↑ = same-window increase; "new window from 0" = reset, then usage from empty.
+widening / narrowing = |calendar - used| vs the previous snapshot of that window.
 """
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ from .quota import ESTIMATED, Quota, Window
 from .score import window_length_seconds
 
 BAR_WIDTH = 16
+BEHIND = "\u25be" "behind"
+AHEAD = "\u25b4" "ahead"
 _MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
 _LABELS = {
     "weekly": "7d",
@@ -27,7 +29,10 @@ _LABELS = {
 }
 
 
-def _tz(name: str = "Europe/London"):
+def _tz(name: str = ""):
+    """Named zone if the config asks for one, otherwise this machine's."""
+    if not name.strip():
+        return datetime.now().astimezone().tzinfo
     try:
         return ZoneInfo(name)
     except Exception:  # noqa: BLE001
@@ -135,13 +140,13 @@ def pace_tags(window: Window, prev: Window | None, *,
     cal = calendar_pct(window, now)
     if cal is not None:
         if window.used_percent < cal - 0.5:
-            tags.append("▾滞后")
+            tags.append(BEHIND)
         elif window.used_percent > cal + 0.5:
-            tags.append("▴提前")
+            tags.append(AHEAD)
     if prev is None:
         return tags
     if not same_window(window, prev):
-        tags.append("新窗从 0")
+        tags.append("new window from 0")
         return tags
     if money and window.used_usd is not None and prev.used_usd is not None:
         delta = window.used_usd - prev.used_usd
@@ -159,9 +164,9 @@ def pace_tags(window: Window, prev: Window | None, *,
     gap = abs(cal - window.used_percent)
     prev_gap = abs(prev_cal - prev.used_percent)
     if gap - prev_gap > 0.15:
-        tags.append("加深")
+        tags.append("widening")
     elif prev_gap - gap > 0.15:
-        tags.append("收窄")
+        tags.append("narrowing")
     return tags
 
 
@@ -196,8 +201,8 @@ def _primary(windows: list[Window], now: float) -> Window | None:
 
 def _bars(cal: float, used: float) -> list[str]:
     return [
-        f"日历 {bar(cal)} {fmt_pct(cal)}",
-        f"用量 {bar(used)} {fmt_pct(used)}",
+        f"{'calendar':<8} {bar(cal)} {fmt_pct(cal)}",
+        f"{'used':<8} {bar(used)} {fmt_pct(used)}",
     ]
 
 
@@ -208,21 +213,21 @@ def render_grok(quota: Quota, prev: Quota | None, now: float, tz) -> str:
     window = windows[0]
     tags = pace_tags(window, _prev_window(prev, window),
                      now=now, prev_now=prev.checked_at if prev else None)
-    title = quota.title or "官方周池"
+    title = quota.title or "official weekly pool"
     lines = [_join([title, *tags])]
     cal = calendar_pct(window, now)
     used = window.used_percent
-    bits = [f"已用 {fmt_pct(used)}", f"剩 {fmt_pct(100 - used)}"]
+    bits = [f"used {fmt_pct(used)}", f"left {fmt_pct(100 - used)}"]
     if cal is not None:
-        bits.append(f"日历 {fmt_pct(cal)}")
+        bits.append(f"calendar {fmt_pct(cal)}")
     if window.resets_at:
-        bits.append(f"距重置 {fmt_left(window.resets_at - now)}")
+        bits.append(f"resets in {fmt_left(window.resets_at - now)}")
     lines.append(" · ".join(bits))
     if cal is not None:
         lines.extend(_bars(cal, used))
     footer = []
     if window.resets_at:
-        footer.append(f"重置 {_when(window.resets_at, tz)} {_tz_label(tz)}")
+        footer.append(f"resets {_when(window.resets_at, tz)} {_tz_label(tz)}")
     for product in quota.products:
         pct = product.get("percent")
         name = product.get("name")
@@ -246,9 +251,9 @@ def render_cursor(quota: Quota, prev: Quota | None, now: float, tz) -> str:
     if isinstance(used, (int, float)) and isinstance(limit, (int, float)) and limit:
         pct = used / limit * 100.0
         header = (f"{header} · included {fmt_usd(used)} / {fmt_usd(limit)}"
-                  f"（{fmt_pct(pct)}）")
+                  f" ({fmt_pct(pct)})")
         if isinstance(remaining, (int, float)):
-            header += f" · 剩 {fmt_usd(remaining)}"
+            header += f" · left {fmt_usd(remaining)}"
         tags = pace_tags(monthly, prev_monthly, now=now,
                          prev_now=prev.checked_at if prev else None,
                          money=True) if monthly else []
@@ -266,7 +271,7 @@ def render_cursor(quota: Quota, prev: Quota | None, now: float, tz) -> str:
             lines.append(_join([f"{label_of(window)} {fmt_pct(window.used_percent)}", *tags]))
             continue
         lines.append(_join([
-            f"{label_of(window)} {fmt_pct(window.used_percent)} vs 日历 {fmt_pct(cal)}",
+            f"{label_of(window)} {fmt_pct(window.used_percent)} vs calendar {fmt_pct(cal)}",
             *tags,
         ]))
         lines.extend(_bars(cal, window.used_percent))
@@ -294,10 +299,10 @@ def _window_line(window: Window, prev: Quota | None, now: float, tz,
     if cal is None:
         head = f"{name} {fmt_pct(window.used_percent)}"
         return [_join([head, *shown])]
-    vs = f"{name} {fmt_pct(window.used_percent)} vs 日历 {fmt_pct(cal)}"
+    vs = f"{name} {fmt_pct(window.used_percent)} vs calendar {fmt_pct(cal)}"
     if window.resets_at and not with_tags:
-        vs += f" · 距重置 {fmt_left(window.resets_at - now)}"
-        vs += f" · 重置 {_when(window.resets_at, tz)}"
+        vs += f" · resets in {fmt_left(window.resets_at - now)}"
+        vs += f" · resets {_when(window.resets_at, tz)}"
     line = _join([vs, *shown] if with_tags else [vs])
     return [line, *_bars(cal, window.used_percent)]
 
@@ -315,8 +320,8 @@ def render_windows(spec: AgentSpec, quota: Quota, prev: Quota | None,
         tags = pace_tags(primary, _prev_window(prev, primary),
                          now=now, prev_now=prev.checked_at if prev else None)
         title = f"{identity}  ·  {label_of(primary)}"
-        lag = [t for t in tags if t in ("▾滞后", "▴提前")]
-        rest = [t for t in tags if t not in ("▾滞后", "▴提前")]
+        lag = [t for t in tags if t in (BEHIND, AHEAD)]
+        rest = [t for t in tags if t not in (BEHIND, AHEAD)]
         if lag:
             title += " " + lag[0]
         if rest:
@@ -346,7 +351,7 @@ def render_windows(spec: AgentSpec, quota: Quota, prev: Quota | None,
         foot.append(label_of(primary) + " " + " · ".join(bits) if bits
                     else label_of(primary))
     for window in fresh:
-        foot.append(f"{label_of(window)} 刚重置")
+        foot.append(f"{label_of(window)} just reset")
     if foot:
         lines.append("  ·  ".join(foot) if len(foot) > 1 else foot[0])
     return "\n".join(lines)
@@ -363,12 +368,13 @@ def render_agent(spec: AgentSpec, quota: Quota, prev: Quota | None,
 
 def render(entries: list[tuple[AgentSpec, Quota, Quota | None]], *,
            now: float, strategy: str = "", order: list[str] | None = None,
-           tz_name: str = "Europe/London") -> str:
+           tz_name: str = "") -> str:
     tz = _tz(tz_name)
     stamp = _when(now, tz, with_year=True) + " " + _tz_label(tz)
     lines = [
-        f"用量节奏  ·  {stamp}",
-        "▾滞后 / ▴提前 = vs 日历 · ↑ 同窗增加 / 新窗从 0 · 加深/收窄 只比同窗",
+        f"usage rhythm  ·  {stamp}",
+        f"{BEHIND} / {AHEAD} = vs calendar  ·  ↑ same-window increase  ·  "
+        "new window from 0  ·  widening/narrowing compares one window",
         "",
     ]
     for spec, quota, prev in entries:

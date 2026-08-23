@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT))
 
 from leftover import render                                      # noqa: E402
 from leftover.agents import AgentPool, Event, Turn               # noqa: E402
-from leftover.config import AgentSpec, Config                    # noqa: E402
+from leftover.config import AgentSpec, Config, Routing           # noqa: E402
 from leftover.orchestrator import Orchestrator, Plan             # noqa: E402
 from leftover.router import Router                               # noqa: E402
 
@@ -195,7 +195,7 @@ async def main() -> int:
             self.max_active_spares = max(
                 self.max_active_spares, self.active_spares)
             try:
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(0.08)
             finally:
                 self.active_spares -= 1
             return Turn(agent=spec, text=f"{spec.key} recovered")
@@ -213,8 +213,10 @@ async def main() -> int:
         collision_cfg, collision_pool,
         Router(collision_cfg, collision_pool),
     )
+    collision_started = asyncio.get_running_loop().time()
     collision_turns = await collision_orch.execute(
         Plan("broadcast", "topic", collision_agents[:2], {}), None)
+    collision_elapsed = asyncio.get_running_loop().time() - collision_started
     ok &= check("broadcast primaries still overlap",
                 collision_pool.max_active_primaries == 2,
                 repr(collision_pool.calls))
@@ -225,9 +227,10 @@ async def main() -> int:
                 and {turn.agent.key for turn in collision_turns}
                 == {"spare-a", "spare-b"},
                 repr(collision_pool.calls))
-    ok &= check("broadcast fallback calls are serialized",
-                collision_pool.max_active_spares == 1,
-                repr(collision_pool.calls))
+    ok &= check("distinct broadcast spares execute concurrently",
+                collision_pool.max_active_spares == 2
+                and collision_elapsed < 0.14,
+                f"calls={collision_pool.calls}, elapsed={collision_elapsed:.3f}s")
 
     class BroadcastTimeoutPool:
         def __init__(self):
@@ -364,6 +367,202 @@ async def main() -> int:
                 "spare" not in timeout_pool.calls
                 and timeout_turns[0].meta.get("timeout_kind") == "idle",
                 repr(timeout_pool.calls))
+
+    print("\n[5c] debate fallbacks claim distinct spares concurrently")
+
+    class DebateFallbackPool:
+        def __init__(self):
+            self.calls: list[str] = []
+            self.active_spares = 0
+            self.max_active_spares = 0
+
+        async def run(self, spec, prompt, on_event=None):
+            self.calls.append(spec.key)
+            if spec.key in {"pro", "con"}:
+                await asyncio.sleep(0.005 if spec.key == "pro" else 0.01)
+                return Turn(agent=spec, error="connection reset by peer")
+            self.active_spares += 1
+            self.max_active_spares = max(
+                self.max_active_spares, self.active_spares)
+            try:
+                await asyncio.sleep(0.08)
+            finally:
+                self.active_spares -= 1
+            return Turn(agent=spec, text=f"{spec.key} recovered")
+
+    debate_fallback_agents = [
+        AgentSpec(key=key, label=key.title(),
+                  interactive_command=[sys.executable])
+        for key in ("pro", "con", "spare-a", "spare-b")
+    ]
+    debate_fallback_cfg = Config(
+        agents=debate_fallback_agents,
+        data_dir=tempfile.mkdtemp(prefix="agora-debate-fallback-test-"),
+        debate_turn_timeout=1,
+    )
+    debate_fallback_pool = DebateFallbackPool()
+    debate_fallback_orch = Orchestrator(
+        debate_fallback_cfg,
+        debate_fallback_pool,
+        Router(debate_fallback_cfg, debate_fallback_pool),
+    )
+    debate_fallback_started = asyncio.get_running_loop().time()
+    debate_fallback_turns = await debate_fallback_orch.execute(
+        Plan("debate", "topic", debate_fallback_agents[:2], {"rounds": "1"}),
+        None,
+    )
+    debate_fallback_elapsed = (
+        asyncio.get_running_loop().time() - debate_fallback_started)
+    ok &= check("each debate side owns a different spare",
+                {turn.agent.key for turn in debate_fallback_turns}
+                == {"spare-a", "spare-b"}
+                and debate_fallback_pool.calls.count("spare-a") == 1
+                and debate_fallback_pool.calls.count("spare-b") == 1,
+                repr(debate_fallback_pool.calls))
+    ok &= check("debate spare calls overlap instead of stacking timeouts",
+                debate_fallback_pool.max_active_spares == 2
+                and debate_fallback_elapsed < 0.14,
+                f"active={debate_fallback_pool.max_active_spares}, "
+                f"elapsed={debate_fallback_elapsed:.3f}s")
+
+    print("\n[5d] buffered output uses one group delivery budget")
+
+    class FastGroupPool:
+        async def run(self, spec, prompt, on_event=None):
+            return Turn(agent=spec, text=f"{spec.key} answer")
+
+    delivery_agents = [
+        AgentSpec(key=f"delivery-{index}", label=f"Delivery {index}")
+        for index in range(3)
+    ]
+    delivery_cfg = Config(
+        agents=delivery_agents,
+        data_dir=tempfile.mkdtemp(prefix="agora-delivery-budget-test-"),
+        routing=Routing(
+            strategy="order",
+            order=[agent.key for agent in delivery_agents],
+            event_sink_timeout=0.03,
+        ),
+    )
+    delivery_pool = FastGroupPool()
+    delivery_orch = Orchestrator(
+        delivery_cfg, delivery_pool, Router(delivery_cfg, delivery_pool))
+    delivery_factories: list[str] = []
+    delivery_cancellations = 0
+
+    async def blocked_group_sink(spec):
+        delivery_factories.append(spec.key)
+
+        async def on_event(_event):
+            nonlocal delivery_cancellations
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                delivery_cancellations += 1
+                raise
+
+        return on_event
+
+    delivery_started = asyncio.get_running_loop().time()
+    delivery_turns = await delivery_orch.execute(
+        Plan("broadcast", "topic", delivery_agents, {}), blocked_group_sink)
+    delivery_elapsed = asyncio.get_running_loop().time() - delivery_started
+    await asyncio.sleep(0)
+    ok &= check("bad group sinks consume one timeout total",
+                delivery_elapsed < 0.09
+                and len(delivery_factories) == 1
+                and delivery_cancellations == 1,
+                f"elapsed={delivery_elapsed:.3f}s, "
+                f"factories={delivery_factories}, "
+                f"cancellations={delivery_cancellations}")
+    ok &= check("every undelivered answer keeps text and reports delivery error",
+                all(turn.text and turn.ok
+                    and turn.meta.get("delivery_error")
+                    for turn in delivery_turns),
+                repr([turn.meta for turn in delivery_turns]))
+
+    class StaggeredGroupPool:
+        async def run(self, spec, prompt, on_event=None):
+            if spec.key == "delivery-slow":
+                await asyncio.sleep(0.06)
+            return Turn(agent=spec, text=f"{spec.key} answer")
+
+    staggered_agents = [
+        AgentSpec(key="delivery-fast", label="Delivery Fast"),
+        AgentSpec(key="delivery-slow", label="Delivery Slow"),
+    ]
+    staggered_cfg = Config(
+        agents=staggered_agents,
+        data_dir=tempfile.mkdtemp(prefix="agora-delivery-gap-test-"),
+        routing=Routing(
+            strategy="order",
+            order=[agent.key for agent in staggered_agents],
+            event_sink_timeout=0.03,
+        ),
+    )
+    staggered_pool = StaggeredGroupPool()
+    staggered_orch = Orchestrator(
+        staggered_cfg, staggered_pool, Router(staggered_cfg, staggered_pool))
+    delivered: list[tuple[str, str]] = []
+
+    async def instant_group_sink(spec):
+        async def on_event(event):
+            delivered.append((spec.key, event.kind))
+
+        return on_event
+
+    staggered_turns = await staggered_orch.execute(
+        Plan("broadcast", "topic", staggered_agents, {}), instant_group_sink)
+    ok &= check("model compute gaps do not consume the delivery budget",
+                all("delivery_error" not in turn.meta
+                    for turn in staggered_turns)
+                and {(key, kind) for key, kind in delivered if kind == "done"}
+                == {(agent.key, "done") for agent in staggered_agents},
+                repr((delivered, [turn.meta for turn in staggered_turns])))
+
+    print("\n[5e] debate warmup cannot outlive normal completion")
+
+    class HangingWarmPool:
+        def __init__(self):
+            self.warm_started = 0
+            self.warm_cancelled = 0
+
+        async def prepare(self, spec):
+            self.warm_started += 1
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.warm_cancelled += 1
+                raise
+
+        async def run(self, spec, prompt, on_event=None):
+            return Turn(agent=spec, text=f"{spec.key} ready")
+
+    warm_agents = [
+        AgentSpec(key="warm-pro", label="Warm Pro"),
+        AgentSpec(key="warm-con", label="Warm Con"),
+    ]
+    warm_cfg = Config(
+        agents=warm_agents,
+        data_dir=tempfile.mkdtemp(prefix="agora-warmup-test-"),
+        debate_turn_timeout=1,
+    )
+    warm_pool = HangingWarmPool()
+    warm_orch = Orchestrator(
+        warm_cfg, warm_pool, Router(warm_cfg, warm_pool))
+    warm_started = asyncio.get_running_loop().time()
+    warm_turns = await warm_orch.execute(
+        Plan("debate", "topic", warm_agents, {"rounds": "1"}), None)
+    warm_elapsed = asyncio.get_running_loop().time() - warm_started
+    ok &= check("successful debate cancels speculative warmups promptly",
+                len(warm_turns) == 2 and all(turn.ok for turn in warm_turns)
+                and warm_pool.warm_started == 2
+                and warm_pool.warm_cancelled == 2
+                and warm_elapsed < 0.15,
+                f"started={warm_pool.warm_started}, "
+                f"cancelled={warm_pool.warm_cancelled}, "
+                f"elapsed={warm_elapsed:.3f}s")
+
     orch.transcript.clear()
     plan = orch.parse("/relay add a healthcheck endpoint", in_group=True)
     turns = await orch.execute(plan, None)

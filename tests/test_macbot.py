@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -111,6 +112,90 @@ def test_score_depleted_short_window_loses() -> None:
           f"gpt {s_gpt.total:.3f} vs cursor {s_cur.total:.3f}")
 
 
+def test_score_fresh_short_window_does_not_starve_overdue_weekly() -> None:
+    print("\n[macbot.3b] overdue weekly beats a just-reset short window")
+    now = 1_000_000.0
+    grok_left = 15.3 * 3600
+    grok = Quota(agent="grok", windows=[Window(
+        name="weekly", used_percent=69.0, resets_at=now + grok_left,
+        started_at=now + grok_left - 7 * 86400, source=REPORTED)])
+    codex = Quota(agent="gpt", windows=[
+        Window(name="5h", used_percent=0.0, resets_at=now + 5 * 3600,
+               started_at=now, source=REPORTED),
+        Window(name="weekly", used_percent=38.0,
+               resets_at=now + 100 * 3600,
+               started_at=now + 100 * 3600 - 7 * 86400,
+               source=REPORTED),
+    ])
+    s_grok = score_quota("grok", grok, now=now)
+    s_gpt = score_quota("gpt", codex, now=now)
+    check("live Grok window outranks fresh Codex",
+          s_grok.total > s_gpt.total,
+          f"grok {s_grok.total:.3f} vs gpt {s_gpt.total:.3f}")
+    check("a just-reset window has no fake catch-up emergency",
+          next(w for w in s_gpt.windows if w.name == "5h").waste == 0.0)
+
+
+async def test_sticky_requires_a_live_session() -> None:
+    print("\n[macbot.3c] persisted cwd choice cannot override fresh quota ranking")
+    from leftover.router import Router
+
+    with tempfile.TemporaryDirectory() as tmp:
+        now = time.time()
+        gpt = AgentSpec(
+            key="gpt", label="Codex", interactive_command=["true"],
+            exec_command=["true"], quota_probe="codex")
+        grok = AgentSpec(
+            key="grok", label="Grok", interactive_command=["true"],
+            exec_command=["true"], quota_probe="grok")
+        cfg = Config(
+            agents=[gpt, grok], data_dir=tmp,
+            routing=Routing(strategy="lag_waste", coding_keys=["gpt", "grok"]))
+        state = {
+            "sticky": {tmp: "gpt"},
+            "quota": {
+                "gpt": Quota(agent="gpt", checked_at=now, windows=[Window(
+                    name="weekly", used_percent=38.0,
+                    resets_at=now + 100 * 3600,
+                    started_at=now + 100 * 3600 - 7 * 86400,
+                    source=REPORTED)]).to_dict(),
+                "grok": Quota(agent="grok", checked_at=now, windows=[Window(
+                    name="weekly", used_percent=69.0,
+                    resets_at=now + 15.3 * 3600,
+                    started_at=now + 15.3 * 3600 - 7 * 86400,
+                    source=REPORTED)]).to_dict(),
+            },
+        }
+        save_state(cfg, state)
+        fresh = await decide(cfg, intent_mod.parse("fix routing"), tmp)
+        check("a fresh process re-ranks instead of following disk sticky",
+              fresh.spec is not None and fresh.spec.key == "grok"
+              and not fresh.sticky, fresh.reason)
+
+        class LiveRunner:
+            def live_session(self) -> bool:
+                return True
+
+        class LivePool:
+            def peek(self, spec: AgentSpec):
+                return LiveRunner() if spec.key == "gpt" else None
+
+        live_router = Router(cfg, LivePool())
+        unrelated = await decide(
+            cfg, intent_mod.parse("new coding task"), tmp, live_router)
+        check("an unrelated warm session cannot activate disk sticky",
+              unrelated.spec is not None and unrelated.spec.key == "grok"
+              and not unrelated.sticky, unrelated.reason)
+        live_router.conversation_success = "gpt"
+        live = await decide(
+            cfg, intent_mod.parse("continue the same change"), tmp,
+            live_router)
+        check("an actual in-process session keeps conversation continuity",
+              live.spec is not None and live.spec.key == "gpt"
+              and live.sticky and "live session" in live.reason,
+              live.reason)
+
+
 async def test_pick_plan_and_cu() -> None:
     print("\n[macbot.4] pick respects /plan and /cu")
     with tempfile.TemporaryDirectory() as tmp:
@@ -160,6 +245,13 @@ async def test_pick_plan_and_cu() -> None:
               coding.as_dict()["run"][:4] == ["leftover", "--print", "--use",
                                               coding.spec.key],
               str(coding.as_dict()["run"]))
+        completion = coding.as_dict().get("completion") or {}
+        check("pick JSON declares process-exit completion without push",
+              completion == {
+                  "mode": "process_exit",
+                  "push": False,
+                  "max_poll_interval_seconds": 10,
+              }, repr(completion))
         check("plan handoff preserves kind",
               "--plan" in plan.as_dict()["run"],
               str(plan.as_dict()["run"]))
@@ -182,6 +274,7 @@ async def test_pick_plan_and_cu() -> None:
         empty_group = await decide(cfg, intent_mod.parse("/rt"), tmp)
         check("empty routed commands do not advertise executable handoffs",
               all(not pick.available and pick.as_dict()["run"] is None
+                  and pick.as_dict()["completion"] is None
                   for pick in (empty_plan, empty_cu, empty_group)),
               "; ".join(pick.reason for pick in
                           (empty_plan, empty_cu, empty_group)))
@@ -406,7 +499,29 @@ async def test_routing_progress_stops_after_cancel() -> None:
 
 def test_skill_install_is_symlink() -> None:
     print("\n[macbot.8] install-skills links, does not copy")
-    from leftover.macbot import link_skill
+    from leftover.macbot import _skill_source, link_skill, skill_destinations
+    dests = [str(path) for path in skill_destinations()]
+    check("leftover skill is installed",
+          any("/skills/leftover/SKILL.md" in path for path in dests))
+    check("the legacy CLI does not duplicate the product skill",
+          len(dests) == 5
+          and not any("/skills/macbot/SKILL.md" in path for path in dests),
+          repr(dests))
+    skill = _skill_source().read_text()
+    check("handoff skill polls the returned process handle promptly",
+          "session_id" in skill and "cell_id" in skill
+          and "max_poll_interval_seconds" in skill
+          and "Never choose the next poll" in skill,
+          "missing bounded parent wait contract")
+    check("pick uses the same immediate foreground wait contract",
+          "This pick is also a foreground command" in skill
+          and "do not start a second pick" in skill,
+          "routing query can still be estimated or duplicated")
+    check("handoff skill cannot synthesize a duplicate job",
+          "Do not synthesize a command" in skill
+          and "after a handoff handle has already been returned" in skill
+          and "If `run` is missing, the equivalent is" not in skill,
+          "legacy command reconstruction is still allowed")
     with tempfile.TemporaryDirectory() as tmp:
         src = Path(tmp) / "SKILL.md"
         dest = Path(tmp) / "claude" / "skills" / "leftover" / "SKILL.md"
@@ -795,11 +910,39 @@ async def test_group_routes_survive_cli_handoff() -> None:
                     contextlib.redirect_stderr(io.StringIO()):
                 code = await run_discuss(
                     cfg, intent_mod.parse("/rt @claude @gpt compare routes"))
+            first_attempts = list(GroupPool.attempts)
+            GroupPool.attempts = []
+
+            class BrokenStreamSink:
+                def __init__(self, *_args, **_kwargs):
+                    pass
+
+                async def __call__(self, _event):
+                    raise RuntimeError("output closed")
+
+            original_sink = ui_mod.StreamSink
+            ui_mod.StreamSink = BrokenStreamSink
+            failed_stdout = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(failed_stdout), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    failed_code = await run_discuss(
+                        cfg,
+                        intent_mod.parse(
+                            "/all @claude @gpt compare delivery"),
+                    )
+            finally:
+                ui_mod.StreamSink = original_sink
         finally:
             agents_mod.AgentPool = original
         check("headless roundtable runs every selected panel member",
-              code == 0 and GroupPool.attempts == ["claude", "gpt"],
-              str(GroupPool.attempts))
+              code == 0 and first_attempts == ["claude", "gpt"],
+              str(first_attempts))
+        check("headless group delivery failure returns nonzero",
+              failed_code == 1
+              and "delivery failed: RuntimeError: output closed"
+              in failed_stdout.getvalue(),
+              repr(failed_stdout.getvalue()))
 
     with tempfile.TemporaryDirectory() as tmp:
         cfg = Config(agents=agents[:2], data_dir=tmp)
@@ -1446,6 +1589,7 @@ async def test_debate_is_parallel_and_compact() -> None:
 
 async def test_event_sink_obeys_the_turn_deadline() -> None:
     print("\n[macbot.25] event delivery is part of the turn deadline")
+    from leftover.orchestrator import Orchestrator
     from leftover.router import Router
 
     class OneEventRunner(BaseRunner):
@@ -1486,6 +1630,149 @@ async def test_event_sink_obeys_the_turn_deadline() -> None:
           failure is not None and terminal
           and router.h(spec).consecutive == 0,
           f"failure={failure}, health={router.h(spec).consecutive}")
+
+    class NeverRunPool:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def run(self, spec, prompt, on_event=None):
+            self.calls += 1
+            return Turn(agent=spec, text="should not run")
+
+    async def stuck_factory(_spec):
+        await asyncio.Event().wait()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = NeverRunPool()
+        cfg = Config(
+            agents=[spec], data_dir=tmp,
+            routing=Routing(
+                strategy="order", order=[spec.key], event_sink_timeout=0.03))
+        router = Router(cfg, pool)
+        began = time.monotonic()
+        routed, decision = await router.run(
+            lambda _spec: "prompt", primary=spec, sink=stuck_factory,
+            ordered_chain=[spec])
+        factory_elapsed = time.monotonic() - began
+        buffered = Turn(agent=spec, text="BUFFERED")
+        orch = Orchestrator(cfg, pool, router)
+        began = time.monotonic()
+        await orch._emit_turn(buffered, stuck_factory)
+        buffered_elapsed = time.monotonic() - began
+    check("sink creation is bounded before an agent starts",
+          factory_elapsed < 0.15 and pool.calls == 0
+          and routed.meta.get("timeout_kind") == "sink"
+          and len(decision.attempts) == 1,
+          f"elapsed={factory_elapsed:.3f}s, calls={pool.calls}")
+    check("buffered group delivery also has a finite deadline",
+          buffered_elapsed < 0.15 and "delivery_error" in buffered.meta,
+          f"elapsed={buffered_elapsed:.3f}s, meta={buffered.meta}")
+
+    from leftover.orchestrator import summarise
+    summary = summarise([buffered])
+    check("group summaries expose delivery failure without discarding text",
+          buffered.ok and buffered.text == "BUFFERED"
+          and "delivery failed: timed out after 0.03s" in summary,
+          summary)
+
+
+async def test_stream_sink_keeps_sync_io_off_the_loop() -> None:
+    print("\n[macbot.26] synchronous terminal output is isolated and cancellable")
+
+    class BlockingOutput:
+        def __init__(self) -> None:
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.parts: list[str] = []
+            self._block_next = True
+
+        def write(self, text: str) -> int:
+            if self._block_next:
+                self._block_next = False
+                self.entered.set()
+                self.release.wait(timeout=1)
+            self.parts.append(text)
+            return len(text)
+
+        def flush(self) -> None:
+            return None
+
+    async def wait_until(predicate, timeout: float = 0.2) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while not predicate():
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("condition was not reached")
+            await asyncio.sleep(0.002)
+
+    blocked_out = BlockingOutput()
+    blocked_sink = ui_mod.StreamSink("Blocked", out=blocked_out)
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0.003)
+
+    ticker_task = asyncio.create_task(ticker())
+    blocked_task = asyncio.create_task(
+        blocked_sink(Event("text", "BLOCKED")))
+    await wait_until(blocked_out.entered.is_set)
+    await asyncio.sleep(0.025)
+    cancel_started = asyncio.get_running_loop().time()
+    blocked_task.cancel()
+    await asyncio.gather(blocked_task, return_exceptions=True)
+    cancel_elapsed = asyncio.get_running_loop().time() - cancel_started
+    blocked_out.release.set()
+    await asyncio.sleep(0.02)
+    ticker_task.cancel()
+    await asyncio.gather(ticker_task, return_exceptions=True)
+    check("a blocking TextIO write does not freeze the event loop",
+          ticks >= 5, f"ticks={ticks}")
+    check("cancelling a blocked output await returns promptly",
+          cancel_elapsed < 0.05, f"elapsed={cancel_elapsed:.3f}s")
+
+    queued_out = BlockingOutput()
+    queued_sink = ui_mod.StreamSink("Queued", out=queued_out)
+    first = asyncio.create_task(queued_sink(Event("text", "FIRST")))
+    await wait_until(queued_out.entered.is_set)
+    second = asyncio.create_task(queued_sink(Event("text", "SECOND")))
+    await wait_until(lambda: queued_sink._writer.queue.qsize() == 1)
+    second.cancel()
+    await asyncio.gather(second, return_exceptions=True)
+    queued_out.release.set()
+    await asyncio.wait_for(first, timeout=0.3)
+    await asyncio.sleep(0.02)
+    rendered = "".join(queued_out.parts)
+    check("cancelled queued output is never written later",
+          "FIRST" in rendered and "SECOND" not in rendered,
+          repr(rendered))
+
+    fanout_outputs = [BlockingOutput() for _ in range(20)]
+    fanout_sinks = [
+        ui_mod.StreamSink(f"Fanout {index}", out=out)
+        for index, out in enumerate(fanout_outputs)
+    ]
+    fanout_tasks = [
+        asyncio.create_task(sink(Event("text", f"VALUE {index}")))
+        for index, sink in enumerate(fanout_sinks)
+    ]
+    await wait_until(lambda: any(out.entered.is_set()
+                                 for out in fanout_outputs))
+    await asyncio.sleep(0.02)
+    writer_threads = [
+        thread for thread in threading.enumerate()
+        if thread.is_alive() and thread.name.startswith("leftover-stream-")
+    ]
+    for task in fanout_tasks:
+        task.cancel()
+    await asyncio.gather(*fanout_tasks, return_exceptions=True)
+    for out in fanout_outputs:
+        out.release.set()
+    await asyncio.sleep(0.03)
+    check("many blocked sinks share one bounded daemon writer",
+          len(writer_threads) <= 1,
+          repr([thread.name for thread in writer_threads]))
 
 
 def test_usher_ux_surface() -> None:
@@ -1551,6 +1838,27 @@ def test_usher_ux_surface() -> None:
         macbot_mod.config_mod.load = original_load
 
 
+def test_subcommand_config_flag() -> None:
+    print("\n[macbot.12b] `leftover doctor|quota --config` reaches the loader")
+    from leftover import macbot as macbot_mod
+
+    for flag in ("--config", "-c"):
+        ns = macbot_mod._parse_argv(["doctor", flag, "/tmp/leftover-test.toml"])
+        check(f"doctor {flag} PATH is kept",
+              ns.command == "doctor" and ns.config == "/tmp/leftover-test.toml",
+              repr(ns.config))
+    ns = macbot_mod._parse_argv(["quota", "--config", "/tmp/x.toml"])
+    check("quota --config PATH is kept", ns.config == "/tmp/x.toml")
+    try:
+        macbot_mod._parse_argv(["quota", "--config"])
+        clean = False
+    except SystemExit as exc:
+        clean = "needs a path" in str(exc)
+    except Exception:
+        clean = False
+    check("a missing value is a usage error, not a traceback", clean)
+
+
 async def test_print_json_envelope_and_stdin() -> None:
     print("\n[macbot.13] --print --json envelope and stdin replay")
     from leftover import agents as agents_mod
@@ -1612,15 +1920,69 @@ async def test_print_json_envelope_and_stdin() -> None:
         agents_mod.AgentPool = original
 
 
+def test_piped_stdin_read_has_a_hard_boundary() -> None:
+    print("\n[macbot.13a] piped stdin does not wait forever for EOF")
+    from leftover.macbot import read_piped_stdin
+
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"partial input")
+    reader = os.fdopen(read_fd, "r", encoding="utf-8")
+    original_stdin = sys.stdin
+    result: dict[str, object] = {}
+
+    def read_open_pipe() -> None:
+        started = time.monotonic()
+        result["text"] = read_piped_stdin()
+        result["elapsed"] = time.monotonic() - started
+
+    try:
+        sys.stdin = reader
+        thread = threading.Thread(target=read_open_pipe, daemon=True)
+        thread.start()
+        thread.join(timeout=0.4)
+        returned_while_open = not thread.is_alive()
+        if not returned_while_open:
+            os.close(write_fd)
+            write_fd = -1
+            thread.join(timeout=1.0)
+        check("partial pipe data returns while its writer remains open",
+              returned_while_open
+              and result.get("text") == "partial input"
+              and float(result.get("elapsed") or 99) < 0.3,
+              repr(result))
+    finally:
+        sys.stdin = original_stdin
+        reader.close()
+        if write_fd >= 0:
+            os.close(write_fd)
+
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"complete input\n")
+    os.close(write_fd)
+    reader = os.fdopen(read_fd, "r", encoding="utf-8")
+    try:
+        sys.stdin = reader
+        complete = read_piped_stdin()
+    finally:
+        sys.stdin = original_stdin
+        reader.close()
+    check("ordinary EOF input is still read completely",
+          complete == "complete input\n", repr(complete))
+
+
 def main() -> int:
     test_compose_followup_is_bare()
     test_intent()
     test_score_short_window_beats_fat_monthly()
     test_score_depleted_short_window_loses()
+    test_score_fresh_short_window_does_not_starve_overdue_weekly()
+    asyncio.run(test_sticky_requires_a_live_session())
     asyncio.run(test_pick_plan_and_cu())
     test_why_table_is_lag_waste_not_reputation()
     test_usher_ux_surface()
+    test_subcommand_config_flag()
     asyncio.run(test_print_json_envelope_and_stdin())
+    test_piped_stdin_read_has_a_hard_boundary()
     test_agent_is_identity_not_mention()
     test_cli_routing_progress_is_human_only()
     asyncio.run(test_routing_progress_stops_after_cancel())
@@ -1645,6 +2007,7 @@ def main() -> int:
     asyncio.run(test_exec_structured_error_is_failure())
     asyncio.run(test_debate_is_parallel_and_compact())
     asyncio.run(test_event_sink_obeys_the_turn_deadline())
+    asyncio.run(test_stream_sink_keeps_sync_io_off_the_loop())
     ok = all(RESULTS)
     print(f"\n{sum(RESULTS)}/{len(RESULTS)} checks passed")
     print("ALL CHECKS PASSED" if ok else "SOME CHECKS FAILED")

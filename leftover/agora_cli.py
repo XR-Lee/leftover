@@ -5,14 +5,14 @@ import argparse
 import asyncio
 import sys
 
-MIN_PYTHON = (3, 10)
-
 from . import config as config_mod
+
+MIN_PYTHON = (3, 10)
 
 
 def main(argv: list[str] | None = None) -> int:
     if sys.version_info < MIN_PYTHON:
-        # macOS still ships 3.9 as `python3`; agora needs newer.
+        # macOS still ships 3.9 as `python3`; leftover needs newer.
         raise SystemExit(
             f"agora needs Python {'.'.join(map(str, MIN_PYTHON))}+, "
             f"this is {sys.version.split()[0]} at {sys.executable}.\n"
@@ -22,7 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", nargs="?", default="console",
                         choices=["bot", "console", "doctor", "leftover", "macbot"])
     parser.add_argument("--config", "-c", default=None,
-                        help="path to agora.toml")
+                        help="path to leftover.toml")
     args = parser.parse_args(argv)
     cfg = config_mod.load(args.config)
 
@@ -34,7 +34,12 @@ def main(argv: list[str] | None = None) -> int:
         print(asyncio.run(doctor.run(cfg)))
         return 0
     if args.command == "bot":
-        from .transports import telegram
+        try:
+            from .transports import telegram
+        except ModuleNotFoundError as exc:      # optional extra, frozen path
+            raise SystemExit(
+                f"`agora bot` needs the telegram extra ({exc.name} is missing).\n"
+                "Install it with:  pip install 'leftover[telegram]'") from None
         telegram.main(cfg)
         return 0
     from .transports import console

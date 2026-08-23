@@ -1,9 +1,9 @@
 """Lag + waste scoring for subscription windows.
 
 Pick the coding backend whose quota is most *behind schedule* (lag) and
-most at risk of vanishing unused at reset (waste). Waste is remaining
-headroom divided by hours-to-reset, so a 5-hour Codex window about to
-clear beats a monthly Cursor pool that still looks "empty".
+needs the highest catch-up rate before reset (waste). A fresh short window
+starts on schedule instead of immediately starving an overdue weekly pool;
+as it falls behind or approaches reset, its score rises quickly.
 """
 from __future__ import annotations
 
@@ -30,8 +30,6 @@ def window_length_seconds(window: Window) -> float | None:
         return float(m.group(1)) * 3600
     if m := _DAYS.search(name):
         return float(m.group(1)) * 86400
-    if "budget" in name and "5h" in name:
-        return 5 * 3600
     return None
 
 
@@ -45,12 +43,17 @@ def _hours_left(window: Window, now: float) -> float:
 
 
 def _elapsed_frac(window: Window, now: float) -> float:
+    if (window.started_at is not None and window.resets_at is not None
+            and window.resets_at > window.started_at):
+        elapsed = ((now - window.started_at)
+                   / (window.resets_at - window.started_at))
+        return min(1.0, max(0.0, elapsed))
     length = window_length_seconds(window)
     if length and window.resets_at is not None:
         left = max(0.0, window.resets_at - now)
         return min(1.0, max(0.0, 1.0 - left / length))
-    if length is None and window.resets_at is None:
-        return 0.5
+    # Nothing to run a clock against: treat the window as half elapsed so it
+    # neither looks overdue nor immune.
     return 0.5
 
 
@@ -80,12 +83,12 @@ def score_window(window: Window, now: float | None = None,
                  waste_weight: float = 1.0) -> WindowScore:
     now = time.time() if now is None else now
     used = min(1.0, max(0.0, window.used_percent / 100.0))
-    remaining = max(0.0, 1.0 - used)
     hours = _hours_left(window, now)
     lag = max(0.0, _elapsed_frac(window, now) - used)
-    # Guessed turn-budgets must not fake a 5-hour emergency. Only vendor
-    # numbers (reported) and a real refusal (observed) get a waste term.
-    waste = 0.0 if window.source == ESTIMATED else remaining / hours
+    # Catch-up rate, not the whole unused pool divided by time. Otherwise a
+    # just-reset short window is permanently urgent and starves weekly pools
+    # that are already behind schedule. Guessed budgets still get no waste.
+    waste = 0.0 if window.source == ESTIMATED else lag / hours
     return WindowScore(
         name=window.name,
         lag=lag,

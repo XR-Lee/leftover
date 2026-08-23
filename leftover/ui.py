@@ -1,8 +1,13 @@
 """Terminal chrome for the leftover conversation. Quiet by default."""
 from __future__ import annotations
 
+import asyncio
+import itertools
 import os
+import queue
 import sys
+import threading
+from dataclasses import dataclass
 from typing import TextIO
 
 KIND_LABELS = {
@@ -124,6 +129,112 @@ def failover_line(src: str, dest: str, *, guarded: bool = True,
     return warn(f"→ {src} {why} — failing over to {dest}{note}")
 
 
+class _WriteTicket:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._cancelled = True
+
+    def claim(self) -> bool:
+        with self._lock:
+            return not self._cancelled
+
+
+@dataclass
+class _WriteJob:
+    owner: "StreamSink"
+    loop: asyncio.AbstractEventLoop
+    future: asyncio.Future
+    ticket: _WriteTicket
+    kind: str
+    text: str
+
+
+_WRITER_IDS = itertools.count(1)
+
+
+class _DaemonStreamWriter:
+    """Bounded daemon writer that keeps synchronous TextIO off the event loop."""
+
+    def __init__(self, queue_size: int = 16) -> None:
+        self.queue: queue.Queue[_WriteJob] = queue.Queue(maxsize=queue_size)
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    async def submit(self, owner: "StreamSink", kind: str, text: str) -> None:
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        ticket = _WriteTicket()
+        job = _WriteJob(owner, loop, future, ticket, kind, text)
+        with self._lock:
+            try:
+                self.queue.put_nowait(job)
+            except queue.Full as exc:
+                raise RuntimeError("stream output queue is full") from exc
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name=f"leftover-stream-{next(_WRITER_IDS)}",
+                    daemon=True,
+                )
+                self._thread.start()
+        try:
+            await future
+        except BaseException:
+            ticket.cancel()
+            raise
+
+    @staticmethod
+    def _settle(future: asyncio.Future,
+                error: BaseException | None) -> None:
+        if future.done():
+            return
+        if error is None:
+            future.set_result(None)
+        else:
+            future.set_exception(error)
+
+    def _notify(self, job: _WriteJob,
+                error: BaseException | None = None) -> None:
+        try:
+            job.loop.call_soon_threadsafe(self._settle, job.future, error)
+        except RuntimeError:
+            pass
+
+    def _should_stop(self) -> bool:
+        with self._lock:
+            if not self.queue.empty():
+                return False
+            self._thread = None
+            return True
+
+    def _run(self) -> None:
+        while True:
+            try:
+                job = self.queue.get(timeout=5)
+            except queue.Empty:
+                if self._should_stop():
+                    return
+                continue
+
+            error: BaseException | None = None
+            if job.ticket.claim():
+                try:
+                    job.owner._write_event(job.kind, job.text)
+                except BaseException as exc:  # keep later jobs drainable
+                    error = exc
+            self._notify(job, error)
+            self.queue.task_done()
+            if job.kind == "done" and self._should_stop():
+                return
+
+
+_STREAM_WRITER = _DaemonStreamWriter()
+
+
 class StreamSink:
     """Render one agent turn: badge, streamed text, compact tool lines."""
 
@@ -133,6 +244,7 @@ class StreamSink:
         self.out = out
         self._header = not show_header
         self._nl = True
+        self._writer = _STREAM_WRITER
 
     def _ensure_header(self) -> None:
         if self._header:
@@ -142,9 +254,7 @@ class StreamSink:
         self._header = True
         self._nl = True
 
-    async def __call__(self, ev) -> None:
-        kind = getattr(ev, "kind", "")
-        text = getattr(ev, "text", "") or ""
+    def _write_event(self, kind: str, text: str) -> None:
         if kind == "text" and text:
             self._ensure_header()
             self.out.write(text)
@@ -169,6 +279,11 @@ class StreamSink:
                 self.out.write("\n")
                 self._nl = True
             self.out.flush()
+
+    async def __call__(self, ev) -> None:
+        kind = getattr(ev, "kind", "")
+        text = getattr(ev, "text", "") or ""
+        await self._writer.submit(self, kind, text)
 
 
 def setup_readline(path) -> None:

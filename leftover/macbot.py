@@ -201,6 +201,10 @@ class Pick:
     def as_dict(self) -> dict:
         is_discussion = self.kind in DISCUSS and bool(self.labels)
         group_label = ", ".join(self.labels) if is_discussion else None
+        run = (discussion_argv(self.kind, self.prompt, self.chain)
+               if is_discussion and self.available else (
+                   None if self.spec is None else run_argv(
+                       self.spec, self.prompt, kind=self.kind)))
         scores = {
             k: {"total": round(s.total, 4), "lag": round(s.lag, 4),
                 "waste": round(s.waste, 4), "detail": s.detail, "source": s.source}
@@ -220,10 +224,12 @@ class Pick:
             "scores": scores,
             "spawn": None if is_discussion or self.spec is None else spawn_argv(
                 self.spec, self.prompt),
-            "run": discussion_argv(self.kind, self.prompt, self.chain)
-            if is_discussion and self.available else (
-                None if self.spec is None else run_argv(
-                    self.spec, self.prompt, kind=self.kind)),
+            "run": run,
+            "completion": None if run is None else {
+                "mode": "process_exit",
+                "push": False,
+                "max_poll_interval_seconds": 10,
+            },
         }
 
 
@@ -596,6 +602,15 @@ def _usable(router: Router, spec: AgentSpec) -> bool:
     return spec.enabled and spec.installed and router.h(spec).usable
 
 
+def _has_live_session(router: Router, spec: AgentSpec) -> bool:
+    """Sticky routing is only meaningful while this process owns the session."""
+    try:
+        runner = router.pool.peek(spec)
+        return bool(runner is not None and runner.live_session())
+    except Exception:                              # noqa: BLE001 - routing degrades
+        return False
+
+
 def _chain_specs(cfg: Config, pick: Pick) -> list[AgentSpec]:
     specs: list[AgentSpec] = []
     for key in pick.chain:
@@ -671,11 +686,12 @@ async def decide(cfg: Config, parsed: intent_mod.Intent, cwd: str,
     ranked = await router.rank(coding) if coding else []
     scores = dict(getattr(router, "last_scores", {}) or {})
 
-    sticky_key = (state.get("sticky") or {}).get(cwd)
+    sticky_key = router.conversation_success
     sticky_spec = cfg.find(sticky_key) if sticky_key else None
     used_sticky = False
     if (parsed.kind == "coding" and named is None and sticky_spec is not None
-            and sticky_spec in ranked and _usable(router, sticky_spec)):
+            and sticky_spec in ranked and _usable(router, sticky_spec)
+            and _has_live_session(router, sticky_spec)):
         ranked = [sticky_spec] + [s for s in ranked if s.key != sticky_spec.key]
         used_sticky = True
 
@@ -703,7 +719,7 @@ async def decide(cfg: Config, parsed: intent_mod.Intent, cwd: str,
             push(spec)
         push(plan)
         if used_sticky:
-            reason = f"sticky {sticky_spec.key} (same cwd)"
+            reason = f"sticky {sticky_spec.key} (live session)"
         elif ranked:
             top = scores.get(ranked[0].key)
             reason = top.detail if top else f"lag_waste → {ranked[0].key}"
@@ -837,13 +853,14 @@ async def _speak(cfg: Config, router: Router, transcript: Transcript,
     if decision.chosen is not None:
         state.setdefault("sticky", {})[os.getcwd()] = decision.chosen.key
         router.last_success = decision.chosen.key
+        router.conversation_success = decision.chosen.key
     persist_health(cfg, router, state)
 
 
 async def _discuss(cfg: Config, router: Router, transcript: Transcript,
                    parsed: intent_mod.Intent, *,
                    heartbeat_seconds: float | None = None) -> bool:
-    """Heterogeneous subagents, each seeing the others. Uses agora.orchestrator."""
+    """Heterogeneous subagents, each seeing the others."""
     from .orchestrator import Orchestrator, Plan, summarise
 
     orch = Orchestrator(cfg, router.pool, router)
@@ -885,7 +902,8 @@ async def _discuss(cfg: Config, router: Router, transcript: Transcript,
             progress.sink(sink, announce_attempt=mode != "debate"))
     sys.stdout.write(ui.dim(f"  {summarise(turns)}") + "\n\n")
     persist_health(cfg, router, load_state(cfg))
-    return bool(turns) and all(turn.ok for turn in turns)
+    return bool(turns) and all(
+        turn.ok and not turn.meta.get("delivery_error") for turn in turns)
 
 
 async def run_discuss(cfg: Config, parsed: intent_mod.Intent, *,
@@ -1023,21 +1041,58 @@ def parse_duration(text: str) -> float:
     return seconds
 
 
+_PIPED_STDIN_READ_SECONDS = 0.1
+_PIPED_STDIN_CHUNK_BYTES = 64 * 1024
+
+
 def read_piped_stdin() -> str:
     """Buffer piped stdin so a failover attempt sees the same extra context.
 
-    Never blocks: if stdin is a TTY or nothing is waiting, return empty.
+    Drain bytes that arrive within one short bounded interval. A readable pipe
+    is not necessarily at EOF, so a text-mode read-to-EOF can otherwise wait
+    forever while its writer remains open.
     """
+    blocking: bool | None = None
+    fd: int | None = None
     try:
         if sys.stdin.isatty():
             return ""
-        sys.stdin.fileno()
-        ready, _, _ = select.select([sys.stdin], [], [], 0)
+        fd = sys.stdin.fileno()
+        ready, _, _ = select.select([fd], [], [], 0)
         if not ready:
             return ""
-        return sys.stdin.read()
+        blocking = os.get_blocking(fd)
+        if blocking:
+            os.set_blocking(fd, False)
+        deadline = time.monotonic() + _PIPED_STDIN_READ_SECONDS
+        chunks: list[bytes] = []
+        while True:
+            try:
+                chunk = os.read(fd, _PIPED_STDIN_CHUNK_BYTES)
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                ready, _, _ = select.select([fd], [], [], remaining)
+                if not ready:
+                    break
+                continue
+            except InterruptedError:
+                continue
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if time.monotonic() >= deadline:
+                break
+        encoding = getattr(sys.stdin, "encoding", None) or "utf-8"
+        errors = getattr(sys.stdin, "errors", None) or "replace"
+        return b"".join(chunks).decode(encoding, errors)
     except (OSError, ValueError, AttributeError):
         return ""
+    finally:
+        if fd is not None and blocking:
+            with contextlib.suppress(OSError):
+                os.set_blocking(fd, True)
 
 
 def _print_envelope(pick: Pick, turn, decision, *, exit_code: int) -> None:
@@ -1161,8 +1216,10 @@ def _parse_argv(argv: list[str] | None) -> argparse.Namespace:
             dry_run=False, why=False, plan=False, cu=False, agent=None,
             use=None, json=False, tui=False, timeout=None)
         rest = argv[1:]
-        if rest[:2] == ["--config"] or (rest and rest[0] == "-c"):
-            ns.config = rest[1] if rest[0] == "-c" else rest[1]
+        if rest and rest[0] in ("--config", "-c"):
+            if len(rest) < 2:
+                raise SystemExit(f"leftover {argv[0]}: {rest[0]} needs a path")
+            ns.config = rest[1]
         return ns
     p = argparse.ArgumentParser(prog="leftover")
     p.add_argument("--config", "-c", default=None)

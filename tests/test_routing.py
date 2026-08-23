@@ -4,8 +4,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
+import signal
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -180,6 +183,31 @@ def test_codex_probe() -> None:
               q.probe_codex(Path(tmp) / "nope") is None)
 
 
+def test_keychain_write_keeps_the_token_off_argv() -> None:
+    print("\n[2b0] a refreshed OAuth token never reaches the process table")
+    seen: dict[str, object] = {}
+
+    class _Done:
+        returncode = 0
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = list(cmd)
+        seen["input"] = kwargs.get("input")
+        return _Done()
+
+    original = q.subprocess.run
+    q.subprocess.run = fake_run
+    try:
+        ok = q._keychain_set_password("Claude Code-credentials", "me", "s3cret")
+    finally:
+        q.subprocess.run = original
+    check("the write is reported as done", ok)
+    check("the secret is passed on stdin",
+          seen.get("input") == "s3cret")
+    check("the secret is not an argv element",
+          "s3cret" not in seen.get("cmd", []), str(seen.get("cmd")))
+
+
 def test_claude_usage_parse() -> None:
     print("\n[2b] Claude /api/oauth/usage")
     limits = q.parse_claude_usage({
@@ -248,7 +276,8 @@ def test_grok_billing_parse() -> None:
     check("59% used", abs(weekly.windows[0].used_percent - 59.0) < 0.01)
     check("plan lands in the note", "SuperGrok Heavy" in weekly.note)
     check("title is the official weekly pool",
-          weekly.title.startswith("官方周池") and "SuperGrok Heavy" in weekly.title)
+          weekly.title.startswith("official weekly pool")
+          and "SuperGrok Heavy" in weekly.title)
     check("product percents drop empty rows",
           weekly.products == [{"name": "Build", "percent": 43.0},
                               {"name": "Chat", "percent": 10.0}])
@@ -298,62 +327,141 @@ def test_sub2api_codex_probe() -> None:
         "data": {
             "five_hour": {
                 "utilization": 0,
-                "resets_at": "2020-01-01T00:00:00Z",
+                "resets_at": "2026-08-23T08:28:48+08:00",
                 "remaining_seconds": 0,
+                "window_stats": {
+                    "requests": 342,
+                    "tokens": 26775073,
+                    "cost": 44.975962,
+                },
             },
             "seven_day": {
-                "utilization": 16,
-                "resets_at": "2099-08-27T04:28:54Z",
-                "remaining_seconds": 451272,
+                "utilization": 38,
+                "resets_at": "2026-08-27T12:28:49+08:00",
+                "remaining_seconds": 359970,
+                "window_stats": {
+                    "requests": 6499,
+                    "tokens": 663999548,
+                    "cost": 1059.25545824,
+                },
             },
         },
     }
-    quota = q.parse_sub2api_usage(usage, account_name="calmabacus")
+    quota = q.parse_sub2api_usage(usage, account_name="acme-team")
     check("usage payload parsed", quota is not None)
     assert quota
     names = {w.name: w for w in quota.windows}
-    check("5h and weekly both present",
-          set(names) == {"5h", "weekly"}, str(set(names)))
-    check("just-reset 5h is live 0%, not expired",
-          names["5h"].used_percent == 0
-          and names["5h"].resets_at is not None
-          and names["5h"].resets_at > time.time() + 4 * 3600,
-          names["5h"].describe())
-    check("weekly 16% with remaining_seconds",
-          abs(names["weekly"].used_percent - 16) < 0.01
+    check("inactive 0/0 5h shell is discarded",
+          set(names) == {"weekly"}, str(set(names)))
+    check("weekly 38% with remaining_seconds",
+          abs(names["weekly"].used_percent - 38) < 0.01
           and names["weekly"].resets_at is not None
-          and 450000 < names["weekly"].resets_at - time.time() < 452000)
+          and 359000 < names["weekly"].resets_at - time.time() < 361000)
+    check("valid weekly stats survive the shell filter",
+          names["weekly"].requests == 6499
+          and names["weekly"].cost_usd == 1059.25545824)
     check("reported", quota.best_source == q.REPORTED)
-    check("account lands in the note", "calmabacus" in quota.note)
+    check("account lands in the note", "acme-team" in quota.note)
+
+    stale_extra = {
+        "codex_5h_used_percent": 0,
+        "codex_5h_window_minutes": 0,
+    }
+    live_reset = time.time() + 7200
+    live = q.parse_sub2api_usage({
+        "data": {
+            "five_hour": {
+                "utilization": 17,
+                "remaining_seconds": 7200,
+                "resets_at": live_reset,
+            },
+        },
+    }, account_name="acme-team", account_extra=stale_extra)
+    check("live usage beats stale disabled account metadata",
+          live is not None and len(live.windows) == 1
+          and live.windows[0].name == "5h"
+          and live.windows[0].used_percent == 17
+          and live.windows[0].resets_at is not None
+          and live.windows[0].resets_at > time.time() + 7100,
+          live.describe() if live else "none")
+
+    zero = q.parse_sub2api_usage({
+        "data": {
+            "five_hour": {
+                "used_percent": 0,
+                "remaining_seconds": 18000,
+                "resets_at": time.time() + 18000,
+            },
+        },
+    })
+    check("an explicit numeric zero remains a valid live percentage",
+          zero is not None and len(zero.windows) == 1
+          and zero.windows[0].used_percent == 0,
+          zero.describe() if zero else "none")
+
+    shell = q.parse_sub2api_usage({
+        "data": {
+            "five_hour": {
+                "utilization": 0,
+                "remaining_seconds": 0,
+                "resets_at": time.time() - 60,
+            },
+        },
+    }, account_name="acme-team", account_extra=stale_extra)
+    check("disabled metadata filters only a matching inactive live shell",
+          shell is None, shell.describe() if shell else "none")
 
     extra = q.parse_sub2api_account({
-        "id": 1, "name": "calmabacus", "platform": "openai", "type": "oauth",
+        "id": 1, "name": "acme-team", "platform": "openai", "type": "oauth",
         "extra": {
             "codex_5h_used_percent": 12,
             "codex_5h_reset_at": "2099-01-01T00:00:00+00:00",
+            "codex_5h_window_minutes": 300,
             "codex_7d_used_percent": 40,
             "codex_7d_reset_at": "2099-01-08T00:00:00+00:00",
+            "codex_7d_window_minutes": 10080,
         },
     })
     check("account extra still parses",
           extra is not None and {w.name: w.used_percent for w in extra.windows}
           == {"5h": 12.0, "weekly": 40.0})
 
+    shell_extra = q.parse_sub2api_account({
+        "id": 1, "name": "acme-team", "platform": "openai", "type": "oauth",
+        "extra": {
+            "codex_5h_used_percent": 0,
+            "codex_5h_reset_at": "2099-01-01T00:00:00+00:00",
+            "codex_5h_window_minutes": 0,
+            "codex_7d_used_percent": 38,
+            "codex_7d_reset_at": "2099-01-08T00:00:00+00:00",
+            "codex_7d_window_minutes": 10080,
+        },
+    })
+    check("account extra filters a disabled 5h window",
+          shell_extra is not None
+          and {w.name: w.used_percent for w in shell_extra.windows}
+          == {"weekly": 38.0})
+
     items = [
         {"id": 5, "name": "Xinrun SuperGrokHeavy", "platform": "grok",
          "type": "oauth", "status": "active", "extra": {}},
         {"id": 4, "name": "aux_account", "platform": "openai",
          "type": "apikey", "status": "active", "extra": {"quota_weekly_used": 98}},
-        {"id": 1, "name": "calmabacus", "platform": "openai",
+        {"id": 1, "name": "acme-team", "platform": "openai",
          "type": "oauth", "status": "active",
-         "extra": {"codex_5h_used_percent": 0, "codex_7d_used_percent": 16}},
+         "extra": {
+             "codex_5h_used_percent": 0,
+             "codex_5h_window_minutes": 0,
+             "codex_7d_used_percent": 38,
+             "codex_7d_window_minutes": 10080,
+         }},
         {"id": 9, "name": "Plus 20x", "platform": "openai",
          "type": "oauth", "status": "active",
          "extra": {"codex_5h_used_percent": 10}},
     ]
     check("pin 20x matches name substring",
           (q.pick_sub2api_account(items, "20x") or {}).get("id") == 9)
-    check("pin id", (q.pick_sub2api_account(items, "1") or {}).get("name") == "calmabacus")
+    check("pin id", (q.pick_sub2api_account(items, "1") or {}).get("name") == "acme-team")
     check("auto prefers openai oauth with Codex extra over apikey",
           (q.pick_sub2api_account(items[:3], "") or {}).get("id") == 1)
     check("unknown pin is None", q.pick_sub2api_account(items, "missing") is None)
@@ -362,7 +470,7 @@ def test_sub2api_codex_probe() -> None:
         configured = True
         base_url = "https://api.example.com:8443/"
         admin_key = "admin-test"
-        gpt_account = "calmabacus"
+        gpt_account = "acme-team"
 
     def fake_http(method, url, headers=None, body=None, timeout=8.0):
         if "/accounts?" in url:
@@ -376,8 +484,10 @@ def test_sub2api_codex_probe() -> None:
     q._http_json = fake_http  # type: ignore[assignment]
     try:
         found = q.probe_sub2api(Fake())
-        check("probe hits usage and returns windows",
-              found is not None and found.windows
+        check("probe hits usage and ignores the disabled 5h shell",
+              found is not None
+              and {w.name: w.used_percent for w in found.windows}
+              == {"weekly": 38.0}
               and found.best_source == q.REPORTED,
               found.describe() if found else "none")
         via_codex = q.probe_codex(sub2api=Fake())
@@ -437,7 +547,8 @@ def test_quota_rhythm() -> None:
                     source=q.REPORTED)
     tags = rh.pace_tags(grok, prev, now=now, prev_now=now - 3600)
     check("lag + increase + narrow",
-          "▾滞后" in tags and any(t.startswith("↑") for t in tags) and "收窄" in tags,
+          rh.BEHIND in tags and any(t.startswith("↑") for t in tags)
+          and "narrowing" in tags,
           str(tags))
     fresh = q.Window("5h", 0.0, resets_at=now + 5 * 3600, started_at=now,
                      source=q.REPORTED)
@@ -445,15 +556,16 @@ def test_quota_rhythm() -> None:
     new = q.Window("weekly", 1.0, resets_at=end + 7 * 86400,
                    started_at=end, source=q.REPORTED)
     check("new window tag",
-          "新窗从 0" in rh.pace_tags(new, grok, now=now, prev_now=now))
+          "new window from 0" in rh.pace_tags(new, grok, now=now, prev_now=now))
     spec = AgentSpec(key="grok", label="Grok", emoji="X")
     block = rh.render_grok(
-        q.Quota("grok", [grok], title="官方周池 · SuperGrok Heavy",
+        q.Quota("grok", [grok], title="official weekly pool · SuperGrok Heavy",
                 products=[{"name": "Build", "percent": 43}]),
         q.Quota("grok", [prev], checked_at=now - 3600),
         now, london)
     check("grok block has both bars",
-          "日历 ████████████░░░░" in block and "用量 ██████████░░░░░░" in block)
+          "calendar ████████████░░░░" in block
+          and "used     ██████████░░░░░░" in block)
     check("grok footer has products", "Build 43%" in block)
     cursor = q.parse_cursor_usage({
         "billingCycleStart": (now - 5.3 * 86400) * 1000,
@@ -466,7 +578,7 @@ def test_quota_rhythm() -> None:
     assert cursor
     text = rh.render_cursor(cursor, None, now, london)
     check("cursor header is included dollars",
-          "included $151.16 / $400" in text and "剩 $248.84" in text)
+          "included $151.16 / $400" in text and "left $248.84" in text)
     check("cursor splits Models and Other api%",
           "Models" in text and "Other api%" in text)
     gpt_week = q.Window("weekly", 16.0, resets_at=end + 4 * 86400,
@@ -476,18 +588,28 @@ def test_quota_rhythm() -> None:
                       source=q.REPORTED)
     gpt_block = rh.render_windows(
         AgentSpec(key="gpt", label="Codex", emoji="G"),
-        q.Quota("gpt", [gpt_5h, gpt_week], title="calmabacus@gmail.com"),
+        q.Quota("gpt", [gpt_5h, gpt_week], title="you@example.com"),
         None, now, london)
     check("codex 5h is a footnote, not bars",
-          "5h 刚重置" in gpt_block and gpt_block.count("日历 █") == 1)
+          "5h just reset" in gpt_block and gpt_block.count("calendar █") == 1)
     check("codex keeps the 7d req/$ line",
           "2.8K req" in gpt_block and "$399.38" in gpt_block)
     page = rh.render(
-        [(spec, q.Quota("grok", [grok], title="官方周池 · SuperGrok Heavy"), None)],
-        now=now, strategy="lag_waste", order=["gpt", "grok"])
+        [(spec, q.Quota("grok", [grok],
+                        title="official weekly pool · SuperGrok Heavy"), None)],
+        now=now, strategy="lag_waste", order=["gpt", "grok"],
+        tz_name="Europe/London")
     check("page header is London stamp",
-          "用量节奏  ·  22 Aug 2026 00:18 London" in page)
-    check("legend is present", "加深/收窄 只比同窗" in page)
+          "usage rhythm  ·  22 Aug 2026 00:18 London" in page)
+    check("legend is present", "widening/narrowing compares one window" in page)
+    local = rh.render(
+        [(spec, q.Quota("grok", [grok], title="official weekly pool"), None)],
+        now=now, strategy="lag_waste")
+    stamp = rh._when(now, rh._tz(""), with_year=True)
+    check("no tz configured means this machine's clock, not London",
+          f"usage rhythm  ·  {stamp} " in local, local.splitlines()[0])
+    check("the view is English so a non-Chinese reader can use /quota",
+          not any("\u4e00" <= ch <= "\u9fff" for ch in local), local)
 
 
 def test_ledger() -> None:
@@ -539,6 +661,147 @@ async def test_quota_fallback() -> None:
         check("second ask skips it without even trying",
               turns[0].agent.key != "claude" and turns[0].ok)
         await router.pool.shutdown()
+
+
+async def test_quota_probe_preserves_concurrent_observed_limit() -> None:
+    print("\n[4b] a quota probe cannot erase a concurrent refusal")
+
+    class RacingRouter(Router):
+        def __init__(self, config: Config, pool) -> None:
+            super().__init__(config, pool)
+            self.probe_started = asyncio.Event()
+            self.release_probe = asyncio.Event()
+
+        async def _probe_quota(self, spec: AgentSpec, deadline: float):
+            self.probe_started.set()
+            await self.release_probe.wait()
+            return q.Quota(agent=spec.key)
+
+    spec = AgentSpec(key="shared", label="Shared")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(agents=[spec], data_dir=tmp)
+        router = RacingRouter(cfg, object())
+        probe = asyncio.create_task(router.quota_for(spec, force=True))
+        await router.probe_started.wait()
+        router.observe(spec, Turn(
+            agent=spec,
+            error="You've hit your weekly limit; resets tomorrow at 12:00am",
+        ))
+        router.release_probe.set()
+        result = await probe
+
+    observed = [
+        window for window in result.windows
+        if window.source == q.OBSERVED and window.used_percent == 100.0
+    ]
+    check("the in-flight probe result retains the observed limit",
+          bool(observed), result.describe())
+    check("shared router health retains the same observed limit",
+          router.h(spec).quota is result
+          and any(window.source == q.OBSERVED
+                  for window in router.h(spec).quota.windows),
+          router.h(spec).quota.describe())
+
+
+async def test_fresh_quota_replaces_stale_observed_without_reset() -> None:
+    print("\n[4c] fresh reported quota replaces a stale undated refusal")
+
+    class FreshRouter(Router):
+        async def _probe_quota(self, spec: AgentSpec, deadline: float):
+            return q.Quota(
+                agent=spec.key,
+                windows=[q.Window(
+                    name="weekly",
+                    used_percent=10.0,
+                    source=q.REPORTED,
+                )],
+            )
+
+    spec = AgentSpec(key="fresh-quota", label="Fresh quota")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(agents=[spec], data_dir=tmp)
+        router = FreshRouter(cfg, object())
+        router.h(spec).quota = q.Quota(
+            agent=spec.key,
+            windows=[q.Window(
+                name="limit",
+                used_percent=100.0,
+                source=q.OBSERVED,
+                detail="undated historical refusal",
+            )],
+        )
+        router.h(spec).quota_checked = 0.0
+        result = await router.quota_for(spec, force=True)
+
+    check("authoritative reported data clears the stale observed limit",
+          len(result.windows) == 1
+          and result.windows[0].source == q.REPORTED
+          and abs(result.headroom - 0.9) < 0.001,
+          f"{result.describe()}, headroom={result.headroom}")
+
+
+async def test_concurrent_probes_do_not_revive_stale_observed_limit() -> None:
+    print("\n[4d] concurrent probes cannot revive a stale refusal")
+
+    class DualProbeRouter(Router):
+        def __init__(self, config: Config, pool) -> None:
+            super().__init__(config, pool)
+            self.calls = 0
+            self.both_started = asyncio.Event()
+            self.release_silent = asyncio.Event()
+            self.release_reported = asyncio.Event()
+
+        async def _probe_quota(self, spec: AgentSpec, deadline: float):
+            self.calls += 1
+            call = self.calls
+            if self.calls == 2:
+                self.both_started.set()
+            if call == 1:
+                await self.release_silent.wait()
+                return None
+            await self.release_reported.wait()
+            return q.Quota(
+                agent=spec.key,
+                windows=[q.Window(
+                    name="weekly",
+                    used_percent=10.0,
+                    source=q.REPORTED,
+                )],
+            )
+
+    spec = AgentSpec(key="dual-probe", label="Dual probe")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(agents=[spec], data_dir=tmp)
+        router = DualProbeRouter(cfg, object())
+        health = router.h(spec)
+        health.quota = q.Quota(
+            agent=spec.key,
+            windows=[q.Window(
+                name="limit",
+                used_percent=100.0,
+                source=q.OBSERVED,
+                detail="undated historical refusal",
+            )],
+        )
+        health.quota_observation_epoch = 1
+        silent = asyncio.create_task(router.quota_for(spec, force=True))
+        reported = asyncio.create_task(router.quota_for(spec, force=True))
+        await router.both_started.wait()
+        router.release_silent.set()
+        silent_result = await silent
+        router.release_reported.set()
+        reported_result = await reported
+
+    check("a silent concurrent probe may retain the cached refusal",
+          any(window.source == q.OBSERVED
+              for window in silent_result.windows),
+          silent_result.describe())
+    check("a later reported probe does not misclassify that copy as new",
+          len(reported_result.windows) == 1
+          and reported_result.windows[0].source == q.REPORTED
+          and abs(reported_result.headroom - 0.9) < 0.001
+          and router.h(spec).quota is reported_result,
+          f"{reported_result.describe()}, headroom={reported_result.headroom}")
 
 
 async def test_circuit_breaker() -> None:
@@ -607,7 +870,8 @@ async def test_recovery_and_auto() -> None:
         report = await router.report()
         check("report names every agent",
               all(k in report for k in ("Claude", "Gpt", "Cursor")), report)
-        check("rhythm header", "用量节奏" in report and "日历" in report.split("\n")[1])
+        check("rhythm header",
+              "usage rhythm" in report and "calendar" in report.split("\n")[1])
         check("report shows the strategy", "strategy: headroom" in report)
         await router.pool.shutdown()
 
@@ -632,6 +896,56 @@ async def test_group_substitution() -> None:
               sorted(t.agent.key for t in turns) == ["cursor", "gpt"],
               " ".join(t.agent.key for t in turns))
         await router.pool.shutdown()
+
+
+async def test_parallel_fallback_shares_one_ranking() -> None:
+    print("\n[7b] parallel fallback shares one quota-aware ranking")
+
+    class FailingPrimaryPool:
+        async def run(self, spec: AgentSpec, prompt: str, on_event=None) -> Turn:
+            await asyncio.sleep(0.005)
+            if spec.key.startswith("primary"):
+                return Turn(agent=spec, error="connection reset by peer")
+            return Turn(agent=spec, text=f"{spec.key} recovered")
+
+    class CountingRouter(Router):
+        def __init__(self, config: Config, pool) -> None:
+            super().__init__(config, pool)
+            self.rank_calls = 0
+
+        async def rank(self, specs: list[AgentSpec]) -> list[AgentSpec]:
+            self.rank_calls += 1
+            await asyncio.sleep(0.02)
+            return await super().rank(specs)
+
+    installed = [sys.executable]
+    agents = [
+        AgentSpec(key="primary-a", label="Primary A",
+                  interactive_command=installed),
+        AgentSpec(key="primary-b", label="Primary B",
+                  interactive_command=installed),
+        AgentSpec(key="spare-a", label="Spare A",
+                  interactive_command=installed),
+        AgentSpec(key="spare-b", label="Spare B",
+                  interactive_command=installed),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = FailingPrimaryPool()
+        cfg = Config(
+            agents=agents,
+            data_dir=tmp,
+            routing=Routing(strategy="order", order=[a.key for a in agents]),
+        )
+        router = CountingRouter(cfg, pool)
+        turns = await Orchestrator(cfg, pool, router).execute(
+            Plan("broadcast", "recover", agents[:2], {}), None)
+
+    check("simultaneous primary failures trigger one shared rank call",
+          router.rank_calls == 1, str(router.rank_calls))
+    check("shared ranking still assigns distinct healthy spares",
+          {turn.agent.key for turn in turns} == {"spare-a", "spare-b"}
+          and all(turn.ok for turn in turns),
+          repr([(turn.agent.key, turn.error) for turn in turns]))
 
 
 async def test_group_role_reservations() -> None:
@@ -838,8 +1152,50 @@ async def test_acp_idle_timeout_cleans_up_silence() -> None:
           f"elapsed={elapsed:.3f}s, state={state}")
 
 
+async def test_acp_internal_activity_does_not_extend_idle_deadline() -> None:
+    print("\n[9c] internal ACP activity cannot hide a user-visible stall")
+    from leftover.agents import acp_runner as acp_mod
+
+    state = {"cancel_calls": 0, "prompt_finished": False}
+
+    class Connection:
+        async def prompt(self, session_id, prompt):
+            try:
+                while True:
+                    await runner._queue.put(acp_mod._ACTIVITY)
+                    await asyncio.sleep(0.005)
+            finally:
+                state["prompt_finished"] = True
+
+        async def cancel(self, session_id):
+            state["cancel_calls"] += 1
+
+    runner = acp_mod.AcpRunner(AgentSpec(
+        key="busy", label="Busy", acp_command=["unused"],
+        timeout=0.2, acp_idle_timeout=0.03))
+    runner._conn = Connection()
+    runner._session_id = "session"
+    original_grace = acp_mod._CANCEL_GRACE_TIMEOUT
+    acp_mod._CANCEL_GRACE_TIMEOUT = 0.01
+    started = asyncio.get_running_loop().time()
+    try:
+        turn = await asyncio.wait_for(runner.run("stay busy"), timeout=0.3)
+    finally:
+        acp_mod._CANCEL_GRACE_TIMEOUT = original_grace
+    elapsed = asyncio.get_running_loop().time() - started
+
+    check("internal activity cannot reset the visible-progress deadline",
+          turn.error == "ACP idle timed out after 0.03s without an update"
+          and turn.meta.get("timeout_kind") == "idle"
+          and 0.02 <= elapsed < 0.15,
+          f"elapsed={elapsed:.3f}s, turn={turn}")
+    check("idle timeout cancels and retires the internally busy prompt",
+          state == {"cancel_calls": 1, "prompt_finished": True}
+          and not runner.live_session(), str(state))
+
+
 async def test_agent_pool_start_timeout_is_a_hard_boundary() -> None:
-    print("\n[9c] runner startup timeout does not await stubborn cleanup")
+    print("\n[9d] runner startup timeout does not await stubborn cleanup")
     from leftover import agents as agents_mod
 
     release = asyncio.Event()
@@ -920,7 +1276,7 @@ async def test_acp_close_is_a_hard_boundary() -> None:
 
     def finished() -> None:
         state["finished"] += 1
-        if state["finished"] == 3:
+        if state["finished"] == 2:
             all_finished.set()
 
     class StubbornStack:
@@ -985,8 +1341,8 @@ async def test_acp_close_is_a_hard_boundary() -> None:
         acp_mod._PROCESS_EXIT_TIMEOUT = original_exit
         loop.set_exception_handler(previous_handler)
     check("all timed-out close tasks settle after their resource exits",
-          state["close_cancelled"] == 1 and state["wait_cancelled"] == 2
-          and state["finished"] == 3, str(state))
+          state["close_cancelled"] == 1 and state["wait_cancelled"] == 1
+          and state["finished"] == 2, str(state))
     check("late close failures are retrieved", not leaked,
           repr([context.get("message") for context in leaked]))
 
@@ -1053,6 +1409,202 @@ asyncio.run(main())
           f"stdout={stdout.decode()!r}, stderr={stderr.decode()!r}")
 
 
+async def test_acp_close_reaps_descendants_holding_stdio() -> None:
+    print("\n[9ea] ACP close reaps descendants that inherit its stdio")
+    if os.name != "posix":
+        check("ACP process-group cleanup is POSIX-only", True)
+        return
+
+    from leftover.agents import acp_runner as acp_mod
+
+    def pid_exists(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    async def wait_for_record(path: Path) -> tuple[int, int]:
+        deadline = asyncio.get_running_loop().time() + 2
+        while True:
+            if path.exists():
+                pid, group = path.read_text().split(":", 1)
+                return int(pid), int(group)
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("ACP descendant did not publish its PID")
+            await asyncio.sleep(0.01)
+
+    async def wait_for_exit(pid: int) -> bool:
+        deadline = asyncio.get_running_loop().time() + 1
+        while pid_exists(pid):
+            if asyncio.get_running_loop().time() >= deadline:
+                return False
+            await asyncio.sleep(0.01)
+        return True
+
+    child_script = (
+        "import os,pathlib,signal,sys,time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "pathlib.Path(sys.argv[1]).write_text("
+        "f'{os.getpid()}:{os.getpgrp()}')\n"
+        "while True:\n"
+        "    time.sleep(60)\n"
+    )
+    parent_script = (
+        "import os,subprocess,sys\n"
+        f"child_script = {child_script!r}\n"
+        "subprocess.Popen([sys.executable, '-c', child_script, sys.argv[1]])\n"
+        "os.execv(sys.executable, [sys.executable, sys.argv[2]])\n"
+    )
+
+    original_exit = acp_mod._PROCESS_EXIT_TIMEOUT
+    original_close = acp_mod._CLOSE_TIMEOUT
+    acp_mod._PROCESS_EXIT_TIMEOUT = 0.05
+    acp_mod._CLOSE_TIMEOUT = 0.2
+    proc = None
+    group = None
+    child_pid = None
+    with tempfile.TemporaryDirectory() as tmp:
+        record = Path(tmp) / "descendant.pid"
+        runner = acp_mod.AcpRunner(AgentSpec(
+            key="acp-tree", label="ACP tree", transport="acp",
+            acp_command=[
+                sys.executable, "-c", parent_script, str(record), MOCK,
+            ],
+            timeout=2,
+        ))
+        try:
+            await asyncio.wait_for(runner.start(tmp), timeout=3)
+            proc = runner._proc
+            tree = runner._tree
+            child_pid, child_group = await wait_for_record(record)
+            group = os.getpgid(proc.pid)
+            check("the real ACP adapter owns a separate process group",
+                  tree is not None and tree.process_group == proc.pid
+                  and group == proc.pid and child_group == group,
+                  f"parent={proc.pid}:{group}, child={child_pid}:{child_group}")
+
+            started = asyncio.get_running_loop().time()
+            await asyncio.wait_for(runner.close(), timeout=1)
+            elapsed = asyncio.get_running_loop().time() - started
+            child_exited = await wait_for_exit(child_pid)
+            check("ACP close kills the parent and inherited-pipe descendant",
+                  elapsed < 0.8 and proc.returncode is not None
+                  and child_exited and runner._proc is None
+                  and runner._tree is None,
+                  f"elapsed={elapsed:.3f}s, parent={proc.returncode}, "
+                  f"child_alive={pid_exists(child_pid)}")
+        finally:
+            acp_mod._PROCESS_EXIT_TIMEOUT = original_exit
+            acp_mod._CLOSE_TIMEOUT = original_close
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(runner.close(), timeout=0.5)
+            if group is not None and group != os.getpgrp():
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(group, signal.SIGKILL)
+            if child_pid is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(child_pid, signal.SIGKILL)
+            if proc is not None and proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(proc.wait(), timeout=0.5)
+
+
+async def test_acp_cancelled_close_keeps_one_full_cleanup() -> None:
+    print("\n[9eb] cancelling ACP close keeps its detached SDK cleanup")
+    from leftover.agents import acp_runner as acp_mod
+
+    term_sent = asyncio.Event()
+    stack_closed = asyncio.Event()
+    state = {"terminate": 0, "kill": 0, "stack_calls": 0}
+
+    class SlowProcess:
+        returncode = None
+
+        def terminate(self):
+            state["terminate"] += 1
+            term_sent.set()
+
+        def kill(self):
+            state["kill"] += 1
+            self.returncode = -signal.SIGKILL
+
+        async def wait(self):
+            while self.returncode is None:
+                await asyncio.sleep(0)
+            return self.returncode
+
+    class Stack:
+        async def aclose(self):
+            state["stack_calls"] += 1
+            stack_closed.set()
+
+    original_exit = acp_mod._PROCESS_EXIT_TIMEOUT
+    acp_mod._PROCESS_EXIT_TIMEOUT = 0.03
+    process = SlowProcess()
+    runner = acp_mod.AcpRunner(AgentSpec(
+        key="cancelled-close", label="Cancelled close",
+        acp_command=["unused"]))
+    runner._conn = object()
+    runner._session_id = "session"
+    runner._proc = process
+    runner._stack = Stack()
+    task = asyncio.create_task(runner.close())
+    try:
+        await term_sent.wait()
+        started = asyncio.get_running_loop().time()
+        task.cancel()
+        result = await asyncio.gather(task, return_exceptions=True)
+        elapsed = asyncio.get_running_loop().time() - started
+        await asyncio.wait_for(stack_closed.wait(), timeout=0.2)
+        check("external cancellation returns while one full cleanup continues",
+              isinstance(result[0], asyncio.CancelledError)
+              and elapsed < 0.1 and process.returncode == -signal.SIGKILL
+              and state == {"terminate": 1, "kill": 1, "stack_calls": 1}
+              and not runner.live_session() and runner._proc is None,
+              f"elapsed={elapsed:.3f}s, state={state}, "
+              f"returncode={process.returncode}")
+    finally:
+        acp_mod._PROCESS_EXIT_TIMEOUT = original_exit
+        if process.returncode is None:
+            process.kill()
+        await asyncio.gather(task, return_exceptions=True)
+        await runner.close()
+
+
+async def test_acp_close_still_closes_stack_after_process_stop_error() -> None:
+    print("\n[9ec] ACP close continues SDK cleanup after process-stop failure")
+    from leftover.agents import acp_runner as acp_mod
+
+    state = {"terminate_calls": 0, "stack_calls": 0}
+    sentinel_tree = object()
+
+    async def broken_terminate(tree, **kwargs):
+        state["terminate_calls"] += 1
+        check("ACP cleanup uses the saved process tree",
+              tree is sentinel_tree, repr(tree))
+        raise RuntimeError("synthetic process-stop failure")
+
+    class Stack:
+        async def aclose(self):
+            state["stack_calls"] += 1
+
+    original_terminate = acp_mod.terminate_process_tree
+    acp_mod.terminate_process_tree = broken_terminate
+    try:
+        await acp_mod._close_transport_cleanup(
+            Stack(), object(), sentinel_tree)
+        check("SDK stack closes even when process-tree termination fails",
+              state == {"terminate_calls": 1, "stack_calls": 1},
+              repr(state))
+    finally:
+        acp_mod.terminate_process_tree = original_terminate
+
+
 async def test_acp_filesystem_callbacks_do_not_block_loop() -> None:
     print("\n[9f] ACP filesystem callbacks are bounded and off-loop")
     from leftover.agents import acp_runner as acp_mod
@@ -1076,25 +1628,27 @@ async def test_acp_filesystem_callbacks_do_not_block_loop() -> None:
 
         original_read = acp_mod._read_text_file_sync
         original_write = acp_mod._write_text_file_sync
+        slow_release = threading.Event()
+        read_started = threading.Event()
+        write_started = threading.Event()
 
         def slow_read(path, line, limit):
-            time.sleep(0.04)
+            read_started.set()
+            slow_release.wait(timeout=0.2)
             return "slow read"
 
         def slow_write(path, content):
-            time.sleep(0.04)
+            write_started.set()
+            slow_release.wait(timeout=0.2)
 
         acp_mod._read_text_file_sync = slow_read
         acp_mod._write_text_file_sync = slow_write
-        ticks = 0
 
         async def ticker() -> None:
-            nonlocal ticks
-            deadline = asyncio.get_running_loop().time() + 0.03
-            while asyncio.get_running_loop().time() < deadline:
-                ticks += 1
-                await asyncio.sleep(0.002)
+            await asyncio.sleep(0.01)
+            slow_release.set()
 
+        started = asyncio.get_running_loop().time()
         try:
             await asyncio.gather(
                 bridge.read_text_file("session", str(source), line=1, limit=1),
@@ -1102,10 +1656,108 @@ async def test_acp_filesystem_callbacks_do_not_block_loop() -> None:
                 ticker(),
             )
         finally:
+            slow_release.set()
             acp_mod._read_text_file_sync = original_read
             acp_mod._write_text_file_sync = original_write
+        elapsed = asyncio.get_running_loop().time() - started
         check("slow filesystem calls leave heartbeat and timeout tasks runnable",
-              ticks >= 5, f"ticks={ticks}")
+              read_started.is_set() and write_started.is_set()
+              and elapsed < 0.15,
+              f"elapsed={elapsed:.3f}s")
+
+        late_target = Path(tmp) / "late-write.txt"
+        late_started = threading.Event()
+        late_release = threading.Event()
+
+        def blocked_write(path, content):
+            late_started.set()
+            late_release.wait()
+            Path(path).write_text(content)
+
+        original_write = acp_mod._write_text_file_sync
+        original_timeout = acp_mod._FS_IO_TIMEOUT
+        acp_mod._write_text_file_sync = blocked_write
+        acp_mod._FS_IO_TIMEOUT = 0.03
+        write_task = asyncio.create_task(bridge.write_text_file(
+            "session", str(late_target), "late content"))
+        try:
+            deadline = asyncio.get_running_loop().time() + 0.2
+            while not late_started.is_set():
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("filesystem write worker did not start")
+                await asyncio.sleep(0.001)
+            write_error = ""
+            try:
+                await write_task
+            except TimeoutError as exc:
+                write_error = str(exc)
+            check("running write timeouts disclose their uncertain outcome",
+                  "outcome is uncertain" in write_error
+                  and "may complete later" in write_error,
+                  repr(write_error))
+
+            late_release.set()
+            deadline = asyncio.get_running_loop().time() + 0.2
+            while (not late_target.exists()
+                   and asyncio.get_running_loop().time() < deadline):
+                await asyncio.sleep(0.005)
+            late_text = (late_target.read_text()
+                         if late_target.exists() else "")
+            check("the disclosure matches an in-flight write's late side effect",
+                  late_text == "late content",
+                  "missing late write" if not late_text else repr(late_text))
+        finally:
+            late_release.set()
+            await asyncio.gather(write_task, return_exceptions=True)
+            acp_mod._write_text_file_sync = original_write
+            acp_mod._FS_IO_TIMEOUT = original_timeout
+
+    check("filesystem execution uses a bounded daemon pool",
+          acp_mod._FS_WORKERS.worker_count == acp_mod._FS_WORKER_COUNT
+          and acp_mod._FS_WORKERS.queue_limit == acp_mod._FS_QUEUE_LIMIT
+          and acp_mod._FS_WORKERS._queue.maxsize == acp_mod._FS_QUEUE_LIMIT)
+
+    script = r'''
+import asyncio
+import threading
+from leftover.agents import acp_runner as mod
+
+def blocked_read(path, line, limit):
+    threading.Event().wait()
+
+async def main():
+    mod._read_text_file_sync = blocked_read
+    mod._FS_IO_TIMEOUT = 0.02
+    bridge = mod._Bridge(asyncio.Queue())
+    try:
+        await bridge.read_text_file("session", "blocked")
+    except TimeoutError as exc:
+        print(str(exc), flush=True)
+
+asyncio.run(main())
+print("asyncio-exited", flush=True)
+'''
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", script,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=str(ROOT))
+    timed_out = False
+    try:
+        # Interpreter startup and the ACP import can exceed 0.5s on a busy Mac.
+        # The worker call itself still has a 0.02s deadline; this outer bound
+        # only detects a process that cannot exit because of the blocked I/O.
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=2)
+    except asyncio.TimeoutError:
+        timed_out = True
+        proc.kill()
+        stdout, stderr = await proc.communicate()
+    output = stdout.decode()
+    check("permanently blocked filesystem I/O cannot hold asyncio.run open",
+          not timed_out and proc.returncode == 0
+          and "timed out after 0.02s" in output
+          and "asyncio-exited" in output,
+          f"timed_out={timed_out}, returncode={proc.returncode}, "
+          f"stdout={output!r}, stderr={stderr.decode()!r}")
 
 
 async def test_acp_prompt_failure_rebuilds_only_next_turn() -> None:
@@ -1114,9 +1766,12 @@ async def test_acp_prompt_failure_rebuilds_only_next_turn() -> None:
 
     state = {"spawns": 0, "closes": 0, "late_updates": 0}
     prompts: list[tuple[int, str]] = []
+    lifecycle: list[str] = []
     processes: list[asyncio.subprocess.Process] = []
     background: set[asyncio.Task] = set()
     release_late = asyncio.Event()
+    first_prompt_started = asyncio.Event()
+    release_first_prompt = asyncio.Event()
 
     class Session:
         def __init__(self, index: int) -> None:
@@ -1139,6 +1794,9 @@ async def test_acp_prompt_failure_rebuilds_only_next_turn() -> None:
         async def prompt(self, session_id, prompt):
             prompts.append((self.index, prompt[0].text))
             if self.index == 1:
+                first_prompt_started.set()
+                await release_first_prompt.wait()
+
                 async def late_update() -> None:
                     await release_late.wait()
                     state["late_updates"] += 1
@@ -1157,13 +1815,16 @@ async def test_acp_prompt_failure_rebuilds_only_next_turn() -> None:
     @contextlib.asynccontextmanager
     async def fake_spawn(bridge, *args, **kwargs):
         state["spawns"] += 1
+        index = state["spawns"]
+        lifecycle.append(f"spawn:{index}")
         child = await asyncio.create_subprocess_exec(
             sys.executable, "-c", "import time; time.sleep(60)")
         processes.append(child)
         try:
-            yield Connection(state["spawns"], bridge), child
+            yield Connection(index, bridge), child
         finally:
             state["closes"] += 1
+            lifecycle.append(f"close:{index}")
             if child.returncode is None:
                 child.kill()
                 await child.wait()
@@ -1174,16 +1835,20 @@ async def test_acp_prompt_failure_rebuilds_only_next_turn() -> None:
         key="rpc-restart", label="RPC restart", acp_command=["fake"],
         timeout=1, acp_idle_timeout=0))
     try:
-        first = await runner.run("first side effect")
-        check("prompt RPC failure returns once and retires the dead session",
+        first_task = asyncio.create_task(runner.run("first side effect"))
+        await first_prompt_started.wait()
+        second_task = asyncio.create_task(runner.run("second explicit turn"))
+        await asyncio.sleep(0)
+        release_first_prompt.set()
+        first, second = await asyncio.gather(first_task, second_task)
+        check("prompt RPC failure retires before the queued turn rebuilds",
               first.error == "ConnectionError: Connection closed"
-              and prompts == [(1, "first side effect")]
-              and not runner.live_session() and state["closes"] == 1,
-              f"turn={first}, prompts={prompts}, state={state}")
+              and prompts.count((1, "first side effect")) == 1
+              and lifecycle[:3] == ["spawn:1", "close:1", "spawn:2"],
+              f"turn={first}, prompts={prompts}, lifecycle={lifecycle}")
 
-        second = await runner.run("second explicit turn")
         await asyncio.gather(*list(background), return_exceptions=True)
-        check("the next explicit turn creates a fresh ACP session",
+        check("the queued next turn creates a fresh ACP session",
               second.text == "NEW" and runner.live_session()
               and runner.session_id == "session-2"
               and state["spawns"] == 2
@@ -1197,6 +1862,7 @@ async def test_acp_prompt_failure_rebuilds_only_next_turn() -> None:
         check("session rebuild keeps the managed runner as ACP",
               isinstance(runner, acp_mod.AcpRunner))
     finally:
+        release_first_prompt.set()
         release_late.set()
         await asyncio.gather(*list(background), return_exceptions=True)
         await runner.close()
@@ -1408,8 +2074,482 @@ async def test_agent_pool_queue_timeout_is_safe_to_fallback() -> None:
             agents_mod.RUNNER_QUEUE_TIMEOUT = original_queue_timeout
 
 
+async def test_router_does_not_replay_shutdown_interrupted_turn() -> None:
+    print("\n[9k] shutdown interruption is terminal but queue timeout is not")
+
+    calls: list[str] = []
+
+    class BoundaryPool:
+        async def run(self, spec, prompt, on_event=None):
+            calls.append(spec.key)
+            if spec.key == "first":
+                return Turn(
+                    agent=spec,
+                    error="not executed: pool shutdown interrupted queued request",
+                    meta={
+                        "not_executed": True,
+                        "shutdown_interrupted": True,
+                    },
+                )
+            return Turn(agent=spec, text="must not run")
+
+    specs = [AgentSpec(key="first", label="First"),
+             AgentSpec(key="second", label="Second")]
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(
+            agents=specs, default_workdir=tmp, data_dir=tmp,
+            routing=Routing(
+                strategy="order", order=["first", "second"],
+                continuation_guard=False))
+        router = Router(cfg, BoundaryPool())
+        turn, decision = await router.run(
+            lambda spec: "work", primary=specs[0],
+            ordered_chain=specs, max_attempts=2)
+        check("router stops the cancelled request at the shutdown boundary",
+              calls == ["first"] and decision.tried == ["first"]
+              and turn.meta.get("shutdown_interrupted") is True
+              and decision.attempts[0].timed_out,
+              f"calls={calls}, attempts={decision.attempts}")
+        check("shutdown interruption does not penalize backend health",
+              router.h(specs[0]).consecutive == 0
+              and router.h(specs[0]).last_error == "",
+              router.h(specs[0]).describe())
+
+
+async def test_agent_pool_shutdown_interrupts_queued_runs() -> None:
+    print("\n[9l] shutdown interrupts queued runs and serializes cancellation")
+    from leftover import agents as agents_mod
+
+    started = asyncio.Event()
+    run_release = asyncio.Event()
+    cancel_entered = asyncio.Event()
+    cancel_release = asyncio.Event()
+    calls: list[str] = []
+    state = {"cancel_calls": 0, "active_cancel": 0,
+             "max_cancel": 0, "close_calls": 0}
+
+    class ShutdownRunner(agents_mod.BaseRunner):
+        async def stream(self, prompt: str, on_event=None):
+            calls.append(prompt)
+            if prompt == "active":
+                started.set()
+                await run_release.wait()
+            yield agents_mod.Event("text", prompt)
+            yield agents_mod.Event("done")
+
+        async def cancel(self):
+            state["cancel_calls"] += 1
+            state["active_cancel"] += 1
+            state["max_cancel"] = max(
+                state["max_cancel"], state["active_cancel"])
+            cancel_entered.set()
+            try:
+                await cancel_release.wait()
+                run_release.set()
+            finally:
+                state["active_cancel"] -= 1
+
+        async def close(self):
+            state["close_calls"] += 1
+
+    original_build = agents_mod.build_runner
+    agents_mod.build_runner = lambda spec: ShutdownRunner(spec)
+    spec = AgentSpec(key="shutdown", label="Shutdown")
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(
+            agents=[spec], default_workdir=tmp, data_dir=tmp))
+        active = asyncio.create_task(pool.run(spec, "active"))
+        queued = None
+        shutdown_one = None
+        shutdown_two = None
+        try:
+            await started.wait()
+            queued = asyncio.create_task(pool.run(spec, "queued"))
+            lock = pool._runner_lock(spec.key)
+            while not getattr(lock, "_waiters", None):
+                await asyncio.sleep(0)
+
+            shutdown_one = asyncio.create_task(pool.shutdown())
+            await cancel_entered.wait()
+            shutdown_two = asyncio.create_task(pool.shutdown())
+            await asyncio.sleep(0.01)
+            check("overlapping shutdown calls share one cancellation sweep",
+                  state["cancel_calls"] == 1 and state["max_cancel"] == 1
+                  and not shutdown_two.done(), str(state))
+
+            cancel_release.set()
+            active_turn, queued_turn, _, _ = await asyncio.wait_for(
+                asyncio.gather(active, queued, shutdown_one, shutdown_two),
+                timeout=0.5)
+            check("work queued before shutdown is never executed afterward",
+                  active_turn.ok and calls == ["active"]
+                  and queued_turn.meta.get("not_executed") is True
+                  and queued_turn.meta.get("shutdown_interrupted") is True,
+                  f"calls={calls}, queued={queued_turn}")
+            check("shutdown closes the runner once and completes",
+                  state["close_calls"] == 1, str(state))
+        finally:
+            cancel_release.set()
+            run_release.set()
+            pending = [task for task in (
+                active, queued, shutdown_one, shutdown_two)
+                if task is not None and not task.done()]
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
+
+
+async def test_agent_pool_cancel_bypasses_pending_workdir_writer() -> None:
+    print("\n[9l] cancel remains available while a workdir writer is pending")
+    from leftover import agents as agents_mod
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    state = {"cancel_calls": 0, "close_calls": 0}
+
+    class CancelRunner(agents_mod.BaseRunner):
+        async def stream(self, prompt: str, on_event=None):
+            started.set()
+            await release.wait()
+            yield agents_mod.Event("text", "finished")
+            yield agents_mod.Event("done")
+
+        async def cancel(self):
+            state["cancel_calls"] += 1
+            release.set()
+
+        async def close(self):
+            state["close_calls"] += 1
+
+    original_build = agents_mod.build_runner
+    agents_mod.build_runner = lambda spec: CancelRunner(spec)
+    spec = AgentSpec(key="cancel-switch", label="Cancel switch")
+    with tempfile.TemporaryDirectory() as tmp:
+        old_dir = str(Path(tmp) / "old")
+        new_dir = str(Path(tmp) / "new")
+        Path(old_dir).mkdir()
+        Path(new_dir).mkdir()
+        pool = AgentPool(Config(
+            agents=[spec], default_workdir=old_dir, data_dir=tmp))
+        active = asyncio.create_task(pool.run(spec, "active"))
+        switching = None
+        cancelling = None
+        try:
+            await started.wait()
+            switching = asyncio.create_task(pool.set_workdir(new_dir))
+            while pool._operations._waiting_writers == 0:
+                await asyncio.sleep(0)
+            cancelling = asyncio.create_task(pool.cancel_all())
+            active_turn, _, _ = await asyncio.wait_for(
+                asyncio.gather(active, switching, cancelling), timeout=0.5)
+            check("cancel_all does not queue behind the pending writer",
+                  active_turn.ok and state["cancel_calls"] == 1
+                  and pool.workdir == new_dir, str(state))
+            check("the completed workdir switch closes the old runner",
+                  state["close_calls"] == 1, str(state))
+        finally:
+            release.set()
+            pending = [task for task in (active, switching, cancelling)
+                       if task is not None and not task.done()]
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
+
+
+async def test_agent_pool_transitions_have_hard_deadlines() -> None:
+    print("\n[9m] pool transitions time out without a late writer")
+    from leftover import agents as agents_mod
+
+    hold_started = asyncio.Event()
+    hold_release = asyncio.Event()
+    state = {"cancel_calls": 0, "close_calls": {}}
+    instances: dict[str, list] = {"hold": [], "fresh": []}
+
+    class BoundaryRunner(agents_mod.BaseRunner):
+        def __init__(self, spec):
+            super().__init__(spec)
+            self.closed = 0
+            instances[spec.key].append(self)
+
+        async def stream(self, prompt: str, on_event=None):
+            if self.spec.key == "hold":
+                hold_started.set()
+                await hold_release.wait()
+            yield agents_mod.Event("text", f"{self.spec.key}:{self._workdir}")
+            yield agents_mod.Event("done")
+
+        async def cancel(self):
+            state["cancel_calls"] += 1
+
+        async def close(self):
+            self.closed += 1
+            state["close_calls"][self.spec.key] = self.closed
+
+    original_build = agents_mod.build_runner
+    original_timeout = agents_mod.POOL_TRANSITION_TIMEOUT
+    agents_mod.build_runner = lambda spec: BoundaryRunner(spec)
+    agents_mod.POOL_TRANSITION_TIMEOUT = 0.03
+    specs = [AgentSpec(key="hold", label="Hold"),
+             AgentSpec(key="fresh", label="Fresh")]
+    with tempfile.TemporaryDirectory() as tmp:
+        old_dir = str(Path(tmp) / "old")
+        new_dir = str(Path(tmp) / "new")
+        Path(old_dir).mkdir()
+        Path(new_dir).mkdir()
+        pool = AgentPool(Config(
+            agents=specs, default_workdir=old_dir, data_dir=tmp))
+        active = asyncio.create_task(pool.run(specs[0], "hold"))
+        try:
+            await hold_started.wait()
+            started = asyncio.get_running_loop().time()
+            shutdown_error = None
+            try:
+                await pool.shutdown()
+            except agents_mod._PoolTransitionTimeout as exc:
+                shutdown_error = str(exc)
+            elapsed = asyncio.get_running_loop().time() - started
+            check("shutdown exposes one total deadline when a run ignores cancel",
+                  shutdown_error == "agent pool shutdown timed out after 0.03s"
+                  and elapsed < 0.15
+                  and not pool._shutdown_active
+                  and pool._operations._waiting_writers == 0
+                  and not pool._lock.locked()
+                  and not pool._shutdown_lock.locked(),
+                  f"elapsed={elapsed:.3f}s, error={shutdown_error!r}")
+
+            fresh_turn = await asyncio.wait_for(
+                pool.run(specs[1], "fresh"), timeout=0.2)
+            fresh_runner = pool.peek(specs[1])
+            switch_error = None
+            try:
+                await pool.set_workdir(new_dir)
+            except agents_mod._PoolTransitionTimeout as exc:
+                switch_error = str(exc)
+            check("an unsafe workdir switch fails finitely and keeps the old cwd",
+                  fresh_turn.ok
+                  and switch_error == (
+                      "agent pool workdir switch timed out after 0.03s")
+                  and pool.workdir == old_dir
+                  and pool._operations._waiting_writers == 0
+                  and not pool._lock.locked(),
+                  f"turn={fresh_turn}, error={switch_error!r}")
+
+            hold_release.set()
+            await active
+            await asyncio.sleep(0.05)
+            check("timed-out writers cannot later close a newly created runner",
+                  pool.peek(specs[1]) is fresh_runner
+                  and fresh_runner is not None and fresh_runner.closed == 0
+                  and pool.workdir == old_dir,
+                  f"fresh={fresh_runner}, cwd={pool.workdir}")
+
+            agents_mod.POOL_TRANSITION_TIMEOUT = original_timeout
+            await pool.set_workdir(new_dir)
+            check("the pool remains reusable after both transition timeouts",
+                  pool.workdir == new_dir and fresh_runner.closed == 1)
+        finally:
+            hold_release.set()
+            await asyncio.gather(active, return_exceptions=True)
+            agents_mod.POOL_TRANSITION_TIMEOUT = original_timeout
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
+
+
+async def test_agent_pool_close_timeout_only_targets_detached_snapshot() -> None:
+    print("\n[9n] close timeout cannot target a replacement runner later")
+    from leftover import agents as agents_mod
+
+    close_release = asyncio.Event()
+    old_close_finished = asyncio.Event()
+    instances: list = []
+
+    class CloseRunner(agents_mod.BaseRunner):
+        def __init__(self, spec):
+            super().__init__(spec)
+            self.index = len(instances) + 1
+            self.closed = 0
+            instances.append(self)
+
+        async def stream(self, prompt: str, on_event=None):
+            yield agents_mod.Event("text", f"runner-{self.index}")
+            yield agents_mod.Event("done")
+
+        async def close(self):
+            self.closed += 1
+            if self.index != 1:
+                return
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await close_release.wait()
+                old_close_finished.set()
+
+    original_build = agents_mod.build_runner
+    original_timeout = agents_mod.POOL_TRANSITION_TIMEOUT
+    agents_mod.build_runner = lambda spec: CloseRunner(spec)
+    agents_mod.POOL_TRANSITION_TIMEOUT = 0.03
+    spec = AgentSpec(key="close-bound", label="Close bound")
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(
+            agents=[spec], default_workdir=tmp, data_dir=tmp))
+        try:
+            first = await pool.run(spec, "first")
+            close_error = None
+            started = asyncio.get_running_loop().time()
+            try:
+                await pool.shutdown()
+            except agents_mod._PoolTransitionTimeout as exc:
+                close_error = str(exc)
+            elapsed = asyncio.get_running_loop().time() - started
+            check("stubborn runner close obeys the pool's total boundary",
+                  first.text == "runner-1"
+                  and close_error == "agent pool shutdown timed out after 0.03s"
+                  and elapsed < 0.15 and pool.peek(spec) is None,
+                  f"elapsed={elapsed:.3f}s, error={close_error!r}")
+
+            second = await asyncio.wait_for(pool.run(spec, "second"), timeout=0.2)
+            replacement = pool.peek(spec)
+            close_release.set()
+            await asyncio.wait_for(old_close_finished.wait(), timeout=0.2)
+            await asyncio.sleep(0)
+            check("late cleanup remains bound to the detached old runner",
+                  second.text == "runner-2"
+                  and replacement is instances[1]
+                  and replacement.closed == 0
+                  and pool.peek(spec) is replacement,
+                  f"instances={[(r.index, r.closed) for r in instances]}")
+        finally:
+            close_release.set()
+            agents_mod.POOL_TRANSITION_TIMEOUT = original_timeout
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
+
+
+async def test_agent_pool_fast_close_error_does_not_mask_answer() -> None:
+    print("\n[9o] fast close errors do not masquerade as pool timeouts")
+    from leftover import agents as agents_mod
+
+    state = {"timeout": 0, "cancelled": 0}
+
+    class BrokenCloseRunner(agents_mod.BaseRunner):
+        async def stream(self, prompt: str, on_event=None):
+            yield agents_mod.Event("text", "completed answer")
+            yield agents_mod.Event("done")
+
+        async def close(self):
+            state[self.spec.key] += 1
+            if self.spec.key == "timeout":
+                raise TimeoutError("runner's own cleanup error")
+            raise asyncio.CancelledError
+
+    original_build = agents_mod.build_runner
+    agents_mod.build_runner = lambda spec: BrokenCloseRunner(spec)
+    specs = [
+        AgentSpec(key="timeout", label="Fast timeout error"),
+        AgentSpec(key="cancelled", label="Self-cancelled close"),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = AgentPool(Config(
+            agents=specs, default_workdir=tmp, data_dir=tmp))
+
+        async def run_with_final_cleanup() -> list[Turn]:
+            try:
+                return await asyncio.gather(*(
+                    pool.run(spec, "work") for spec in specs))
+            finally:
+                await pool.shutdown()
+
+        try:
+            turns = await run_with_final_cleanup()
+            check("an immediate cleanup error cannot overwrite a good turn",
+                  all(turn.ok and turn.text == "completed answer"
+                      for turn in turns)
+                  and state == {"timeout": 1, "cancelled": 1}
+                  and all(pool.peek(spec) is None for spec in specs),
+                  f"turns={turns}, state={state}")
+        finally:
+            agents_mod.build_runner = original_build
+            await pool.shutdown()
+
+
+async def test_agent_pool_external_cancel_restores_transition_state() -> None:
+    print("\n[9p] external cancellation restores pool transition state")
+    from leftover import agents as agents_mod
+
+    hold_started = asyncio.Event()
+    hold_release = asyncio.Event()
+
+    class CancelledTransitionRunner(agents_mod.BaseRunner):
+        async def stream(self, prompt: str, on_event=None):
+            if self.spec.key == "hold":
+                hold_started.set()
+                await hold_release.wait()
+            yield agents_mod.Event("text", self.spec.key)
+            yield agents_mod.Event("done")
+
+        async def cancel(self):
+            return None
+
+    original_build = agents_mod.build_runner
+    agents_mod.build_runner = lambda spec: CancelledTransitionRunner(spec)
+    specs = [AgentSpec(key="hold", label="Hold"),
+             AgentSpec(key="fresh", label="Fresh")]
+    with tempfile.TemporaryDirectory() as tmp:
+        old_dir = str(Path(tmp) / "old")
+        new_dir = str(Path(tmp) / "new")
+        Path(old_dir).mkdir()
+        Path(new_dir).mkdir()
+        pool = AgentPool(Config(
+            agents=specs, default_workdir=old_dir, data_dir=tmp))
+        active = asyncio.create_task(pool.run(specs[0], "hold"))
+        try:
+            await hold_started.wait()
+            switching = asyncio.create_task(pool.set_workdir(new_dir))
+            while pool._operations._waiting_writers == 0:
+                await asyncio.sleep(0)
+            switching.cancel()
+            switch_result = await asyncio.gather(
+                switching, return_exceptions=True)
+            check("cancelling set_workdir removes its writer and lock state",
+                  isinstance(switch_result[0], asyncio.CancelledError)
+                  and pool.workdir == old_dir
+                  and pool._operations._waiting_writers == 0
+                  and not pool._operations._writer
+                  and not pool._lock.locked())
+
+            shutdown = asyncio.create_task(pool.shutdown())
+            while pool._operations._waiting_writers == 0:
+                await asyncio.sleep(0)
+            shutdown.cancel()
+            shutdown_result = await asyncio.gather(
+                shutdown, return_exceptions=True)
+            check("cancelling shutdown restores epoch and all control locks",
+                  isinstance(shutdown_result[0], asyncio.CancelledError)
+                  and not pool._shutdown_active
+                  and pool._shutdown_epoch % 2 == 0
+                  and pool._operations._waiting_writers == 0
+                  and not pool._operations._writer
+                  and not pool._lock.locked()
+                  and not pool._shutdown_lock.locked()
+                  and not pool._cancel_lock.locked())
+
+            fresh = await asyncio.wait_for(
+                pool.run(specs[1], "fresh"), timeout=0.2)
+            check("the pool accepts new work after either external cancellation",
+                  fresh.ok and fresh.text == "fresh", repr(fresh))
+        finally:
+            hold_release.set()
+            await asyncio.gather(active, return_exceptions=True)
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
+
+
 async def test_acp_abort_is_hard_bounded_and_rotates_queue() -> None:
-    print("\n[9k] stubborn ACP abort is bounded and isolates late updates")
+    print("\n[9q] stubborn ACP abort is bounded and isolates late updates")
     from leftover.agents import acp_runner as acp_mod
 
     release = asyncio.Event()
@@ -1959,6 +3099,7 @@ async def main() -> int:
     test_config_parallel_bound()
     await test_success_result_refusal_boundary()
     test_codex_probe()
+    test_keychain_write_keeps_the_token_off_argv()
     test_claude_usage_parse()
     test_grok_billing_parse()
     test_sub2api_codex_probe()
@@ -1966,21 +3107,36 @@ async def main() -> int:
     test_quota_rhythm()
     test_ledger()
     await test_quota_fallback()
+    await test_quota_probe_preserves_concurrent_observed_limit()
+    await test_fresh_quota_replaces_stale_observed_without_reset()
+    await test_concurrent_probes_do_not_revive_stale_observed_limit()
     await test_circuit_breaker()
     await test_recovery_and_auto()
     await test_group_substitution()
+    await test_parallel_fallback_shares_one_ranking()
     await test_group_role_reservations()
     await test_debate_turn_timeout_is_bounded()
     await test_acp_idle_timeout_tracks_all_updates()
     await test_acp_idle_timeout_cleans_up_silence()
+    await test_acp_internal_activity_does_not_extend_idle_deadline()
     await test_agent_pool_start_timeout_is_a_hard_boundary()
     await test_acp_close_is_a_hard_boundary()
     await test_acp_close_exits_asyncio_run_process()
+    await test_acp_close_reaps_descendants_holding_stdio()
+    await test_acp_cancelled_close_keeps_one_full_cleanup()
+    await test_acp_close_still_closes_stack_after_process_stop_error()
     await test_acp_filesystem_callbacks_do_not_block_loop()
     await test_acp_prompt_failure_rebuilds_only_next_turn()
     await test_acp_rebuild_failure_uses_exec_fallback()
     await test_agent_pool_workdir_gate_preserves_parallel_runs()
     await test_agent_pool_queue_timeout_is_safe_to_fallback()
+    await test_router_does_not_replay_shutdown_interrupted_turn()
+    await test_agent_pool_shutdown_interrupts_queued_runs()
+    await test_agent_pool_cancel_bypasses_pending_workdir_writer()
+    await test_agent_pool_transitions_have_hard_deadlines()
+    await test_agent_pool_close_timeout_only_targets_detached_snapshot()
+    await test_agent_pool_fast_close_error_does_not_mask_answer()
+    await test_agent_pool_external_cancel_restores_transition_state()
     await test_acp_abort_is_hard_bounded_and_rotates_queue()
     await test_acp_external_cancel_propagates_through_stuck_cleanup()
     await test_terminal_timeout_does_not_cross_backends()

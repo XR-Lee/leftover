@@ -22,7 +22,7 @@ It does not draw a pager, sandbox, diff viewer, or subagent tree. Those stay ins
 | Headless one-shot | `leftover --print` / `-p "…"` | `run_print` / `run_discuss` | `test_run_print_*`, stdin replay |
 | Headless JSON | `leftover -p --json "…"` | run envelope | `test_print_json_envelope_and_stdin` |
 | Headless timeout | `leftover -p --timeout 2m "…"` | per-attempt; exit 124 | parse + requires `-p` |
-| Skill handoff | `leftover --pick --json --agent $SELF "…"` | `decide`, `Pick.as_dict` | `--agent` vs `--use`, group `run` argv |
+| Skill handoff | `leftover --pick --json --agent $SELF "…"` | `decide`, `Pick.as_dict` | `--agent` vs `--use`, group `run` argv, process-exit completion |
 | Preview | `macbot --dry-run "…"` | `_print_pick` | pick chain |
 | Why table | `macbot --why "…"` | `format_why` | lag/waste + remaining bar; no strength |
 | Seat / failover | TTY stderr/stdout | `ui.seat_line` / `failover_line` | usher-shaped, our axis |
@@ -37,7 +37,7 @@ It does not draw a pager, sandbox, diff viewer, or subagent tree. Those stay ins
 | Quota view | `leftover quota` or `/quota` | `router.report` + `rhythm` | parse probes + rhythm |
 | Doctor | `leftover doctor` | `doctor` | roster + remaining bar + paths |
 | Install skill | `leftover install-skills` | symlink `SKILL.md` | `test_skill_install_is_symlink` |
-| Sticky cwd | same directory keeps last success | `leftover-state.json` | quota cache + pick |
+| Live session continuity | a successful in-process coding session keeps its backend | router + runner state | `test_sticky_requires_a_live_session` |
 | Workdir | `/cd` in REPL; `--print` uses `os.getcwd()` | `AgentPool.set_workdir` | `test_run_print_uses_current_workdir` |
 
 ## Routing that must stay true
@@ -46,13 +46,13 @@ It does not draw a pager, sandbox, diff viewer, or subagent tree. Those stay ins
 |---|---|
 | Default task is coding | Claude is not in the lag race |
 | Coding pool = `gpt`, `grok`, `cursor` | Cursor pinned to `--model grok-4.6` (Ultra first-party) |
-| Score = `0.5 * lag + 1.0 * waste` | A 5h window about to reset beats a fat monthly pool |
+| Score = `0.5 * lag + 1.0 * waste` | Overdue windows rise; fresh short windows do not starve them |
 | `waste = 0` on `estimated` | Turn budgets must not fake a 5h emergency |
 | `/plan` → Claude first, coding pool as fallback | Planning is the only default Claude job |
 | `/cu` → Codex only, no further fallback | Computer use is a Codex harness, not a model id |
 | `--agent` is caller identity | Must not force routing (skill anti-recursion) |
 | `--use` / `@name` forces first backend | Explicit beat scores |
-| Same cwd sticks until hard refusal | Voice continuity without a second frontend |
+| Only a live in-process session sticks | Fresh commands must honor current quota ranking |
 | Substitution is never silent | `routed:` on stderr / dim line in REPL |
 | Failover gets a dirty-tree notice | `continuation_guard` (usher); toml can turn it off |
 | Group `--pick` returns `run: leftover --print /rt @…` | Skills must not `exec` a TUI |
@@ -84,7 +84,7 @@ Probes reuse the vendor login. They must not spawn a Grok ACP session just to re
 
 | Thing | Where | Why it stays frozen |
 |---|---|---|
-| Telegram bot | `transports/telegram.py`, `render.py`, `com.agora.bot.plist` | D7: not the main path. D6 still pending. |
+| Telegram bot | `transports/telegram.py`, `render.py`, `com.leftover.bot.plist` | D7: not the main path. Optional `[telegram]` extra. D6 still pending. |
 | `agora console` | `transports/console.py` | Duplicate of `leftover` REPL |
 | Fork / wrap Grok or Codex TUI | — | D8: vendors do not take PRs; harness is vendor-owned |
 | Reverse proxy / OpenAI-compatible gateway | — | D1: loses the agent loop, ToS risk |
@@ -96,16 +96,16 @@ Probes reuse the vendor login. They must not spawn a Grok ACP session just to re
 
 ## Size (so growth is visible)
 
-Approximate lines, 2026-08-22:
+Approximate lines, 2026-08-23:
 
 | Layer | Files | Lines | Role |
 |---|---|---|---|
-| CLI + intent + score + ui | `leftover` `intent` `score` `ui` | ~1.1k | product |
-| Quota + router + rhythm | `quota` `router` `rhythm` | ~2.3k | pick / fallback |
-| ACP/exec pool | `agents/*` | ~0.7k | harness |
-| Group modes | `orchestrator` `transcript` | ~0.5k | `/rt` `/all` `/debate` `/relay` |
-| Config / doctor | `config` `doctor` | ~0.4k | defaults |
-| Leftover Telegram | `telegram` `render` `console` | ~0.5k | freeze |
-| Tests | `tests/test_*.py` | ~2.0k | contract |
+| CLI + intent + score + ui | `macbot` `intent` `score` `ui` | ~1.8k | product |
+| Quota + router + rhythm | `quota` `router` `rhythm` | ~2.9k | pick / fallback |
+| ACP/exec pool | `agents/*` | ~2.0k | harness |
+| Group modes | `orchestrator` `transcript` | ~0.6k | `/rt` `/all` `/debate` `/relay` |
+| Config / doctor | `config` `doctor` | ~0.5k | defaults |
+| Leftover Telegram | `telegram` `render` `console` | ~0.5k | freeze, optional extra |
+| Tests | `tests/*.py` | ~7.0k | contract |
 
 `quota.py` is the hotspot. New vendor field names belong there plus a parser test, not a new abstraction.
