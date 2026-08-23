@@ -3057,13 +3057,16 @@ async def test_debate_walks_distinct_installed_spares() -> None:
           pool.calls.count(("bad-spare", "FOR")) == 1
           and ("bad-spare", "AGAINST") not in pool.calls,
           str(pool.calls))
+    seats = [(turn.agent.key, turn.meta.get("discussion_role"))
+             for turn in turns]
+    # Which healthy spare lands on which side is a scheduling race between the
+    # two advocate tasks, and it resolves differently before Python 3.12. The
+    # contract is that both sides end up seated on *distinct* healthy spares,
+    # in role order, with the judge last.
     check("fallback continues to distinct healthy spares",
-          [(turn.agent.key, turn.meta.get("discussion_role")) for turn in turns]
-          == [
-              ("good-for", "FOR"),
-              ("good-against", "AGAINST"),
-              ("judge", "JUDGE"),
-          ],
+          [role for _key, role in seats] == ["FOR", "AGAINST", "JUDGE"]
+          and {key for key, _role in seats[:2]} == {"good-for", "good-against"}
+          and seats[2][0] == "judge",
           repr([(turn.agent.key, turn.error) for turn in turns]))
 
 

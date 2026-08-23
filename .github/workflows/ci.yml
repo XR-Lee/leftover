@@ -45,4 +45,4 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install ruff
-      - run: ruff check leftover tests
+      - run: ruff check leftover tests scripts
