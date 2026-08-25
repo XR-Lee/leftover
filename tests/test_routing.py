@@ -769,9 +769,7 @@ async def test_forced_quota_keeps_live_failure() -> None:
         forced = await router.quota_for(spec, force=True)
 
     check("quota/doctor keep the live failure note",
-          forced.note == "Claude usage API HTTP 401"
-          and not any(w.name == "5h" and w.source == q.REPORTED
-                      for w in forced.windows),
+          forced.note == "Claude usage API HTTP 401",
           forced.describe())
     check("ranking still reuses the last reported window",
           any(w.name == "5h" and w.source == q.REPORTED
@@ -1483,7 +1481,16 @@ async def test_acp_long_running_tool_survives_idle_silence() -> None:
                 "status": "in_progress",
             })
             await asyncio.sleep(runner.spec.acp_idle_timeout * 3)
-            await runner._queue.put(acp_mod.Event("text", "tests passed"))
+            await runner._bridge.session_update(session_id, {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "bash-1",
+                "title": "bash",
+                "status": "completed",
+            })
+            await runner._bridge.session_update(session_id, {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"text": "tests passed"},
+            })
             return Result()
 
         async def cancel(self, session_id):
@@ -1504,6 +1511,91 @@ async def test_acp_long_running_tool_survives_idle_silence() -> None:
     check("a quiet in-flight tool survives past the idle boundary",
           turn.ok and turn.text == "tests passed" and turn.tools == ["bash"]
           and elapsed > runner.spec.acp_idle_timeout
+          and turn.meta.get("timeout_kind") is None,
+          f"elapsed={elapsed:.3f}s error={turn.error!r} tools={turn.tools} "
+          f"meta={turn.meta}")
+
+
+async def test_acp_progress_extends_turn_timeout() -> None:
+    print("\n[9c2b] visible ACP progress is not a start-of-turn wall clock")
+    from leftover.agents import acp_runner as acp_mod
+
+    class Result:
+        stop_reason = "end_turn"
+
+    class Connection:
+        async def prompt(self, session_id, prompt):
+            for index in range(4):
+                await runner._queue.put(
+                    acp_mod.Event("text", f"step {index}\n"))
+                await asyncio.sleep(0.05)
+            return Result()
+
+        async def cancel(self, session_id):
+            raise AssertionError("progressing prompt must not hit turn timeout")
+
+    runner = acp_mod.AcpRunner(AgentSpec(
+        key="progress", label="Progress", acp_command=["unused"],
+        timeout=0.08, acp_idle_timeout=0))
+    runner._conn = Connection()
+    runner._session_id = "session"
+    started = asyncio.get_running_loop().time()
+    turn = await runner.run("keep working")
+    elapsed = asyncio.get_running_loop().time() - started
+    check("streamed text slides the turn deadline past the original budget",
+          turn.ok and "step 3" in turn.text
+          and elapsed > runner.spec.timeout
+          and turn.meta.get("timeout_kind") is None,
+          f"elapsed={elapsed:.3f}s error={turn.error!r} text={turn.text!r}")
+
+
+async def test_acp_in_flight_tool_extends_turn_timeout() -> None:
+    print("\n[9c2c] an in-flight tool slides the turn deadline")
+    from leftover.agents import acp_runner as acp_mod
+
+    class Result:
+        stop_reason = "end_turn"
+
+    class Connection:
+        async def prompt(self, session_id, prompt):
+            await runner._bridge.session_update(session_id, {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "bash-1",
+                "title": "bash",
+                "kind": "execute",
+                "status": "in_progress",
+            })
+            await asyncio.sleep(runner.spec.timeout * 3)
+            await runner._bridge.session_update(session_id, {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "bash-1",
+                "title": "bash",
+                "status": "completed",
+            })
+            await runner._bridge.session_update(session_id, {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"text": "suite done"},
+            })
+            return Result()
+
+        async def cancel(self, session_id):
+            raise AssertionError(
+                "in-flight tool must not be cancelled as a turn timeout")
+
+    queue = asyncio.Queue()
+    runner = acp_mod.AcpRunner(AgentSpec(
+        key="long-turn", label="Long turn", acp_command=["unused"],
+        timeout=0.06, acp_idle_timeout=0))
+    runner._queue = queue
+    runner._bridge = acp_mod._Bridge(queue)
+    runner._conn = Connection()
+    runner._session_id = "session"
+    started = asyncio.get_running_loop().time()
+    turn = await runner.run("run a long suite")
+    elapsed = asyncio.get_running_loop().time() - started
+    check("a quiet in-flight tool survives past the original turn budget",
+          turn.ok and turn.text == "suite done" and turn.tools == ["bash"]
+          and elapsed > runner.spec.timeout
           and turn.meta.get("timeout_kind") is None,
           f"elapsed={elapsed:.3f}s error={turn.error!r} tools={turn.tools} "
           f"meta={turn.meta}")
@@ -5492,6 +5584,8 @@ async def main() -> int:
     await test_acp_idle_timeout_cleans_up_silence()
     await test_acp_internal_activity_does_not_extend_idle_deadline()
     await test_acp_long_running_tool_survives_idle_silence()
+    await test_acp_progress_extends_turn_timeout()
+    await test_acp_in_flight_tool_extends_turn_timeout()
     await test_acp_idle_resumes_after_tool_completes()
     await test_agent_pool_start_timeout_is_a_hard_boundary()
     await test_acp_close_is_a_hard_boundary()

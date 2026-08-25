@@ -356,6 +356,40 @@ def test_quota_report_refreshes_agents_in_parallel() -> None:
     assert all(spec.label in report for spec in agents)
 
 
+def test_stream_json_progress_extends_turn_timeout() -> None:
+    async def run() -> None:
+        script = (
+            "import json, sys, time\n"
+            "for index in range(5):\n"
+            "    sys.stdout.write(json.dumps({\n"
+            "        'type': 'agent_message',\n"
+            "        'msg': {'text': f'step {index}'},\n"
+            "    }) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "    time.sleep(0.05)\n"
+        )
+        spec = AgentSpec(
+            key="json-progress",
+            label="JSON progress",
+            transport="exec",
+            exec_command=[sys.executable, "-c", script],
+            exec_output="stream-json",
+            timeout=0.12,
+        )
+        runner = ExecRunner(spec)
+        await runner.start(str(ROOT))
+        started = time.monotonic()
+        turn = await runner.run("prompt")
+        elapsed = time.monotonic() - started
+        assert turn.ok
+        assert "step 4" in turn.text
+        assert turn.meta.get("timeout_kind") is None
+        assert elapsed > spec.timeout
+        assert runner._proc is None
+
+    asyncio.run(run())
+
+
 def test_stream_json_eof_cannot_bypass_turn_timeout() -> None:
     async def run() -> None:
         script = (
@@ -990,6 +1024,7 @@ def main() -> int:
         test_grok_probe_phases_share_one_total_budget,
         test_sub2api_pagination_honors_one_deadline,
         test_quota_report_refreshes_agents_in_parallel,
+        test_stream_json_progress_extends_turn_timeout,
         test_stream_json_eof_cannot_bypass_turn_timeout,
         test_process_tree_signal_falls_back_during_group_startup_race,
         test_process_tree_uses_direct_kill_after_term_timeout,

@@ -6,6 +6,39 @@
 
 ---
 
+## D21 — leftover heavy 的执行形状是 Grok Heavy：并行独立思考 + 并行比较笔记
+
+**2026-08-25 · 生效**
+
+D20 钉死 leftover heavy 是本地多模型协作，不是第二套聊天产品。那一条仍在。D20 写的「顺序发言，Grok 打头」把 Grok Heavy 理解成了圆桌：Grok 先说，别人等着看。那不是 Grok Heavy。
+
+Grok Heavy：多家独立思考（并行，包括 leader），然后比较笔记（并行），leader 给出结论。leftover 的对位：
+
+1. **Independent**：panel 全员并行，看不见彼此。只读：讨论或提出改动，不写文件。
+2. **Compare-notes**：全员看见独立稿。worker 讨论；leader 综合结论。这一轮也并行。写/做的任务只有 leader 动工作区。
+
+Grok 是 leader（未安装则 panel 第一家）。只有一家时仍降成单 worker。`/rt` 仍是顺序圆桌；`/all` 仍是互不见面的广播。
+
+推翻 D20 的「顺序发言」。其余（触发词、单 worker、不是默认 coding）不动。
+
+**不采用：** 把 `/heavy` 收成 `/all`；让所有 worker 并行改同一棵树；第三轮再串行综合（leader 的综合已经在比较笔记那一轮，和讨论同时进行）。
+
+---
+
+## D20 — leftover heavy 是本地多模型协作，不是第二套聊天产品
+
+**2026-08-25 · 生效**（执行形状被 D21 修正）
+
+Grok 会话里的 Heavy：问题讨论式回答，或一起写 / 一起开发。leftover 的对位不是再画一个 pager，也不是默认 `/rt` 烧四家额度。
+
+leftover **heavy** 是同一场父对话里的本地协作：两家（或以上）已登录官方 CLI，Grok 当 leader。只有一家时降成单 worker，不报失败。`/heavy` `--heavy` `/discuss`，以及显式说法（`should we`、`一起写`、`该不该`、问号）。`fix the tests` 仍是 coding。
+
+顺序发言已被 D21 推翻：独立思考和比较笔记都是并行的。
+
+**不采用：** 把默认 coding 改成讨论；fork Grok TUI；用反代把各家拼成一个「统一模型」。
+
+---
+
 ## D19 — leftover 对其他 CLI 的影响可开关；开关面不是第二套聊天 TUI
 
 **2026-08-24 · 生效**

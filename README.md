@@ -2,7 +2,7 @@
 
 # leftover
 
-**Spend leftover Codex / Grok / Cursor quota before the window resets.**
+**Local multi-model collab on the CLIs you already pay for.**
 
 [![ci](https://github.com/XR-Lee/leftover/actions/workflows/ci.yml/badge.svg)](https://github.com/XR-Lee/leftover/actions/workflows/ci.yml)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
@@ -12,26 +12,59 @@
 
 </div>
 
-You pay for several coding subscriptions. Each one meters a window — 5 hours,
-a week, a month — and every window you underuse is money that expires quietly.
+Grok Heavy-style discussion and co-writing, on this Mac. Codex, Grok Build,
+Cursor, Antigravity, and Claude sit in **one leftover conversation**. Not a
+cloud mix. Not a second TUI.
 
 ```
+leftover /heavy should we split the worker
+→ Grok, Claude  (heavy)
+
 leftover "migrate sessions onto JWT"
 leftover · Cursor
 ```
 
-A thin local router: classify a task, pick a logged-in official CLI by
-lag+waste, stay in one parent conversation. Not a second TUI. Not a bot fleet.
+You already pay for several coding subscriptions. Each one meters a window —
+5 hours, a week, a month — and every window you underuse expires quietly.
+leftover spends the one that is rotting. When the work is a question or a
+shared draft, it puts two or more official CLIs in the same parent
+conversation: discuss, then write.
 
-Closest analog is [usher](https://github.com/theodorebeaupre-prog/usher) (launcher → official TUI). leftover does not rewrite that. `--tui` is that path. What usher does not do: official remaining quota, spend the rotting window, roundtable / debate / relay in one conversation.
+Closest analog is [usher](https://github.com/theodorebeaupre-prog/usher)
+(launcher → official TUI). leftover does not rewrite that. `--tui` is that
+path. What usher does not do: remaining quota, lag+waste, and this local
+multi-model collab.
 
 `macbot` is a one-minor-version alias.
+
+## Local multi-model collab
+
+This is leftover **heavy**. Same idea as a Grok Heavy thread — discuss a
+problem, or write and build together — except the speakers are the official
+CLIs already logged in on this machine.
+
+```
+leftover /heavy should we split the worker
+leftover --heavy "一起写 auth 文档"
+you> /heavy 该不该上 JWT
+you> should we extract a worker?
+```
+
+Two or more installed CLIs think independently in parallel, then compare
+notes in parallel. Grok is the leader when it is installed and synthesizes
+the conclusion; only the leader writes the working directory. One CLI still
+works: leftover degrades to a single heavy worker instead of failing.
+
+Questions and collab phrases (`should we`, `一起写`, `该不该`, a `?`) route
+here. `fix the tests` stays coding. `/rt` `/debate` `/relay` `/all` stay
+the sharper group tools.
 
 ## Rules
 
 | Task | Who |
 |---|---|
 | Default coding | Highest lag+waste among `codex`, `grok`, `cursor-agent --model grok-4.6`, `agy --model gemini-3.1-pro-high`. A successful in-process coding session stays on its backend; independent commands re-rank. |
+| `/heavy` or `should we` / `一起写` / `?` | Local collab. Grok leads; independent takes and compare-notes run in parallel. One CLI is enough. |
 | `/plan` | Claude first. Coding pool if Claude is out. |
 | `/cu` or “computer use / 点界面” | Codex CLI only. |
 | `@codex` `@grok` `@cursor` `@antigravity` `@claude` | Named beat scores. |
@@ -67,7 +100,7 @@ are subagents it spawns.
 cd your-repo
 leftover
 you> swap session for JWT, keep tests green
-you> /plan should we split the worker
+you> /heavy should we split the worker
 you> /cu click through signup
 you> /quit
 ```
@@ -75,6 +108,7 @@ you> /quit
 | Command | What |
 |---|---|
 | (type) | coding, pick, continue in this conversation |
+| `/heavy …` | local multi-model collab: parallel independent takes, then parallel compare-notes |
 | `/plan …` | Claude plans |
 | `/cu …` | Codex computer use |
 | `/rt …` | roundtable |
@@ -112,7 +146,7 @@ chat product.
 ## Runtime guarantees
 
 - ACP is preferred when available. Cursor and Codex keep their native ACP runner and session across explicit turns; exec is only a startup fallback or an explicit override.
-- A full-turn or ACP-idle timeout ends that request and is never replayed on another backend. Idle hang detection pauses while a tool is in-flight (a quiet `pytest` is work, not a hang) and resumes when that tool completes. Fast startup, authentication, quota, and transient failures may still follow the configured fallback chain.
+- A full-turn or ACP-idle timeout ends that request and is never replayed on another backend. The turn deadline is silence since the last visible update or in-flight tool, not a wall clock from start. Idle hang detection pauses while a tool is in-flight (a quiet `pytest` is work, not a hang) and resumes when that tool completes. Fast startup, authentication, quota, and transient failures may still follow the configured fallback chain.
 - Quiet `--print` routes report route/attempt/tool progress and a 30-second heartbeat on stderr. Stdout remains answer-only.
 - Skill handoffs wait on the returned process handle; they never defer the next check from a model-generated duration estimate. If an exec leader exits while descendants retain its pipes, leftover reaps that process group and returns the captured answer immediately.
 - `/all` workers and `/debate` advocates run in parallel, but each completed answer is emitted as one grouped block. Debate roles and event delivery have finite deadlines.

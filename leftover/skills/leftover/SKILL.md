@@ -37,7 +37,7 @@ If `leftover` is not on PATH, try `macbot --pick --json --agent "$LEFTOVER_SELF"
 
 - `run` is null: report `reason` and stop. The requested route is unavailable.
 - `kind` is `computer_use` and `run` is present: hand off to Codex CLI (`gpt`) via `run` below. If you already *are* Codex, do the work with computer-use tools on this Mac. Do not send computer use to `grok`, `claude`, or `cursor-agent`.
-- `kind` is `roundtable`, `broadcast`, `debate`, or `relay` and `run` is present: this is a leftover group run, not a task for one worker. Show `announce`, execute `run`, wait for every turn, and give the human its stdout. Do this even when an individual `agent` would otherwise match you.
+- `kind` is `roundtable`, `broadcast`, `debate`, `relay`, or `heavy` and `run` is present: this is a leftover group run (or a single heavy worker if only one CLI is installed), not a silent switch of voice. Show `announce`, execute `run`, wait for every turn, and give the human its stdout. Do this even when an individual `agent` would otherwise match you.
 - `agent` is null: report `reason` and stop.
 - `agent` matches you (`gpt` if you are Codex, etc.): **do the work yourself**. Do not spawn another copy of yourself. Do not run `leftover --print`.
 - `agent` is someone else: show `announce`, then run the `run` argv from the JSON (headless). Wait for it to finish. Give the human the stdout. If stderr has a `routed:` line, mention that quietly. **Do not exec `spawn`** — that is a TUI and the answer will not come back to this chat.
@@ -71,6 +71,7 @@ reconstruct `leftover --print` after a handoff handle has already been returned.
 
 - `/plan …` or "先出方案" → Claude first.
 - `/cu` or "computer use" / "点界面" → Codex CLI (computer use on this Mac).
+- `/heavy`, `/discuss`, "should we", "一起写", "该不该", or a `?` → leftover heavy: local multi-model collab. Grok is the leader. Independent takes and compare-notes run in parallel.
 - `/rt`, `/all`, `/debate`, `/relay`, or multiple `@agent` mentions → run the requested multi-agent panel through leftover.
 - `@codex` `@gpt` `@claude` `@grok` `@cursor` `@antigravity` → that backend first.
 

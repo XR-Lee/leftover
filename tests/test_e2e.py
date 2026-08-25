@@ -105,6 +105,12 @@ async def main() -> int:
                 and p.prompt == "tabs beat spaces")
     ok &= check("light agent sorts last in heavy-first order",
                 orch._heavy_first()[-1].key == "grok")
+    p = orch.parse("/heavy should we split the worker", in_group=True)
+    ok &= check("/heavy is a grok-first collab panel",
+                p is not None and p.mode == "heavy"
+                and p.agents and p.agents[0].key == "grok"
+                and "leftover heavy" in p.meta.get("extra", ""),
+                "" if p is None else f"{[a.key for a in p.agents]} extra={p.meta}")
 
     print("\n[2] single turn, streaming")
     events: list[str] = []
@@ -583,6 +589,96 @@ async def main() -> int:
                 f"started={warm_pool.warm_started}, "
                 f"cancelled={warm_pool.warm_cancelled}, "
                 f"elapsed={warm_elapsed:.3f}s")
+
+    print("\n[5f] heavy independent and compare-notes are both parallel")
+
+    class HeavyPool:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+            self.phase_peak = [0, 0]
+            self.phase_active = [0, 0]
+
+        def peek(self, spec):
+            return None
+
+        async def run(self, spec, prompt, on_event=None):
+            phase = 0 if "cannot see their answers yet" in prompt else 1
+            self.active += 1
+            self.phase_active[phase] += 1
+            self.max_active = max(self.max_active, self.active)
+            self.phase_peak[phase] = max(
+                self.phase_peak[phase], self.phase_active[phase])
+            try:
+                await asyncio.sleep(0.04)
+            finally:
+                self.active -= 1
+                self.phase_active[phase] -= 1
+            return Turn(agent=spec, text=f"{spec.key} take", seconds=0.04)
+
+    heavy_agents = [
+        AgentSpec(key="grok", label="Grok"),
+        AgentSpec(key="claude", label="Claude"),
+        AgentSpec(key="gpt", label="Codex"),
+    ]
+    heavy_cfg = Config(
+        agents=heavy_agents,
+        data_dir=tempfile.mkdtemp(prefix="agora-heavy-test-"),
+        max_parallel=4,
+    )
+    heavy_pool = HeavyPool()
+    heavy_orch = Orchestrator(
+        heavy_cfg, heavy_pool, Router(heavy_cfg, heavy_pool))
+    heavy_turns = await heavy_orch.execute(
+        Plan("heavy", "should we split the worker", heavy_agents, {}), None)
+    ok &= check(
+        "heavy is two parallel rounds: independent then compare-notes",
+        len(heavy_turns) == 6
+        and [t.meta.get("discussion_role") for t in heavy_turns]
+        == ["LEADER", "WORKER", "WORKER", "SYNTHESIS", "DISCUSS", "DISCUSS"]
+        and heavy_pool.phase_peak[0] == 3
+        and heavy_pool.phase_peak[1] == 3,
+        f"roles={[t.meta.get('discussion_role') for t in heavy_turns]} "
+        f"peaks={heavy_pool.phase_peak}")
+
+    class HeavyChunkPool:
+        async def run(self, spec, prompt, on_event=None):
+            await asyncio.sleep(0.12 if spec.key == "grok" else 0.01)
+            return Turn(agent=spec, text=f"{spec.key} take")
+
+    heavy_chunk_agents = [
+        AgentSpec(key="grok", label="Grok"),
+        AgentSpec(key="claude", label="Claude"),
+    ]
+    heavy_chunk_cfg = Config(
+        agents=heavy_chunk_agents,
+        data_dir=tempfile.mkdtemp(prefix="agora-heavy-output-test-"),
+    )
+    heavy_chunk_pool = HeavyChunkPool()
+    heavy_chunk_orch = Orchestrator(
+        heavy_chunk_cfg, heavy_chunk_pool,
+        Router(heavy_chunk_cfg, heavy_chunk_pool))
+    heavy_emitted: list[tuple[str, str]] = []
+    heavy_first_after: list[float] = []
+    heavy_started = asyncio.get_running_loop().time()
+
+    async def heavy_sink(spec):
+        async def on_event(ev):
+            if not heavy_emitted:
+                heavy_first_after.append(
+                    asyncio.get_running_loop().time() - heavy_started)
+            heavy_emitted.append((spec.key, ev.kind))
+        return on_event
+
+    heavy_chunk_turns = await heavy_chunk_orch.execute(
+        Plan("heavy", "topic", heavy_chunk_agents, {}), heavy_sink)
+    ok &= check("heavy return value keeps leader then worker slot order",
+                [turn.agent.key for turn in heavy_chunk_turns[:2]]
+                == ["grok", "claude"])
+    ok &= check("fast heavy worker emits before the slow leader finishes",
+                heavy_emitted[:2] == [("claude", "text"), ("claude", "done")]
+                and bool(heavy_first_after) and heavy_first_after[0] < 0.06,
+                f"events={heavy_emitted}, delay={heavy_first_after}")
 
     orch.transcript.clear()
     plan = orch.parse("/relay add a healthcheck endpoint", in_group=True)

@@ -367,7 +367,8 @@ class BaseRunner:
 
     async def run(self, prompt: str, on_event: OnEvent | None = None) -> Turn:
         started = time.monotonic()
-        deadline = started + max(float(self.spec.timeout), 0.0)
+        budget = max(float(self.spec.timeout), 0.0)
+        deadline = started + budget
         turn = Turn(agent=self.spec)
         chunks: list[str] = []
         timeout_kind = ""
@@ -378,6 +379,7 @@ class BaseRunner:
                 async with contextlib.aclosing(
                         self.stream(prompt, on_event)) as stream:
                     async for ev in stream:
+                        deadline = time.monotonic() + budget
                         if not context.settled:
                             if ev.kind == "text":
                                 chunks.append(ev.text)
@@ -390,7 +392,7 @@ class BaseRunner:
                                 await _deliver_event(
                                     on_event, ev,
                                     deadline - time.monotonic(),
-                                    float(self.spec.timeout))
+                                    budget)
                             except EventSinkTimeout as exc:
                                 self._settle_active_turn(
                                     error=str(exc), timeout_kind="sink")

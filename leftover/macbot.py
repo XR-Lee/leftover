@@ -62,15 +62,16 @@ task: {prompt}
 STATE_NAME = "leftover-state.json"
 STATE_LOCK_TIMEOUT = 5.0
 _STATE_MAP_KEYS = frozenset({"sticky", "health", "quota"})
-DISCUSS = {"roundtable", "broadcast", "debate", "relay"}
+DISCUSS = {"roundtable", "broadcast", "debate", "relay", "heavy"}
 DISCUSS_COMMANDS = {
     "roundtable": "/rt",
     "broadcast": "/all",
     "debate": "/debate",
     "relay": "/relay",
+    "heavy": "/heavy",
 }
 
-BANNER = "leftover  ·  /plan /cu /quota /scope /cd /reset /quit"
+BANNER = "leftover  ·  /heavy /plan /cu /quota /scope /cd /reset /quit"
 PROGRESS_HEARTBEAT_SECONDS = 30.0
 PROGRESS_ACTIVITY_SECONDS = 1.5
 
@@ -87,6 +88,15 @@ PLAN_ONLY = (
     "Do not edit files or run mutating commands. Do not run leftover. "
     "List files to touch and the change for each. Report the plan back "
     "to leftover."
+)
+HEAVY = (
+    "You are leftover heavy: Grok-Heavy-shaped local collab on this Mac. "
+    "If this is a question or a decision, discuss: tradeoffs, then a "
+    "recommendation. Do not edit files unless the human is clearly writing "
+    "or building with you. "
+    "If this is collaborative writing or development, make the change in "
+    "the working directory and explain it. "
+    "Do not run leftover."
 )
 
 
@@ -684,6 +694,8 @@ def run_argv(spec: AgentSpec, prompt: str, *, kind: str = "coding") -> list[str]
         argv.append("--plan")
     elif kind == "computer_use":
         argv.append("--cu")
+    elif kind == "heavy":
+        argv.append("--heavy")
     if prompt.strip():
         argv.append(prompt)
     return argv
@@ -696,7 +708,8 @@ def discussion_argv(kind: str, prompt: str, chain: list[str]) -> list[str]:
     return ["leftover", "--print", task]
 
 
-def prepare_task(text: str, *, plan: bool = False, cu: bool = False) -> str:
+def prepare_task(text: str, *, plan: bool = False, cu: bool = False,
+                 heavy: bool = False) -> str:
     text = text.strip()
     command = text.split(maxsplit=1)[0].lower() if text else ""
     if plan and text and command not in intent_mod.PLAN_PREFIXES:
@@ -704,6 +717,9 @@ def prepare_task(text: str, *, plan: bool = False, cu: bool = False) -> str:
         command = "/plan"
     if cu and text and command not in intent_mod.CU_PREFIXES:
         text = "/cu " + text
+        command = "/cu"
+    if heavy and text and command not in intent_mod.HEAVY_PREFIXES:
+        text = "/heavy " + text
     return text
 
 
@@ -768,19 +784,28 @@ async def decide(cfg: Config, parsed: intent_mod.Intent, cwd: str,
                         parsed.kind, parsed.prompt)
         from .orchestrator import Orchestrator
         orch = Orchestrator(cfg, _NullPool(), router)
-        panel = (orch.debate_panel(parsed.named_all)
-                 if parsed.kind == "debate"
-                 else orch.discussion_panel(parsed.named_all))
+        if parsed.kind == "debate":
+            panel = orch.debate_panel(parsed.named_all)
+        elif parsed.kind == "heavy":
+            panel = orch.heavy_panel(parsed.named_all)
+        else:
+            panel = orch.discussion_panel(parsed.named_all)
         if parsed.kind == "relay":
             panel = panel[:3]
+        if parsed.kind == "heavy" and len(panel) == 1:
+            return Pick(panel[0], [panel[0].key], {},
+                        "heavy → one installed CLI",
+                        parsed.kind, parsed.prompt)
         minimum = 3 if parsed.kind in {"debate", "relay"} else 2
         if len(panel) < minimum:
             return Pick(None, [spec.key for spec in panel], {},
                         f"{parsed.kind} needs at least {minimum} installed CLIs",
                         parsed.kind, parsed.prompt,
                         labels=[spec.label for spec in panel])
+        reason = (f"heavy → {cfg.routing.heavy_key} first"
+                  if parsed.kind == "heavy" else f"{parsed.kind} panel")
         return Pick(None, [spec.key for spec in panel], {},
-                    f"{parsed.kind} panel",
+                    reason,
                     parsed.kind, parsed.prompt,
                     labels=[spec.label for spec in panel])
 
@@ -913,7 +938,13 @@ def _compose(spec: AgentSpec, prompt: str, transcript: Transcript,
     """
     if followup:
         return prompt
-    parts: list[str] = [PLAN_ONLY if kind == "plan" else WORK]
+    if kind == "plan":
+        boot = PLAN_ONLY
+    elif kind == "heavy":
+        boot = HEAVY
+    else:
+        boot = WORK
+    parts: list[str] = [boot]
     if spec.persona.strip():
         parts.append(spec.persona.strip())
     history = transcript.render()
@@ -985,8 +1016,8 @@ async def _speak(cfg: Config, router: Router, transcript: Transcript,
 async def _discuss(cfg: Config, router: Router, transcript: Transcript,
                    parsed: intent_mod.Intent, *,
                    heartbeat_seconds: float | None = None) -> bool:
-    """Heterogeneous subagents, each seeing the others."""
-    from .orchestrator import Orchestrator, Plan, summarise
+    """Grok-Heavy panel: independent parallel takes, then compare-notes."""
+    from .orchestrator import Orchestrator, Plan, summarise, _HEAVY_EXTRA
 
     orch = Orchestrator(cfg, router.pool, router)
     orch.transcript = transcript
@@ -996,19 +1027,31 @@ async def _discuss(cfg: Config, router: Router, transcript: Transcript,
         labels = ", ".join(f"@{token}" for token in unknown)
         sys.stdout.write(ui.err(f"  unknown agent {labels}") + "\n")
         return False
-    panel = (orch.debate_panel(names) if parsed.kind == "debate"
-             else orch.discussion_panel(names))
+    if parsed.kind == "debate":
+        panel = orch.debate_panel(names)
+    elif parsed.kind == "heavy":
+        panel = orch.heavy_panel(names)
+    else:
+        panel = orch.discussion_panel(names)
     if parsed.kind == "broadcast":
         mode, agents = "broadcast", panel
     elif parsed.kind == "debate":
         mode, agents = "debate", panel[:3]
     elif parsed.kind == "relay":
         mode, agents = "relay", panel[:3]
+    elif parsed.kind == "heavy":
+        mode, agents = "heavy", panel
     else:
         mode, agents = "roundtable", panel
     if not parsed.prompt.strip():
         sys.stdout.write(ui.err("  need a topic") + "\n")
         return False
+    if parsed.kind == "heavy" and len(agents) == 1:
+        pick = Pick(agents[0], [agents[0].key], {},
+                    "heavy → one installed CLI", "heavy", parsed.prompt)
+        await _speak(cfg, router, orch.transcript, pick, parsed.prompt,
+                     heartbeat_seconds=heartbeat_seconds)
+        return True
     minimum = 3 if mode in {"debate", "relay"} else 2
     if len(agents) < minimum:
         sys.stdout.write(ui.err(
@@ -1020,11 +1063,17 @@ async def _discuss(cfg: Config, router: Router, transcript: Transcript,
     async def sink(spec: AgentSpec):
         return ui.StreamSink(spec.label, out=sys.stdout)
 
+    meta: dict[str, str] = {}
+    if mode == "debate":
+        meta["rounds"] = str(cfg.debate_rounds)
+    if parsed.kind == "heavy":
+        meta["extra"] = _HEAVY_EXTRA
     async with _Progress(
             f"{mode} panel", heartbeat_seconds=heartbeat_seconds) as progress:
-        turns = await orch.execute(Plan(mode, parsed.prompt, agents, {
-            "rounds": str(cfg.debate_rounds)} if mode == "debate" else {}),
-            progress.sink(sink, announce_attempt=mode != "debate"))
+        turns = await orch.execute(
+            Plan(mode, parsed.prompt, agents, meta),
+            progress.sink(
+                sink, announce_attempt=mode not in {"debate", "heavy"}))
     sys.stdout.write(ui.dim(f"  {summarise(turns)}") + "\n\n")
     persist_health(cfg, router, load_state(cfg))
     return bool(turns) and all(
@@ -1033,7 +1082,7 @@ async def _discuss(cfg: Config, router: Router, transcript: Transcript,
 
 async def run_discuss(cfg: Config, parsed: intent_mod.Intent, *,
                       heartbeat_seconds: float | None = None) -> int:
-    """Headless group execution for `--print /rt|/all|/debate|/relay`."""
+    """Headless group execution for `--print /heavy|/rt|/all|/debate|/relay`."""
     from .agents import AgentPool
     cfg.routing.strategy = "lag_waste"
     pool = AgentPool(cfg)
@@ -1057,7 +1106,21 @@ async def chat(cfg: Config, first: str = "") -> int:
     router = Router(cfg, pool)
     restore_health(router, load_state(cfg))
     transcript = Transcript(keep=cfg.transcript_turns)
-    ui.setup_readline(Path(cfg.data_dir) / "history")
+    mentions = ui.mention_tokens(cfg.agents)
+    scope_names: list[str] = []
+    seen_scope: set[str] = set()
+    for agent in cfg.agents:
+        if not agent.enabled:
+            continue
+        for raw in (agent.key, *agent.aliases):
+            name = str(raw).lstrip("@")
+            if name.lower() in seen_scope:
+                continue
+            seen_scope.add(name.lower())
+            scope_names.append(name)
+    ui.setup_readline(
+        Path(cfg.data_dir) / "history",
+        mentions=mentions, scope_names=scope_names)
     folder = Path(pool.workdir).name or pool.workdir
     print(ui.bold("leftover") + ui.dim(f"  {folder}"))
     on = [a.label for a in cfg.agents if a.enabled and a.installed]
@@ -1067,7 +1130,7 @@ async def chat(cfg: Config, first: str = "") -> int:
         roster += ui.dim("  off: " + " · ".join(off))
     print(ui.dim("  ") + roster)
     print(scope_mod.doctor_line())
-    print(ui.dim("  /plan /cu /rt /debate /relay   /quota /scope /cd /quit") + "\n")
+    print(ui.dim(f"  {ui.REPL_HINT}") + "\n")
     loop = asyncio.get_running_loop()
 
     async def handle(line: str) -> bool:
@@ -1077,8 +1140,9 @@ async def chat(cfg: Config, first: str = "") -> int:
         if raw in ("/quit", "/exit"):
             return False
         if raw in ("/help", "?"):
-            print(ui.dim("  task  /plan  /cu  /rt  /debate  /relay  /all"))
+            print(ui.dim("  task  /heavy  /plan  /cu  /rt  /debate  /relay  /all"))
             print(ui.dim("  @name  @claude @gpt …  /quota /scope /cd /reset /quit"))
+            print(ui.dim("  tab completes those; /cd completes paths"))
             return True
         if raw == "/scope" or raw.startswith("/scope "):
             try:
@@ -1317,7 +1381,8 @@ def _parse_argv(argv: list[str] | None) -> argparse.Namespace:
     if argv and argv[0] in commands:
         ns = argparse.Namespace(
             command=argv[0], prompt=[], config=None, pick=False, headless=False,
-            dry_run=False, why=False, plan=False, cu=False, agent=None,
+            dry_run=False, why=False, plan=False, cu=False, heavy=False,
+            agent=None,
             use=None, json=False, tui=False, timeout=None, show_help=False)
         rest = argv[1:]
         i = 0
@@ -1352,6 +1417,8 @@ def _parse_argv(argv: list[str] | None) -> argparse.Namespace:
                    help="print the lag+waste table and stop (usher-shaped)")
     p.add_argument("--plan", action="store_true")
     p.add_argument("--cu", action="store_true")
+    p.add_argument("--heavy", action="store_true",
+                   help="local multi-model collab: discuss, or write/build together")
     p.add_argument("--agent", default=None,
                    help="caller identity (who is asking). Does not force routing")
     p.add_argument("--use", default=None,
@@ -1407,7 +1474,8 @@ def main(argv: list[str] | None = None) -> int:
         persist_health(cfg, router, load_state(cfg))
         return 0
 
-    text = prepare_task(" ".join(args.prompt), plan=args.plan, cu=args.cu)
+    text = prepare_task(" ".join(args.prompt), plan=args.plan, cu=args.cu,
+                        heavy=getattr(args, "heavy", False))
 
     dump_pick = (
         (args.json and not args.headless)

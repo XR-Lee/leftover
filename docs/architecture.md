@@ -27,7 +27,7 @@ human / Warp / Cursor / Claude / Grok skill
         |
         +-- intent.kind
         |     coding | plan | computer_use
-        |     roundtable | broadcast | debate | relay
+        |     roundtable | broadcast | debate | relay | heavy
         |
         +-- Router.rank  (lag_waste on coding pool)
         |     + quota probes (vendor login, read-only)
@@ -77,7 +77,7 @@ Config search order: `~/.config/leftover/leftover.toml`, `~/.config/macbot/macbo
 
 | Field | Meaning |
 |---|---|
-| `kind` | `coding` `plan` `computer_use` `roundtable` `broadcast` `debate` `relay` |
+| `kind` | `coding` `plan` `computer_use` `heavy` `roundtable` `broadcast` `debate` `relay` |
 | `agent` | chosen key, or null for a group panel |
 | `agents` | group panel keys |
 | `announce` | the one line the human should see (`leftover · Cursor`) |
@@ -113,7 +113,7 @@ launch a duplicate.
 1. `intent.parse` — tags beat scoring; `@any` is unnamed.
 2. `decide` forces `strategy = lag_waste`. Only an unnamed coding follow-up
    with process-local success provenance and a live session is sticky.
-3. Group modes build a panel (`discussion_panel` / `debate_panel`) and stop. They do not pick one agent.
+3. Group modes build a panel (`discussion_panel` / `debate_panel` / `heavy_panel`) and stop. They do not pick one agent. Heavy is two parallel rounds (independent, then compare-notes), not a sequential roundtable.
 4. `Router.run` walks `ordered_chain` (the pick), skipping benched keys. It does not re-inject per-agent `fallback` when the chain is pinned.
 5. `observe` classifies error **and** short result text. Quota refusal benches until `resets_at` or `quota_blind_cooldown`.
 6. REPL follow-up on a live ACP session sends the bare user line. First turn on a new session gets WORK/PLAN_ONLY plus trimmed leftover history.
@@ -171,8 +171,13 @@ hold `asyncio.run()` teardown open.
 
 Timeouts remain distinct: queue wait, task deadline, ACP visible-progress idle
 deadline, event-sink delivery, and cleanup grace each have their own boundary.
-Protocol activity without visible thought, plan/status, tool, or text output
-does not extend the ACP idle deadline. Turn, idle, and event-sink timeouts
+The turn deadline is silence since the last visible update or in-flight tool,
+not a wall clock from start, so a busy long job is not cut at 900s. Protocol
+activity without visible thought, plan/status, tool, or text output
+does not extend the ACP idle deadline or the turn deadline. Idle pauses while
+a tool is in-flight
+and restarts when the last one completes, so a quiet execute is not a hang.
+Turn, idle, and event-sink timeouts
 become visible to the parent before ACP abort cleanup; shutdown also owns
 direct prepare/startup tasks so a warmup cannot retain the pool's read gate
 unnoticed.

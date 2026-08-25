@@ -7,6 +7,8 @@ broadcast   every agent answers the same question in parallel
 roundtable  agents answer in sequence, each reading the previous answers
 debate      two agents argue assigned sides for N rounds, a third judges
 relay       plan -> implement -> review pipeline for actual heavy work
+heavy       Grok-Heavy-shaped local collab: independent parallel takes,
+            then parallel compare-notes (workers discuss, leader synthesizes)
 """
 from __future__ import annotations
 
@@ -32,6 +34,43 @@ _GROUP_FRAME = (
     "Address the human. Do not impersonate the others. Add something they "
     "did not say, or disagree with a reason. Keep it tight unless the task "
     "needs depth or you are implementing."
+)
+
+_HEAVY_EXTRA = (
+    "This is leftover heavy: Grok-Heavy-shaped local collab on this Mac.\n"
+    "If the human is asking a question or weighing options: discuss. "
+    "Tradeoffs first. Do not silently rewrite the repo.\n"
+    "If the human is writing or building: make the smallest change that "
+    "moves the work and explain it."
+)
+
+_HEAVY_INDEPENDENT = (
+    "This is leftover heavy: Grok-Heavy-shaped local collab.\n"
+    "You are working independently in parallel with the other subagents. "
+    "You cannot see their answers yet; do not wait for them.\n"
+    "If this is a question or decision: take a position. Tradeoffs first. "
+    "Do not edit files.\n"
+    "If this is writing or building: propose the smallest change that would "
+    "move the work. Do not edit files yet — the leader implements after "
+    "comparing notes."
+)
+
+_HEAVY_DISCUSS = (
+    "Independent takes are in. This is the compare-notes round; everyone "
+    "is writing in parallel from those takes, so do not wait for peers.\n"
+    "Add what others missed or disagree with a reason. Do not repeat your "
+    "independent take. Do not edit files. The leader is synthesizing the "
+    "conclusion in parallel from the same independent takes."
+)
+
+_HEAVY_SYNTHESIS = (
+    "You are the leader. Independent takes are in. The others are comparing "
+    "notes in parallel from the same takes; do not wait for them.\n"
+    "Compare the independent takes, resolve conflicts, and give the practical "
+    "conclusion.\n"
+    "If this is a question or decision: the recommendation and why.\n"
+    "If this is writing or building: make the change in the working directory "
+    "now."
 )
 
 _DEBATE_RULES = (
@@ -135,6 +174,9 @@ class Orchestrator:
                     "rounds": str(self.config.debate_rounds)})
             if cmd in ("relay", "job", "build"):
                 return Plan("relay", rest, self._heavy_first()[:3], {})
+            if cmd in ("heavy", "discuss"):
+                return Plan("heavy", rest, self.heavy_panel(), {
+                    "extra": _HEAVY_EXTRA})
             return None
 
         tokens = MENTION_RE.findall(text)
@@ -185,6 +227,22 @@ class Orchestrator:
             seen.add(key)
             spec = self.config.find(key)
             if spec is not None and spec.installed:
+                found.append(spec)
+        return found
+
+    def heavy_panel(self, names: list[str] | None = None) -> list[AgentSpec]:
+        """Grok as leader, then the planner, then the coding pool."""
+        if names:
+            return self.discussion_panel(names)
+        keys: list[str] = []
+        for key in (self.config.routing.heavy_key, self.config.routing.plan_key,
+                    *self.config.routing.coding_keys):
+            if key and key not in keys:
+                keys.append(key)
+        found: list[AgentSpec] = []
+        for key in keys:
+            spec = self.config.find(key)
+            if spec is not None and spec.installed and spec not in found:
                 found.append(spec)
         return found
 
@@ -242,6 +300,7 @@ class Orchestrator:
         runner = {
             "ask": self._run_sequence,
             "roundtable": self._run_sequence,
+            "heavy": self._run_heavy,
             "broadcast": self._run_parallel,
             "debate": self._run_debate,
             "relay": self._run_relay,
@@ -309,11 +368,13 @@ class Orchestrator:
     async def _run_sequence(self, plan: Plan, sink: TurnSink | None) -> list[Turn]:
         turns: list[Turn] = []
         attempts = None if plan.mode == "ask" else 2
+        extra = plan.meta.get("extra", "")
         for spec in (plan.agents or [None]):
             floor = list(turns)
             turns.append(await self._speak(
                 spec,
-                lambda s, f=floor: self._compose(s, plan.prompt, floor=f),
+                lambda s, f=floor, e=extra: self._compose(
+                    s, plan.prompt, extra=e, floor=f),
                 sink,
                 exclude={t.agent.key for t in turns if t.agent},
                 attempts=attempts,
@@ -556,6 +617,138 @@ class Orchestrator:
             round_no = turn.meta.get("discussion_round")
             suffix = f" {role} R{round_no}" if round_no else f" {role}"
             self.transcript.add(f"{turn.agent.label} [{suffix.strip()}]", turn.text)
+        return turns
+
+    async def _run_heavy(self, plan: Plan, sink: TurnSink | None) -> list[Turn]:
+        """Independent parallel takes, then parallel compare-notes.
+
+        Workers discuss while the leader synthesizes from the independent
+        takes. Neither round waits on a peer in the same round. Only the
+        leader may edit the working directory, and only in synthesis.
+        """
+        if len(plan.agents) < 2:
+            return await self._run_sequence(plan, sink)
+
+        seats = list(plan.agents)
+        reserved = {agent.key for agent in plan.agents}
+        history = self.transcript.render(
+            exclude_last=True, limit=self.config.transcript_turns)
+        warm = getattr(self.pool, "prepare", None)
+        warm_tasks = [asyncio.create_task(warm(spec)) for spec in plan.agents] \
+            if callable(warm) else []
+        delivery = _DeliveryBudget(self.config.routing.event_sink_timeout)
+        sem = asyncio.Semaphore(max(1, int(self.config.max_parallel)))
+        leader_label = seats[0].label
+        turns: list[Turn] = []
+
+        def extra_for(role: str) -> str:
+            if role == "LEADER":
+                return (f"You are the leader ({leader_label}). "
+                        f"{_HEAVY_INDEPENDENT}")
+            if role == "WORKER":
+                return (f"You are a worker. The leader is {leader_label}. "
+                        f"{_HEAVY_INDEPENDENT}")
+            if role == "DISCUSS":
+                return f"The leader is {leader_label}. {_HEAVY_DISCUSS}"
+            return _HEAVY_SYNTHESIS
+
+        def builder(role: str, floor: list[Turn]):
+            extra = extra_for(role)
+            include_persona = role == "SYNTHESIS"
+            return lambda spec, e=extra, f=floor, p=include_persona: (
+                self._compose(
+                    spec, plan.prompt, e, f, history=history,
+                    include_persona=p))
+
+        async def invoke(spec: AgentSpec, prompt_builder) -> Turn:
+            async with sem:
+                return await self._speak(
+                    spec, prompt_builder, None, attempts=1, record=False,
+                    ordered_chain=[spec])
+
+        def spare(blocked: set[str], attempted: set[str]) -> AgentSpec | None:
+            for spec in self.config.enabled_agents():
+                if (spec.key not in blocked and spec.key not in attempted
+                        and spec.installed and self.router.h(spec).usable):
+                    return spec
+            return None
+
+        async def parallel_round(
+            entries: list[tuple[int, AgentSpec, str]],
+            floor: list[Turn],
+            round_no: int,
+        ) -> list[Turn]:
+            round_reserved = reserved | {spec.key for _, spec, _ in entries}
+            attempted_spares: set[str] = set()
+            fallback_lock = asyncio.Lock()
+
+            async def resolve(index: int, seat: int, spec: AgentSpec,
+                              role: str) -> tuple[int, int, Turn]:
+                prompt_builder = builder(role, floor)
+                turn = await invoke(spec, prompt_builder)
+                if not turn.ok and not self.router._terminal_turn(turn):
+                    while (not turn.ok
+                           and not self.router._terminal_turn(turn)):
+                        async with fallback_lock:
+                            replacement = spare(
+                                round_reserved, attempted_spares)
+                            if replacement is not None:
+                                attempted_spares.add(replacement.key)
+                        if replacement is None:
+                            break
+                        turn = await invoke(replacement, prompt_builder)
+                turn.meta = dict(turn.meta)
+                turn.meta.update(
+                    discussion_role=role, discussion_round=round_no)
+                return index, seat, turn
+
+            slots: list[Turn | None] = [None] * len(entries)
+            tasks = [
+                asyncio.create_task(resolve(index, seat, spec, role))
+                for index, (seat, spec, role) in enumerate(entries)
+            ]
+            try:
+                for completed in asyncio.as_completed(tasks):
+                    index, seat, turn = await completed
+                    slots[index] = turn
+                    if turn.ok:
+                        seats[seat] = turn.agent
+                        reserved.add(turn.agent.key)
+                    await self._emit_turn(turn, sink, delivery)
+            except BaseException:
+                await _cancel_and_drain(tasks)
+                raise
+            return [turn for turn in slots if turn is not None]
+
+        try:
+            independent = await parallel_round(
+                [(i, spec, "LEADER" if i == 0 else "WORKER")
+                 for i, spec in enumerate(seats)],
+                [],
+                1,
+            )
+            turns.extend(independent)
+            if any(turn.ok for turn in independent):
+                leader_label = seats[0].label
+                compared = await parallel_round(
+                    [(0, seats[0], "SYNTHESIS"),
+                     *[(i, spec, "DISCUSS")
+                       for i, spec in enumerate(seats) if i != 0]],
+                    independent,
+                    2,
+                )
+                turns.extend(compared)
+        finally:
+            await _cancel_and_drain(warm_tasks)
+
+        for turn in turns:
+            if not turn.ok:
+                continue
+            role = str(turn.meta.get("discussion_role", "heavy")).lower()
+            round_no = turn.meta.get("discussion_round")
+            suffix = f" {role} R{round_no}" if round_no else f" {role}"
+            self.transcript.add(
+                f"{turn.agent.label} [{suffix.strip()}]", turn.text)
         return turns
 
     async def _run_relay(self, plan: Plan, sink: TurnSink | None) -> list[Turn]:

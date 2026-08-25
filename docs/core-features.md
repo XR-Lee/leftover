@@ -18,11 +18,11 @@ It does not draw a pager, sandbox, diff viewer, or subagent tree. Those stay ins
 
 | Feature | How it is invoked | Owner | Tests |
 |---|---|---|---|
-| Parent REPL | `macbot` then type; optional first argv | `leftover.chat` | compose, pick, group routes |
+| Parent REPL | `macbot` then type; optional first argv | `leftover.chat` | compose, pick, group routes; tab completes `/` `@` `/cd` `/scope` |
 | Headless one-shot | `leftover --print` / `-p "…"` | `run_print` / `run_discuss` | `test_run_print_*`, stdin replay |
 | Headless activity | `--print` stderr while the worker runs | `_Progress` / ACP `plan`+thought | `test_progress_is_visible_*`, plan payloads |
 | Headless JSON | `leftover -p --json "…"` | run envelope | `test_print_json_envelope_and_stdin` |
-| Headless timeout | `leftover -p --timeout 2m "…"` | per-attempt; exit 124 | parse + requires `-p`; long in-flight tool stays 0 (`test_print_long_running_tool_does_not_exit_124`) |
+| Headless timeout | `leftover -p --timeout 2m "…"` | silence since last progress; exit 124 | parse + requires `-p`; busy/in-flight work slides the window (`test_print_long_running_tool_does_not_exit_124`, `test_acp_progress_extends_turn_timeout`) |
 | Skill handoff | `leftover --pick --json --agent $SELF "…"` | `decide`, `Pick.as_dict` | `--agent` vs `--use`, group `run` argv, process-exit completion + parent poll while `--print` lives |
 | Preview | `macbot --dry-run "…"` | `_print_pick` | pick chain |
 | Why table | `macbot --why "…"` | `format_why` | lag/waste + remaining bar; no strength |
@@ -32,6 +32,8 @@ It does not draw a pager, sandbox, diff viewer, or subagent tree. Those stay ins
 | Plan | `/plan` or `--plan` | intent + `plan_key=claude` | `test_pick_plan_and_cu` |
 | Computer use | `/cu` or `--cu` or explicit “点界面” | always Codex (`gpt`) | same + no fallback past Codex |
 | Named backend | `@codex` `@grok` `@cursor` `@antigravity` `@claude` | `intent.named` | intent + `--use` |
+| Heavy collab | `/heavy` `--heavy` `/discuss` or `should we` / `一起写` / `?` | Grok leader; independent + compare-notes in parallel; one CLI ok | `test_pick_heavy_is_local_multi_model_collab`, `test_heavy_is_parallel_leader_and_discuss` |
+| Group: heavy | `/heavy` | `_run_heavy` | parallel independent + compare-notes; e2e + macbot.24b |
 | Group: roundtable | `/rt` or two+ `@` mentions | `orchestrator._run_sequence` | group pick JSON + e2e |
 | Group: broadcast | `/all` | `_run_parallel` | e2e |
 | Group: debate | `/debate` (needs 3 CLIs) | `_run_debate` | `test_debate_is_parallel_and_compact` |
@@ -49,6 +51,7 @@ It does not draw a pager, sandbox, diff viewer, or subagent tree. Those stay ins
 | Rule | Why |
 |---|---|
 | Default task is coding | Claude is not in the lag race |
+| `/heavy` → Grok is leader; independent + compare-notes in parallel | Local collab, not a sequential roundtable |
 | Coding pool = `gpt`, `grok`, `cursor`, `antigravity` | Cursor pinned to `--model grok-4.6`, Antigravity pinned to `--model gemini-3.1-pro-high` — both first-party |
 | Score = `0.5 * lag + 1.0 * waste` | Overdue windows rise; fresh short windows do not starve them |
 | `waste = 0` on `estimated` | Turn budgets must not fake a 5h emergency |
@@ -109,7 +112,7 @@ Approximate lines, 2026-08-23:
 | CLI + intent + score + ui | `macbot` `intent` `score` `ui` | ~1.8k | product |
 | Quota + router + rhythm | `quota` `router` `rhythm` | ~2.9k | pick / fallback |
 | ACP/exec pool | `agents/*` | ~2.0k | harness |
-| Group modes | `orchestrator` `transcript` | ~0.6k | `/rt` `/all` `/debate` `/relay` |
+| Group modes | `orchestrator` `transcript` | ~0.6k | `/heavy` `/rt` `/all` `/debate` `/relay` |
 | Config / doctor | `config` `doctor` | ~0.5k | defaults |
 | Leftover Telegram | `telegram` `render` `console` | ~0.5k | freeze, optional extra |
 | Tests | `tests/*.py` | ~7.0k | contract |

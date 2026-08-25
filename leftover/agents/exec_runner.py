@@ -456,6 +456,8 @@ class ExecRunner(BaseRunner):
         """Consume newline-delimited JSON events (Codex-style `exec --json`)."""
         assert proc.stdout is not None
         residual_group_reaped = False
+        timeout = max(float(self.spec.timeout), 0.0)
+        loop = asyncio.get_running_loop()
         while True:
             line_task = asyncio.create_task(
                 _readline_unbounded(proc.stdout))
@@ -490,6 +492,7 @@ class ExecRunner(BaseRunner):
 
             if not line:
                 break
+            deadline = loop.time() + timeout
             try:
                 evt = json.loads(line)
             except json.JSONDecodeError:

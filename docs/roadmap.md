@@ -21,7 +21,7 @@ A change is on the roadmap only if it deepens one of:
 
 1. **Official remaining** — `quota.py` asks the vendor. Degrade honestly.
 2. **lag+waste** — spend the rotting window, not the “best” model.
-3. **One parent conversation** — ACP REPL, `--print`, `/rt` `/debate` `/relay`.
+3. **One parent conversation** — ACP REPL, `--print`, `/heavy` `/rt` `/debate` `/relay`.
 
 It is off the roadmap if it is a second TUI, a reverse proxy, a hosted
 account, a second chat frontend, a reputation/strength score, or a sixth

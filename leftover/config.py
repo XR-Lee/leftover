@@ -54,6 +54,9 @@ class AgentSpec:
     persona: str = ""
     # "heavy" agents get the long / expensive work, "light" ones get quick takes.
     tier: str = "heavy"
+    # Silence after the last visible update or in-flight tool, not a wall
+    # clock from start. Progress slides the window; a busy 20-minute turn
+    # is fine. Non-streaming exec still uses this as a process-lifetime cap.
     timeout: int = 900
     # Maximum silence between ACP updates. Non-positive disables the idle limit.
     acp_idle_timeout: float = 180.0
@@ -104,6 +107,7 @@ class Routing:
         default_factory=lambda: ["gpt", "grok", "cursor", "antigravity"])
     plan_key: str = "claude"
     cu_key: str = "gpt"
+    heavy_key: str = "grok"
     max_attempts: int = 3            # agents tried before giving up on a turn
     # After a refused attempt, tell the next agent the workspace may be dirty.
     # Same idea as usher's continuation_guard; axis here is still lag+waste.
@@ -194,6 +198,9 @@ class Config:
 
     def cu_agent(self) -> AgentSpec | None:
         return self.find(self.routing.cu_key)
+
+    def heavy_agent(self) -> AgentSpec | None:
+        return self.find(self.routing.heavy_key)
 
 
 # --- built-in defaults -------------------------------------------------------

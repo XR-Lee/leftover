@@ -13,6 +13,7 @@ from typing import TextIO
 KIND_LABELS = {
     "plan": "plan",
     "computer_use": "computer use",
+    "heavy": "heavy",
     "roundtable": "roundtable",
     "broadcast": "broadcast",
     "debate": "debate",
@@ -317,11 +318,136 @@ class StreamSink:
         await self._writer.submit(self, kind, text)
 
 
-def setup_readline(path) -> None:
+REPL_COMMANDS = (
+    "/plan", "/cu", "/computer", "/computer-use",
+    "/heavy", "/discuss",
+    "/rt", "/roundtable", "/all", "/debate", "/relay",
+    "/quota", "/scope", "/cd", "/who", "/reset", "/help", "/quit", "/exit",
+)
+REPL_HINT = "tab  /heavy /plan /cu /rt /debate /relay   /quota /scope /cd /quit"
+SCOPE_WORDS = ("on", "off")
+
+
+def mention_tokens(agents) -> list[str]:
+    """@key and @alias for enabled agents, first-seen order."""
+    seen: set[str] = set()
+    tokens: list[str] = []
+    for agent in agents:
+        if not getattr(agent, "enabled", True):
+            continue
+        for raw in (agent.key, *getattr(agent, "aliases", ())):
+            token = f"@{str(raw).lstrip('@')}"
+            key = token.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            tokens.append(token)
+    return tokens
+
+
+class Completer:
+    """Tab-complete leftover slash commands, @names, /scope, and /cd paths."""
+
+    def __init__(self, commands: tuple[str, ...] | list[str] = REPL_COMMANDS,
+                 mentions: list[str] | None = None,
+                 scope_names: list[str] | None = None) -> None:
+        self.commands = list(commands)
+        self.mentions = list(mentions or [])
+        self.scope_names = list(scope_names or [])
+        self._matches: list[str] = []
+
+    def __call__(self, text: str, state: int) -> str | None:
+        if state == 0:
+            line = ""
+            try:
+                import readline
+                line = readline.get_line_buffer()
+            except Exception:  # noqa: BLE001
+                line = text
+            self._matches = self.matches(text, line)
+        try:
+            return self._matches[state]
+        except IndexError:
+            return None
+
+    def matches(self, text: str, line: str | None = None) -> list[str]:
+        buf = text if line is None else line
+        head = _completion_head(buf)
+        if head == "/cd":
+            return _cd_path_matches(text, buf)
+        if head == "/scope" and not text.startswith("/"):
+            words = [*SCOPE_WORDS, *self.scope_names]
+            return [word for word in words if word.startswith(text)]
+        if text.startswith("@") or (not text and not buf.strip()):
+            names = [name for name in self.mentions if name.startswith(text)]
+            if text.startswith("@"):
+                return names
+            return [word for word in self.commands if word.startswith(text)] + names
+        if not text or text.startswith("/"):
+            return [word for word in self.commands if word.startswith(text)]
+        return []
+
+
+def _completion_head(line: str) -> str:
+    token = line.lstrip().split(maxsplit=1)
+    return token[0] if token else ""
+
+
+def _cd_argument(line: str) -> str:
+    """Path token after `/cd`, including a trailing slash."""
+    parts = line.lstrip().split(maxsplit=1)
+    if not parts or parts[0] != "/cd":
+        return ""
+    return parts[1] if len(parts) > 1 else ""
+
+
+def _cd_path_matches(text: str, line: str) -> list[str]:
+    """Complete `/cd` using the full path, even if readline split on `/`."""
+    path_text = _cd_argument(line) or text
+    matches = _path_matches(path_text)
+    if text == path_text:
+        return matches
+    if path_text.endswith(text):
+        cut = len(path_text) - len(text)
+        return [match[cut:] for match in matches]
+    return matches
+
+
+def _path_matches(text: str) -> list[str]:
+    expanded = os.path.expanduser(text)
+    if text.endswith(("/", "\\")):
+        directory, prefix = expanded, ""
+    else:
+        directory, prefix = os.path.split(expanded)
+    directory = directory or "."
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    matches: list[str] = []
+    for name in sorted(names):
+        if prefix and not name.startswith(prefix):
+            continue
+        if name.startswith(".") and not prefix.startswith("."):
+            continue
+        full = os.path.join(directory, name) if directory != "." else name
+        if text.startswith("~"):
+            home = os.path.expanduser("~")
+            if full == home or full.startswith(home + os.sep):
+                full = "~" + full[len(home):]
+        if os.path.isdir(os.path.join(directory, name)):
+            full = full.rstrip("/\\") + "/"
+        matches.append(full)
+    return matches
+
+
+def setup_readline(path, *, commands=REPL_COMMANDS, mentions=(),
+                   scope_names=()) -> Completer:
+    completer = Completer(commands, list(mentions), list(scope_names))
     try:
         import readline
     except ImportError:
-        return
+        return completer
     path = path.expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -329,6 +455,18 @@ def setup_readline(path) -> None:
     except OSError:
         pass
     readline.set_history_length(500)
+    readline.set_completer(completer)
+    doc = getattr(readline, "__doc__", "") or ""
+    if "libedit" in doc:
+        readline.parse_and_bind("bind ^I rl_complete")
+    else:
+        readline.parse_and_bind("tab: complete")
+    # libedit treats / ~ - as word breaks, so /cd docs/src and @name die
+    # after the first segment. Keep those inside one completion token.
+    delims = readline.get_completer_delims()
+    for ch in "@/~-":
+        delims = delims.replace(ch, "")
+    readline.set_completer_delims(delims)
 
     def _save() -> None:
         try:
@@ -338,3 +476,4 @@ def setup_readline(path) -> None:
 
     import atexit
     atexit.register(_save)
+    return completer

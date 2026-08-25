@@ -51,6 +51,11 @@ def test_compose_followup_is_bare() -> None:
     plan = _compose(spec, "split worker", Transcript(), followup=False, kind="plan")
     check("plan turn forbids edits", "Plan only" in plan)
     check("plan worker must not re-enter macbot", "Do not run leftover" in plan)
+    heavy = _compose(spec, "should we split", Transcript(), followup=False,
+                     kind="heavy")
+    check("heavy first turn is discussion/collab, not dump-and-done",
+          "leftover heavy" in heavy and "Do the work now" not in heavy
+          and "Do not run leftover" in heavy)
 
 
 def test_intent() -> None:
@@ -82,6 +87,100 @@ def test_intent() -> None:
     check(" /computerized is not /computer",
           computerized.kind == "coding"
           and computerized.prompt == "/computerized x")
+    hv = intent_mod.parse("/heavy should we split the worker")
+    check(" /heavy is heavy",
+          hv.kind == "heavy" and hv.prompt == "should we split the worker")
+    disc = intent_mod.parse("/discuss 一起写 README")
+    check(" /discuss is heavy", disc.kind == "heavy" and "README" in disc.prompt)
+    lift = intent_mod.parse("/heavylift x")
+    check(" /heavylift is not /heavy",
+          lift.kind == "coding" and lift.prompt == "/heavylift x")
+    q = intent_mod.parse("should we split the worker?")
+    check(" should we / ? is heavy", q.kind == "heavy")
+    collab = intent_mod.parse("一起写 auth 文档")
+    check(" 一起写 is heavy", collab.kind == "heavy")
+    check(" implement-shaped text stays coding",
+          intent_mod.parse("fix the flaky test").kind == "coding")
+    two_q = intent_mod.parse("@claude @gpt should we use JWTs")
+    check(" two mentions still beat a heavy phrase",
+          two_q.kind == "roundtable")
+
+
+def test_repl_completes_commands_and_mentions() -> None:
+    print("\n[macbot.1b] REPL tab completes leftover chrome, not a pager")
+    agents = [
+        AgentSpec(key="gpt", label="Codex", aliases=["codex"]),
+        AgentSpec(key="cursor", label="Cursor", aliases=["composer"]),
+        AgentSpec(key="claude", label="Claude", enabled=False,
+                  aliases=["cc"]),
+    ]
+    mentions = ui_mod.mention_tokens(agents)
+    check("disabled agents stay off the @ list",
+          mentions == ["@gpt", "@codex", "@cursor", "@composer"],
+          str(mentions))
+    completer = ui_mod.Completer(
+        ui_mod.REPL_COMMANDS, mentions, ["gpt", "codex", "cursor"])
+    check("/p is only /plan",
+          completer.matches("/p", "/p") == ["/plan"],
+          str(completer.matches("/p", "/p")))
+    check("@c lists cursor aliases and @codex, not disabled claude",
+          completer.matches("@c", "@c") == ["@codex", "@cursor", "@composer"],
+          str(completer.matches("@c", "@c")))
+    empty = completer.matches("", "")
+    check("empty tab lists commands and @names",
+          "/plan" in empty and "/quota" in empty and "@gpt" in empty,
+          str(empty[:8]))
+    check("plain words are not stolen",
+          completer.matches("fix", "fix the tests") == [])
+    check("/scope completes verbs and names",
+          completer.matches("o", "/scope o") == ["on", "off"]
+          and completer.matches("c", "/scope on c") == ["codex", "cursor"],
+          str((completer.matches("o", "/scope o"),
+               completer.matches("c", "/scope on c"))))
+    with tempfile.TemporaryDirectory() as tmp:
+        docs = Path(tmp) / "docs"
+        nested = docs / "nested"
+        deep = nested / "deep"
+        deep.mkdir(parents=True)
+        (docs / "notes.md").write_text("x\n")
+        (Path(tmp) / "readme.md").write_text("x\n")
+        here = os.getcwd()
+        try:
+            os.chdir(tmp)
+            paths = completer.matches("d", "/cd d")
+            full = completer.matches("docs/", "/cd docs/")
+            partial = completer.matches("docs/ne", "/cd docs/ne")
+            split = completer.matches("ne", "/cd docs/ne")
+            after_slash = completer.matches("", "/cd docs/")
+            third = completer.matches("docs/nested/", "/cd docs/nested/")
+        finally:
+            os.chdir(here)
+        check("/cd completes directories with a trailing slash",
+              paths == ["docs/"], str(paths))
+        check("/cd lists the next path level after a slash",
+              full == ["docs/nested/", "docs/notes.md"], str(full))
+        check("/cd completes a nested prefix as one token",
+              partial == ["docs/nested/"], str(partial))
+        check("/cd still completes when readline split on /",
+              split == ["nested/"], str(split))
+        check("/cd after a trailing slash lists children, not cwd",
+              after_slash == ["nested/", "notes.md"], str(after_slash))
+        check("/cd completes a third path level",
+              third == ["docs/nested/deep/"], str(third))
+    bound = ui_mod.setup_readline(Path(tempfile.mkdtemp()) / "history",
+                                  mentions=mentions)
+    check("setup_readline returns the same completer shape",
+          "/plan" in bound.matches("/p", "/p"),
+          str(bound.matches("/p", "/p")))
+    try:
+        import readline
+        delims = readline.get_completer_delims()
+    except ImportError:
+        delims = ""
+    if delims:
+        check("path characters stay inside a /cd token",
+              all(ch not in delims for ch in "@/~-"),
+              repr(delims))
 
 
 def test_score_short_window_beats_fat_monthly() -> None:
@@ -281,6 +380,66 @@ async def test_pick_plan_and_cu() -> None:
                           (empty_plan, empty_cu, empty_group)))
 
 
+async def test_pick_heavy_is_local_multi_model_collab() -> None:
+    print("\n[macbot.4h] /heavy is local multi-model collab")
+    from leftover.macbot import _parse_argv
+    with tempfile.TemporaryDirectory() as tmp:
+        agents = [
+            AgentSpec(key="claude", label="Claude", emoji="C",
+                      interactive_command=["true"], exec_command=["true"]),
+            AgentSpec(key="gpt", label="Codex", emoji="G",
+                      interactive_command=["true"], exec_command=["true"]),
+            AgentSpec(key="grok", label="Grok", emoji="X",
+                      interactive_command=["true"], exec_command=["true"]),
+            AgentSpec(key="cursor", label="Cursor", emoji="K",
+                      interactive_command=["true"], exec_command=["true"]),
+        ]
+        cfg = Config(agents=agents, data_dir=tmp,
+                     routing=Routing(strategy="lag_waste",
+                                     coding_keys=["gpt", "grok", "cursor"],
+                                     plan_key="claude", heavy_key="grok"))
+        pick = await decide(cfg, intent_mod.parse("/heavy should we split"), tmp)
+        blob = pick.as_dict()
+        check("heavy with two+ CLIs is a panel, not one worker",
+              pick.kind == "heavy" and pick.spec is None
+              and pick.available and pick.chain[0] == "grok"
+              and "Claude" in pick.labels and "Grok" in pick.labels,
+              repr(pick.chain))
+        check("heavy announce is leftover · panel · heavy",
+              blob["announce"].startswith("leftover · ")
+              and blob["announce"].endswith(" · heavy"),
+              blob["announce"])
+        check("heavy run is leftover --print /heavy @…",
+              blob["run"][:2] == ["leftover", "--print"]
+              and blob["run"][2].startswith("/heavy")
+              and "@grok" in " ".join(blob["run"]),
+              str(blob["run"]))
+        check("--heavy stamps the task the same way --plan does",
+              intent_mod.parse(prepare_task("should we split", heavy=True)).kind
+              == "heavy")
+        ns = _parse_argv(["--heavy", "should we split"])
+        check("--heavy is a flag, not a route override",
+              ns.heavy and ns.prompt == ["should we split"])
+        empty = await decide(cfg, intent_mod.parse("/heavy"), tmp)
+        check("empty /heavy is not a runnable handoff",
+              not empty.available and empty.as_dict()["run"] is None)
+
+        solo = [
+            AgentSpec(key="grok", label="Grok", emoji="X",
+                      interactive_command=["true"], exec_command=["true"]),
+            AgentSpec(key="claude", label="Claude", emoji="C"),
+        ]
+        one = Config(agents=solo, data_dir=tmp,
+                     routing=Routing(heavy_key="grok", plan_key="claude",
+                                     coding_keys=["grok"]))
+        single = await decide(
+            one, intent_mod.parse("/heavy 一起写 README"), tmp)
+        check("one installed CLI degrades to a single heavy worker",
+              single.spec is not None and single.spec.key == "grok"
+              and single.kind == "heavy" and "--heavy" in single.as_dict()["run"],
+              str(single.as_dict().get("run")))
+
+
 def test_why_table_is_lag_waste_not_reputation() -> None:
     print("\n[macbot.4b] --why is usher-shaped, lag+waste axis")
     from leftover.macbot import _parse_argv
@@ -385,6 +544,10 @@ def test_agent_is_identity_not_mention() -> None:
     forced_cu = prepare_task("/cupertino x", cu=True)
     check("--cu does not confuse /cupertino with /cu",
           intent_mod.parse(forced_cu).kind == "computer_use", forced_cu)
+    forced_heavy = prepare_task("/heavylift x", heavy=True)
+    check("--heavy does not confuse /heavylift with /heavy",
+          intent_mod.parse(forced_heavy).kind == "heavy"
+          and forced_heavy.startswith("/heavy "), forced_heavy)
 
 
 def test_cli_routing_progress_is_human_only() -> None:
@@ -1859,6 +2022,90 @@ async def test_debate_is_parallel_and_compact() -> None:
           all("EDIT_FILES_NOW" not in prompt for _, prompt in pool.prompts))
 
 
+async def test_heavy_is_parallel_leader_and_discuss() -> None:
+    print("\n[macbot.24b] heavy runs parallel independent takes and compare-notes")
+    from leftover.orchestrator import Orchestrator, Plan
+    from leftover.router import Router
+
+    class HeavyPool:
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+            self.phase_active = [0, 0]
+            self.phase_peak = [0, 0]
+            self.prompts: list[tuple[str, str]] = []
+
+        def peek(self, spec):
+            return None
+
+        async def run(self, spec, prompt, on_event=None):
+            self.prompts.append((spec.key, prompt))
+            phase = 0 if "cannot see their answers yet" in prompt else 1
+            self.active += 1
+            self.phase_active[phase] += 1
+            self.max_active = max(self.max_active, self.active)
+            self.phase_peak[phase] = max(
+                self.phase_peak[phase], self.phase_active[phase])
+            try:
+                await asyncio.sleep(0.05)
+            finally:
+                self.active -= 1
+                self.phase_active[phase] -= 1
+            marker = f"{spec.key.upper()}_TAKE_" + "x" * 80
+            return Turn(agent=spec, text=marker, seconds=0.05)
+
+    agents = [
+        AgentSpec(key="grok", label="Grok", persona="EDIT_FILES_NOW"),
+        AgentSpec(key="claude", label="Claude", persona="EDIT_FILES_NOW"),
+        AgentSpec(key="gpt", label="Codex", persona="EDIT_FILES_NOW"),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(
+            agents=agents, data_dir=tmp, max_parallel=4,
+            routing=Routing(strategy="order", order=[a.key for a in agents],
+                            heavy_key="grok"),
+        )
+        pool = HeavyPool()
+        orch = Orchestrator(cfg, pool, Router(cfg, pool))
+        topic = "Should we split the worker?"
+        started = asyncio.get_running_loop().time()
+        turns = await orch.execute(Plan("heavy", topic, agents, {}), None)
+        elapsed = asyncio.get_running_loop().time() - started
+
+    independent = [p for _, p in pool.prompts
+                   if "cannot see their answers yet" in p]
+    discuss = [p for _, p in pool.prompts if "compare-notes round" in p]
+    synthesis = [p for _, p in pool.prompts
+                 if "give the practical conclusion" in p]
+    check("independent takes and compare-notes both overlap",
+          pool.phase_peak[0] == 3 and pool.phase_peak[1] == 3,
+          f"peaks={pool.phase_peak}, elapsed={elapsed:.3f}s")
+    check("leader and workers then synthesis and discuss",
+          len(turns) == 6
+          and [t.meta.get("discussion_role") for t in turns]
+          == ["LEADER", "WORKER", "WORKER", "SYNTHESIS", "DISCUSS", "DISCUSS"])
+    check("independent takes cannot see each other",
+          len(independent) == 3
+          and all("GROK_TAKE_" not in p and "CLAUDE_TAKE_" not in p
+                  and "GPT_TAKE_" not in p for p in independent))
+    check("the leader synthesizes from every independent take",
+          len(synthesis) == 1
+          and synthesis[0].count("GROK_TAKE_") == 1
+          and synthesis[0].count("CLAUDE_TAKE_") == 1
+          and synthesis[0].count("GPT_TAKE_") == 1)
+    check("workers compare notes from the independent takes",
+          len(discuss) == 2
+          and all(p.count("GROK_TAKE_") == 1 and p.count("CLAUDE_TAKE_") == 1
+                  and p.count("GPT_TAKE_") == 1 for p in discuss))
+    check("the current topic is not duplicated",
+          all(prompt.count(topic) == 1 for _, prompt in pool.prompts))
+    check("only the leader synthesis may implement",
+          all("EDIT_FILES_NOW" not in p for p in independent + discuss)
+          and all("Do not edit files" in p for p in independent + discuss)
+          and len(synthesis) == 1 and "EDIT_FILES_NOW" in synthesis[0]
+          and "make the change in the working directory" in synthesis[0])
+
+
 async def test_event_sink_obeys_the_turn_deadline() -> None:
     print("\n[macbot.25] event delivery is part of the turn deadline")
     from leftover.orchestrator import Orchestrator
@@ -2305,11 +2552,13 @@ def test_piped_stdin_read_has_a_hard_boundary() -> None:
 def main() -> int:
     test_compose_followup_is_bare()
     test_intent()
+    test_repl_completes_commands_and_mentions()
     test_score_short_window_beats_fat_monthly()
     test_score_depleted_short_window_loses()
     test_score_fresh_short_window_does_not_starve_overdue_weekly()
     asyncio.run(test_sticky_requires_a_live_session())
     asyncio.run(test_pick_plan_and_cu())
+    asyncio.run(test_pick_heavy_is_local_multi_model_collab())
     test_why_table_is_lag_waste_not_reputation()
     test_usher_ux_surface()
     test_subcommand_config_flag()
@@ -2341,6 +2590,7 @@ def main() -> int:
     asyncio.run(test_exec_pool_shutdown_reaps_process())
     asyncio.run(test_exec_structured_error_is_failure())
     asyncio.run(test_debate_is_parallel_and_compact())
+    asyncio.run(test_heavy_is_parallel_leader_and_discuss())
     asyncio.run(test_event_sink_obeys_the_turn_deadline())
     asyncio.run(test_stream_sink_keeps_sync_io_off_the_loop())
     asyncio.run(test_stream_sink_shows_plan_and_thought())

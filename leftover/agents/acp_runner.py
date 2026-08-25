@@ -949,17 +949,22 @@ class AcpRunner(BaseRunner):
 
             try:
                 loop = asyncio.get_running_loop()
-                deadline = loop.time() + self.spec.timeout
+                turn_timeout = max(float(self.spec.timeout), 0.0)
+                deadline = loop.time() + turn_timeout
                 idle_timeout = self.spec.acp_idle_timeout
                 idle_deadline = (loop.time() + idle_timeout
                                  if idle_timeout > 0 else None)
                 busy = False
                 while True:
                     now = loop.time()
+                    in_flight = self._tools_in_flight()
+                    if in_flight:
+                        # A long pytest is work. Do not spend the original
+                        # start-of-turn budget while a tool is still running.
+                        deadline = now + turn_timeout
                     remaining = deadline - now
                     if remaining <= 0:
                         raise TimeoutError
-                    in_flight = self._tools_in_flight()
                     if idle_deadline is not None and busy and not in_flight:
                         # The last in-flight tool just ended. Restart hang
                         # detection from now so a 10-minute pytest is not an
@@ -980,12 +985,10 @@ class AcpRunner(BaseRunner):
                                 queue.get(), timeout=wait_timeout)
                         except asyncio.TimeoutError:
                             now = loop.time()
-                            if self._tools_in_flight() and now < deadline:
+                            if self._tools_in_flight():
                                 continue
                             if (idle_deadline is not None
-                                    and not self._tools_in_flight()
-                                    and idle_deadline <= now
-                                    and idle_deadline <= deadline):
+                                    and idle_deadline <= now):
                                 raise AcpIdleTimeout(idle_timeout) from None
                             raise TimeoutError from None
                     if (isinstance(item, tuple) and len(item) == 2
@@ -994,13 +997,23 @@ class AcpRunner(BaseRunner):
                             break
                         continue
                     if item is _ACTIVITY:
+                        now = loop.time()
+                        in_flight = self._tools_in_flight()
+                        if idle_deadline is not None and busy and not in_flight:
+                            # Completion of a long tool is not a stall. The
+                            # deadline still dates from when that tool started.
+                            idle_deadline = now + idle_timeout
+                        busy = in_flight
+                        if in_flight:
+                            deadline = now + turn_timeout
                         if (idle_deadline is not None
-                                and not self._tools_in_flight()
-                                and idle_deadline <= loop.time()):
+                                and not in_flight
+                                and idle_deadline <= now):
                             raise AcpIdleTimeout(idle_timeout)
                         continue
                     if idle_deadline is not None:
                         idle_deadline = loop.time() + idle_timeout
+                    deadline = loop.time() + turn_timeout
                     yield item
 
                 terminal = terminal_waiter.result()

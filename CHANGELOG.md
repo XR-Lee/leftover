@@ -4,13 +4,50 @@ Notable changes per release. Dates are release dates.
 
 ## Unreleased
 
-### Tests
+## 0.1.2 — 2026-08-25
 
-- **`--print` long-tool path is covered.** The 0.1.1 idle-pause fix had a
-  runner-only example. `test_print_long_running_tool_does_not_exit_124` now
-  drives a real mock ACP process through `run_print`: a quiet in-flight
-  `pytest` lasts past `acp_idle_timeout`, the parent-style poll keeps seeing
-  a live task, stderr heartbeats, and the exit code stays 0 instead of 124.
+Local multi-model collab. A busy turn is no longer cut at 900s.
+
+### Added
+
+- **leftover heavy — local multi-model collab.** Grok Heavy-shaped discussion
+  and co-writing on this Mac. `/heavy`, `--heavy`, `/discuss`, and explicit
+  phrases (`should we`, `一起写`, `该不该`, `?`) put two or more official CLIs
+  in one leftover conversation. Independent takes run in parallel; then
+  workers compare notes while the leader synthesizes, also in parallel. Grok
+  is the leader when installed. One CLI degrades to a single heavy worker.
+  `fix the tests` stays coding. `/rt` stays sequential. D20, D21.
+- **REPL tab completion.** `you>` still uses readline, not a leftover
+  pager. Tab now completes slash commands, `@name` / aliases, `/scope`
+  `on|off` and names, and `/cd` paths. Empty tab lists the same words the
+  hint line already showed. `@` is not a completer delimiter.
+
+### Fixed
+
+- **A busy turn is no longer cut at 900s.** `timeout` is silence since the
+  last visible update or in-flight tool, not a wall clock from start. A
+  long coding job that keeps sending text/tools, or a quiet `pytest` still
+  running, slides the window. Internal ACP chatter still does not. Idle
+  hang detection (default 180s with no progress) is unchanged. Exec
+  one-shot JSON (`agy -p`) still uses the process-lifetime cap because it
+  does not stream. `test_acp_progress_extends_turn_timeout` and
+  `test_stream_json_progress_extends_turn_timeout` cover the slide.
+
+- **`/cd` tab completion now walks nested paths.** macOS libedit treats
+  `/`, `~`, and `-` as word breaks, so the completer only saw the last
+  segment (`src` from `docs/src`) and listed the cwd again after
+  `docs/`. Those characters stay inside one token, and `/cd` matches
+  against the full argument so a second Tab lists `docs/…`.
+
+- **Finishing a long ACP tool no longer looks like an idle hang.** 0.1.1
+  paused idle while a tool was in-flight, but the completion notification
+  is protocol `_ACTIVITY` (same tool title). leftover still held the idle
+  deadline from when that tool *started*, so a quiet `pytest` longer than
+  `acp_idle_timeout` died the instant it printed "done" and `--print`
+  exited 124. Completing the last in-flight tool now restarts hang
+  detection. `test_acp_long_running_tool_survives_idle_silence` sends the
+  real completed→text sequence; `test_print_long_running_tool_does_not_exit_124`
+  drives a mock ACP process through `run_print` and a parent-style poll.
 
 ## 0.1.1 — 2026-08-25
 

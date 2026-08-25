@@ -459,10 +459,22 @@ class Router:
             for w in found.windows
         ))
         # A silent or empty refresh must not wipe a live reported window.
-        # Ranking, leftover quota, and doctor all keep that last real number.
+        # Ranking keeps that last real number. leftover quota / doctor
+        # (force=True) may attach a live failure note on top of it.
         result = found if found_real or not cached.windows else cached
         if result is None:
             result = cached
+        if (force and found is not None and found.note and not found_real
+                and result is not found):
+            result = q.Quota(
+                agent=result.agent,
+                windows=list(result.windows),
+                checked_at=result.checked_at,
+                note=found.note,
+                title=result.title,
+                products=list(result.products),
+                extras=dict(result.extras),
+            )
         # Keep refusals observed while this probe was in flight. Router health
         # is shared across conversations, so observe() may have replaced the
         # cached quota after `previous` was captured above.

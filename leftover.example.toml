@@ -26,6 +26,7 @@ order = ["gpt", "grok", "cursor", "claude", "antigravity"]
 coding_keys = ["gpt", "grok", "cursor", "antigravity"]  # last = loses every tie
 plan_key = "claude"
 cu_key = "gpt"
+heavy_key = "grok"          # leftover /heavy leader; workers think in parallel
 lag_weight = 0.5
 waste_weight = 1.0
 max_attempts = 3          # quick failures tried; turn/idle timeout stops immediately
@@ -117,7 +118,7 @@ key = "antigravity"
 # `--print-timeout` must cover `timeout`, or agy quits at its own 5m default.
 exec_command = ["agy", "--output-format", "json", "--dangerously-skip-permissions",
                 "--print-timeout", "15m", "--model", "gemini-3.1-pro-high", "-p"]
-timeout = 900
+timeout = 900             # silence after last progress; busy turns may run longer
 # No vendor usage endpoint is known. Ranking counts your own turns against
 # these, and `/quota` / doctor draw them as "estimated local". Replace them
 # with your real plan limits if you know them.
