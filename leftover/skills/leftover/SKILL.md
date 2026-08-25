@@ -1,6 +1,6 @@
 ---
 name: leftover
-description: Route coding, planning, computer-use, roundtable, broadcast, debate, or relay work onto the right local subscription CLIs (Codex, Grok Build, Cursor Grok, Claude). Use when starting work, when unsure which agent should spend quota, when the user says leftover, macbot, /plan, /cu, /rt, /all, /debate, /relay, names multiple agents, or asks you to hand off to another CLI.
+description: Route coding, planning, computer-use, roundtable, broadcast, debate, or relay work onto the right local subscription CLIs (Codex, Grok Build, Cursor Grok, Antigravity, Claude). Use when starting work, when unsure which agent should spend quota, when the user says leftover, macbot, /plan, /cu, /rt, /all, /debate, /relay, names multiple agents, or asks you to hand off to another CLI.
 ---
 
 # leftover
@@ -28,6 +28,7 @@ If `leftover` is not on PATH, try `macbot --pick --json --agent "$LEFTOVER_SELF"
 | Codex CLI / Codex app / ChatGPT coding | `gpt` |
 | Grok Build | `grok` |
 | Cursor Agent CLI | `cursor` |
+| Antigravity CLI | `antigravity` |
 | Claude Code | `claude` |
 
 `$TASK` is the user's request, unmodified.
@@ -58,7 +59,7 @@ leftover cannot push a callback into this parent conversation. The JSON
 - Never choose the next poll from your estimate of task duration, and never
   sleep for one to five minutes before checking. The worker may have already
   finished. Do not start a duplicate `run` while its handle is live.
-- stderr route, tool, failover, and `still working` lines are progress only.
+- stderr route, tool, plan/thought, failover, and `still working` lines are progress only.
   stdout is the answer. Keep waiting through quiet polls; treat process exit as
   success/failure and then return captured stdout to the human.
 
@@ -71,10 +72,10 @@ reconstruct `leftover --print` after a handoff handle has already been returned.
 - `/plan …` or "先出方案" → Claude first.
 - `/cu` or "computer use" / "点界面" → Codex CLI (computer use on this Mac).
 - `/rt`, `/all`, `/debate`, `/relay`, or multiple `@agent` mentions → run the requested multi-agent panel through leftover.
-- `@codex` `@gpt` `@claude` `@grok` `@cursor` → that backend first.
+- `@codex` `@gpt` `@claude` `@grok` `@cursor` `@antigravity` → that backend first.
 
-Default with no tag is **coding**. Coding pool is Codex, Grok Build CLI, and `cursor-agent --model grok-4.6` (Cursor Ultra first-party). Claude is last-resort fallback, not in the lag race.
+Default with no tag is **coding**. Coding pool is Codex, Grok Build CLI, `cursor-agent --model grok-4.6` (Cursor Ultra first-party), and `agy --model gemini-3.1-pro-high` (Antigravity first-party). Claude is last-resort fallback, not in the lag race.
 
-Do not send Cursor Agent onto Claude or GPT **models**. That spends the Cursor third-party pool, not those subscriptions.
+Do not send Cursor Agent or Antigravity onto Claude or GPT **models**. That spends their third-party pools, not those subscriptions.
 
 Do not use reverse proxies or API keys to "unify" quota. Subscription windows only move when the official CLI/app of that vendor runs.

@@ -6,6 +6,67 @@
 
 ---
 
+## D19 — leftover 对其他 CLI 的影响可开关；开关面不是第二套聊天 TUI
+
+**2026-08-24 · 生效**
+
+leftover 对别家 CLI 的影响就是 `SKILL.md` 链进
+`~/.codex|/.grok|/.claude|/.cursor|/.agents/skills/leftover/`。`install-skills`
+全开。没有开关时，人只能手动 rm 才能让某家 CLI 自己干活。
+
+`leftover scope` 是 `install-skills` 的逐家开关：TTY 五行面板，非 TTY 表格，
+`on|off [name…]` 脚本。真相是磁盘上那条 symlink，不是 toml。`--tui` 仍是
+usher 那条路（exec 进官方 TUI）。父对话仍是 `you>`。这不是 D8 档 D，也不是
+第二前端。
+
+**不采用：** leftover 自己画聊天 pager；把 `--tui` 改成这个面板；用 toml
+当真相。
+
+---
+
+## D18 — 长期只加深三件护城河，不把 leftover 做成第二个终端产品
+
+**2026-08-23 · 生效**
+
+D11 钉死了维护面。开源前还缺一条**增长过滤**：什么值得做、社区会盯什么、什么看起来热闹但会把 leftover 归类成又一个 wrapper。
+
+对照对象仍是 [usher](https://github.com/theodorebeaupre-prog/usher)（D13），不是 acpbot / OmniRoute。usher FAQ 写「厂商不暴露剩余额度」——对 Codex / Claude / Grok / Cursor 是错的（D9）。那是 leftover 唯一低可复刻、可截图、可审计的楔子。lag+waste 和父对话是第二、第三件；薄 router 本身不要讲。
+
+**只加深这三件：**
+
+1. **官方 remaining。** `quota.py` 继续问厂商「这个窗还剩多少」，而不是本地目击后衰减。字段会变，这是脏活，也是护城河。没有已知接口时不许把本地 ledger 写成官方 remaining：`/quota` 和 doctor 可以画 estimated 百分比，但必须标 `estimated local`。新探针同一提交写进 `SECURITY.md`。
+2. **lag+waste。** 按腐烂程度花钱，不是「谁最擅长这题」。estimated 窗 `waste = 0`。分数公式和 `--why` 列不要偷偷加 strength / 口碑。
+3. **同一场父对话。** ACP REPL、`--print`、`/rt` `/debate` `/relay`。usher exec 完就走；OpenACP 明文单 agent。编排可以更稳，不要长成第二个聊天产品。
+
+**社区会盯、也值得做（按杀伤力）：**
+
+| 做 | 为什么社区在乎 | 不是什么 |
+|---|---|---|
+| 探针保活 + 解析器夹具 | 推翻 usher FAQ 的实证每天都在腐烂；fixture 让外人能复现而不花订阅 | 新抽象层 |
+| Codex 不靠 Sub2API 的 reported | 多数人没有 admin key；session 日志经常 `used_percent: null` | 把 completion 打进反代 |
+| Antigravity reported | 第五家现在只有 ledger，排序是观点不是数字 | 编一个百分数 |
+| Linux / 无 IDE 的 Cursor token | CI 已经跑 Linux；Windows 路径有了，Linux 无 `state.vscdb` 时探针空转 | 为 Windows 做 GUI |
+| `leftover quota --json` / `--why --json` | git 社区第一反应是脚本，不是 REPL | 新前端 |
+| 只读 probe 契约测试（录制 payload，不打真网） | 可审计 = 转化率；「帮你花光额度」的工具必须让外人验证路径 | telemetry、账号 |
+| Skill / plugin 包装现有 `--pick`（D8 档 C） | 人已经坐在官方 TUI 里时，`/leftover` 比再开一个 REPL 自然 | fork pager |
+| 组模式可靠（并行、deadline、脏树） | `/debate` `/all` 是空白，但受众窄；稳比炫重要 | Discord / 第二聊天前端 |
+
+**明确不做，即使 issue 热：**
+
+- 反代 / OpenAI-compatible gateway /「统一 model id」（D1）。赛道里 CLIProxyAPI、OmniRoute 已经把这条路走脏了；leftover 的干净是默认不被相信的，做一次就卖点没了。
+- 默认改成 `--tui`（usher 已经选了 launcher）。父对话才是楔子。
+- 任务类型 × 口碑、strength 列、动画 banner（D14）。
+- 长大 Telegram / 加 Discord / Slack（D7、D11）。
+- fork Grok/Codex TUI（D8 档 D）。
+- Cursor / Antigravity 钉到另一家的模型（花第三方池）。
+- 为了「更聪明」把 Claude 拉进 lag 赛。
+
+待决问题里「默认 TUI / Discord / 用 acpbot 替编排 / 用 OmniRoute」按本条关闭：默认否。Grok/Codex **plugin**（档 C）仍开着，但只包装现有 skill ABI，不改官方 TUI。
+
+清单落在 [roadmap.md](../roadmap.md)。新 feature 进仓前先过这张过滤表；过不了就写进「不做」。
+
+---
+
 ## D17 — Antigravity 进 coding pool，排最后，钉死在 first-party Gemini
 
 **2026-08-23 · 生效**
@@ -27,7 +88,7 @@ Google 自己的池子——而 Claude 那份订阅用户本来就单独付着�
 - `--print-timeout` 默认 5m，比 leftover 的 900s turn timeout 短。不显式传
   `15m` 的话，agy 会在 leftover 还在等的时候自己放弃。
 - 没有已知的用量接口。`quota_probe` 留空，排序靠本地 ledger 对 `budget_*_turns`
-  估算，`/quota` 显示 "no vendor number" 而不是编一个数字出来。
+  估算。`/quota` 和 doctor 画这些窗时标 `estimated local`，不把它们写成官方 remaining。
 
 **实测发现的两个 agy 行为**（不是 leftover 的问题，但用它就会撞上）：
 
@@ -296,11 +357,12 @@ CLIProxyAPI 那类东西给的是**裸模型补全**，会丢掉 Claude Code 的
 
 # 待决问题
 
-- [ ] 默认交互要不要从 MacBot `you>` REPL 改成 `exec` 进官方 TUI（`--tui` 当默认）？usher 已经选了 launcher。这边默认留 REPL 是因为父对话是楔子，不是因为没见过那条路。跨家接力仍走 ACP chat
-- [ ] 要不要做一个 Grok/Codex **plugin** 包装现有 skill（`/macbot`），而不是继续只靠 `install-skills` 拷 SKILL.md
-- [ ] acpbot 能不能让两个 agent 读同一份上下文？如果能，连编排层都省了
-- [ ] OmniRoute 的订阅层到底怎么拿的 token——spawn CLI 还是反代？决定它能不能用
+- [x] 默认交互要不要从 `you>` REPL 改成 `exec` 进官方 TUI（`--tui` 当默认）？**否。** D18：usher 已经选了 launcher；父对话才是楔子。`--tui` 继续是那条路，不是默认。
+- [ ] 要不要做一个 Grok/Codex **plugin** 包装现有 skill（`/leftover`），而不是继续只靠 `install-skills` 拷 SKILL.md。仍开着，但是 D8 档 C：只挂 slash，不改官方 TUI。见 roadmap Later。
+- [x] acpbot 能不能让两个 agent 读同一份上下文？如果能，连编排层都省了。**不跟。** 对照对象是 usher（D13）；编排层是父对话楔子的一部分，不外包给聊天桥。
+- [x] OmniRoute 的订阅层到底怎么拿的 token——spawn CLI 还是反代？**当反代，不用。** D1 / D18：即使它 spawn CLI，走 completion 网关也丢掉 agent loop。
 - [x] `codex-acp@1.6.2`、`grok agent stdio`、`cursor-agent --model grok-4.6 acp` 三条命令实测
-- [ ] Claude 和 Cursor 的 5 小时 / 周额度上限到底是多少轮？budget 只在 usage 接口失败时还用得上
-- [ ] 要不要 Discord？OpenACP 三个平台都支持，acpbot 只有 Telegram。**在 D11 下默认是否：不加。**
+- [ ] Claude 和 Cursor 的 5 小时 / 周额度上限到底是多少轮？budget 只在 usage 接口失败时还用得上。仍开着；猜的预算不得产生 `waste`。
+- [x] 要不要 Discord？**否。** D11 + D18：不加第二前端。
 - [x] 独立 git 仓：`agora/` 为根，公开名 leftover，远程 XR-Lee/leftover（D15）
+- [x] 长期增长过滤：只加深官方 remaining / lag+waste / 父对话（D18，[roadmap.md](../roadmap.md)）

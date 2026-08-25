@@ -16,7 +16,7 @@ from ..config import AgentSpec
 @dataclass
 class Event:
     """A streamed fragment from an agent."""
-    kind: str          # "text" | "thought" | "tool" | "error" | "done"
+    kind: str          # "text" | "thought" | "tool" | "status" | "error" | "done"
     text: str = ""
 
 
@@ -221,7 +221,7 @@ OnEvent = Callable[[Event], Awaitable[None]]
 
 
 class AcpIdleTimeout(TimeoutError):
-    """An ACP prompt stayed alive but produced no updates for too long."""
+    """An ACP prompt produced no visible progress and has no in-flight tool."""
 
     def __init__(self, seconds: float) -> None:
         self.seconds = seconds

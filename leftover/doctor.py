@@ -1,7 +1,8 @@
 """`leftover doctor` — who's in the room, remaining bars, config paths.
 
-Shape matches usher doctor. Remaining is vendor remaining from the last
-cached snapshot (reported/observed), not usher's launch-confidence ledger.
+Shape matches usher doctor. Remaining is the latest quota snapshot
+(reported/observed, else estimated local), not usher's launch-confidence
+ledger.
 """
 from __future__ import annotations
 
@@ -10,7 +11,8 @@ import shutil
 from pathlib import Path
 
 from .config import DEFAULT_CONFIG_PATHS, AgentSpec, Config
-from .quota import OBSERVED, REPORTED, Quota
+from .quota import ESTIMATED, OBSERVED, REPORTED, Quota
+from .scope import doctor_line
 from . import ui
 
 INSTALL_HINTS = {
@@ -42,17 +44,26 @@ def _hint(spec: AgentSpec) -> str:
     return INSTALL_HINTS.get(spec.key, f"install `{spec.binary or spec.key}`")
 
 
-def _remaining(quota: Quota | None) -> tuple[float | None, str]:
+def _remaining(quota: Quota | None) -> tuple[float | None, str, float | None]:
     if quota is None:
-        return None, ""
-    live = [
-        window for window in quota.windows
-        if not window.expired and window.source in (REPORTED, OBSERVED)
+        return None, "", None
+    live = [window for window in quota.windows if not window.expired]
+    vendor = [
+        window for window in live
+        if window.source in (REPORTED, OBSERVED)
     ]
-    if not live:
-        return None, ""
-    worst = min(live, key=lambda window: window.headroom)
-    return worst.headroom * 100.0, worst.name
+    extra = next((window for window in vendor if window.name == "extra"), None)
+    plan = [window for window in vendor if window.name != "extra"]
+    pool = plan or vendor or [
+        window for window in live if window.source == ESTIMATED
+    ]
+    if not pool:
+        return None, "", None
+    worst = min(pool, key=lambda window: window.headroom)
+    extra_left = None
+    if extra is not None and extra is not worst:
+        extra_left = extra.headroom * 100.0
+    return worst.headroom * 100.0, worst.name, extra_left
 
 
 def _quota_from_cache(spec: AgentSpec, cached: dict) -> Quota | None:
@@ -83,7 +94,16 @@ async def check(spec: AgentSpec) -> str:
     return "\n".join(lines)
 
 
-async def _roster_line(spec: AgentSpec, cached: dict, width: int = 10) -> str:
+def _quota_of(spec: AgentSpec, cached: dict,
+              quotas: dict[str, Quota] | None) -> Quota | None:
+    if quotas and spec.key in quotas:
+        found = quotas[spec.key]
+        return found if isinstance(found, Quota) else Quota.from_dict(found)
+    return _quota_from_cache(spec, cached)
+
+
+async def _roster_line(spec: AgentSpec, cached: dict, width: int = 10,
+                       quotas: dict[str, Quota] | None = None) -> str:
     name = f"{spec.label:<{width}}"
     if not spec.enabled:
         return ui.dim(f"  {name} disabled")
@@ -98,11 +118,13 @@ async def _roster_line(spec: AgentSpec, cached: dict, width: int = 10) -> str:
             version = msg.split(" (")[0].strip()[:16]
     version = f"{version:<16}" if version else f"{'installed':<16}"
 
-    remaining, window = _remaining(_quota_from_cache(spec, cached))
+    remaining, window, extra_left = _remaining(_quota_of(spec, cached, quotas))
     if remaining is None:
         return f"  {name} {version} remaining —"
     bar = ui.remaining_bar(remaining)
     extra = f"  {window}" if window else ""
+    if extra_left is not None:
+        extra += f"  extra {extra_left:3.0f}%"
     return f"  {name} {version} remaining {bar} {remaining:3.0f}%{extra}"
 
 
@@ -121,16 +143,18 @@ def _paths(config: Config) -> list[str]:
     ]
 
 
-async def run(config: Config, cached: dict | None = None) -> str:
+async def run(config: Config, cached: dict | None = None,
+              quotas: dict[str, Quota] | None = None) -> str:
     cached = cached if isinstance(cached, dict) else {}
     lines = ["leftover doctor"]
     width = max([10, *(len(spec.label) for spec in config.agents)])
     for spec in config.agents:
-        lines.append(await _roster_line(spec, cached, width))
+        lines.append(await _roster_line(spec, cached, width, quotas))
     on = [a.label for a in config.agents if a.enabled and a.installed]
     if on:
         lines.append(ui.dim("  on: " + " · ".join(on)))
     else:
         lines.append(ui.err("  on: none — install and log in to at least one CLI"))
+    lines.append(doctor_line())
     lines.extend(_paths(config))
     return "\n".join(lines)

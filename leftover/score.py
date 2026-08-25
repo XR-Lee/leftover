@@ -105,7 +105,8 @@ def score_quota(key: str, quota: Quota, now: float | None = None,
     """One number per agent: the window that most wants to be spent."""
     now = time.time() if now is None else now
     live = [w for w in quota.windows
-            if w.resets_at is None or w.resets_at > now]
+            if w.name != "extra"
+            and (w.resets_at is None or w.resets_at > now)]
     if not live:
         return AgentScore(key=key, lag=0.0, waste=0.0, total=0.0,
                           source=quota.best_source, detail="no live window",

@@ -247,9 +247,69 @@ def test_claude_usage_parse() -> None:
           extra is not None and extra.headroom > 0.8
           and extra.windows[0].name == "5h",
           extra.describe() if extra else "none")
+    check("extra is a reported percent window",
+          extra is not None
+          and any(w.name == "extra" and abs(w.used_percent - 93.0) < 0.1
+                  for w in extra.windows),
+          extra.describe() if extra else "none")
     check("extra credits still visible in the note",
-          extra is not None and "extra $" in extra.note)
+          extra is not None and "extra 93%" in extra.note)
     check("empty payload is no quota", q.parse_claude_usage({}) is None)
+
+
+def test_claude_refresh_uses_cli_user_agent() -> None:
+    print("\n[2b2] Claude OAuth refresh sends the CLI User-Agent")
+    seen: list[dict[str, str]] = []
+
+    def fake_http(method, url, *, headers=None, body=None, timeout=8.0):
+        seen.append(dict(headers or {}))
+        return 200, {
+            "access_token": "tok",
+            "expires_in": 3600,
+            "refresh_token": "r2",
+        }
+
+    orig_http = q._http_json
+    orig_persist = q._persist_claude_creds
+    orig_ua = q._CLAUDE_UA
+    q._http_json = fake_http
+    q._persist_claude_creds = lambda *a, **k: None
+    q._CLAUDE_UA = "claude-code/2.1.241"
+    try:
+        blob = {"claudeAiOauth": {"refreshToken": "r1", "accessToken": "old"}}
+        out = q._refresh_claude_oauth(blob, "file")
+    finally:
+        q._http_json = orig_http
+        q._persist_claude_creds = orig_persist
+        q._CLAUDE_UA = orig_ua
+    check("refresh returns a new blob", out is not None)
+    check("refresh User-Agent is claude-code",
+          seen and seen[0].get("User-Agent", "").startswith("claude-code/"),
+          repr(seen[0] if seen else None))
+
+
+def test_claude_refresh_stops_on_rate_limit() -> None:
+    print("\n[2b3] Claude OAuth refresh does not hammer the fallback host")
+    urls: list[str] = []
+
+    def fake_http(method, url, *, headers=None, body=None, timeout=8.0):
+        urls.append(url)
+        return 429, {"error": {"type": "rate_limit_error"}}
+
+    orig_http = q._http_json
+    orig_persist = q._persist_claude_creds
+    q._http_json = fake_http
+    q._persist_claude_creds = lambda *a, **k: None
+    try:
+        blob = {"claudeAiOauth": {"refreshToken": "r1", "accessToken": "old"}}
+        out = q._refresh_claude_oauth(blob, "file")
+    finally:
+        q._http_json = orig_http
+        q._persist_claude_creds = orig_persist
+    check("429 returns no blob", out is None)
+    check("only the first token host is hit",
+          urls == ["https://platform.claude.com/v1/oauth/token"],
+          repr(urls))
 
 
 def test_grok_billing_parse() -> None:
@@ -554,6 +614,31 @@ def test_quota_rhythm() -> None:
     fresh = q.Window("5h", 0.0, resets_at=now + 5 * 3600, started_at=now,
                      source=q.REPORTED)
     check("just-reset 5h", rh.just_reset(fresh, now))
+    undated = q.Window("5h", 0.0, source=q.REPORTED)
+    check("0% without a reset clock is not just-reset",
+          not rh.just_reset(undated, now))
+    spec_agy = AgentSpec(key="antigravity", label="Antigravity", emoji="A")
+    estimated = rh.render_windows(
+        spec_agy,
+        q.Quota("antigravity", [
+            q.Window("5h budget", 40.0, resets_at=now + 5 * 3600,
+                     source=q.ESTIMATED, detail="12/30 turns"),
+        ]),
+        None, now, london)
+    check("estimated local percent is drawn, not hidden",
+          "40%" in estimated and "estimated local" in estimated
+          and "no vendor number" not in estimated, estimated)
+    extra_block = rh.render_windows(
+        AgentSpec(key="claude", label="Claude", emoji="C"),
+        q.Quota("claude", [
+            q.Window("5h", 0.0, source=q.REPORTED),
+            q.Window("weekly", 0.0, source=q.REPORTED),
+            q.Window("extra", 93.0, source=q.REPORTED),
+        ], title="Claude · Xinrun"),
+        None, now, london)
+    check("stale 0% windows are percents, extra is visible",
+          "just reset" not in extra_block
+          and "extra 93%" in extra_block, extra_block)
     new = q.Window("weekly", 1.0, resets_at=end + 7 * 86400,
                    started_at=end, source=q.REPORTED)
     check("new window tag",
@@ -662,6 +747,36 @@ async def test_quota_fallback() -> None:
         check("second ask skips it without even trying",
               turns[0].agent.key != "claude" and turns[0].ok)
         await router.pool.shutdown()
+
+
+async def test_forced_quota_keeps_live_failure() -> None:
+    print("\n[4a2] force=True does not hide a live probe failure behind cache")
+
+    class FailRouter(Router):
+        async def _probe_quota(self, spec: AgentSpec, deadline: float):
+            return q.Quota(agent=spec.key, note="Claude usage API HTTP 401")
+
+    spec = AgentSpec(key="claude", label="Claude")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(agents=[spec], data_dir=tmp)
+        router = FailRouter(cfg, object())
+        router.h(spec).quota = q.Quota(
+            agent=spec.key,
+            windows=[q.Window("5h", 0.0, source=q.REPORTED)],
+        )
+        router.h(spec).quota_checked = 0.0
+        ranked = await router.quota_for(spec, force=False)
+        forced = await router.quota_for(spec, force=True)
+
+    check("quota/doctor keep the live failure note",
+          forced.note == "Claude usage API HTTP 401"
+          and not any(w.name == "5h" and w.source == q.REPORTED
+                      for w in forced.windows),
+          forced.describe())
+    check("ranking still reuses the last reported window",
+          any(w.name == "5h" and w.source == q.REPORTED
+              for w in ranked.windows),
+          ranked.describe())
 
 
 async def test_quota_probe_preserves_concurrent_observed_limit() -> None:
@@ -1177,6 +1292,98 @@ async def test_acp_idle_timeout_tracks_all_updates() -> None:
           f"elapsed={elapsed:.3f}s, error={turn.error!r}, tools={turn.tools}")
 
 
+def test_acp_plan_and_tool_progress_payloads() -> None:
+    print("\n[9a2] ACP plan/tool payloads become status and path-bearing tools")
+    from leftover.agents import acp_runner as acp_mod
+
+    check("in-progress plan entry is the status line",
+          acp_mod._plan_activity({
+              "sessionUpdate": "plan",
+              "entries": [
+                  {"content": "read leftover progress", "status": "in_progress"},
+                  {"content": "print it on stderr", "status": "pending"},
+              ],
+          }) == "read leftover progress")
+    check("pending is used when nothing is in progress",
+          acp_mod._plan_activity({
+              "sessionUpdate": "plan",
+              "entries": [
+                  {"content": "already done", "status": "completed"},
+                  {"content": "print it on stderr", "status": "pending"},
+              ],
+          }) == "print it on stderr")
+    check("markdown plan update collapses to one line",
+          acp_mod._plan_activity({
+              "sessionUpdate": "plan_update",
+              "plan": {"type": "markdown", "content": "  inspect\n  progress  "},
+          }) == "inspect progress")
+    check("tool label prefers path from locations",
+          acp_mod._tool_label({
+              "sessionUpdate": "tool_call",
+              "title": "Read File",
+              "kind": "read",
+              "locations": [{"path": "leftover/macbot.py"}],
+          }) == "Read File leftover/macbot.py")
+    check("tool label can take a path from rawInput",
+          acp_mod._tool_label({
+              "title": "Read File",
+              "rawInput": {"path": "leftover/ui.py"},
+          }) == "Read File leftover/ui.py")
+    check("a later path-bearing label is considered better",
+          acp_mod._tool_label_better(
+              "Read File leftover/macbot.py", "Read File"))
+
+
+async def test_acp_session_update_emits_status_and_tool_paths() -> None:
+    print("\n[9a3] session updates enqueue status and refined tool events")
+    from leftover.agents import acp_runner as acp_mod
+
+    class PlanUpdate:
+        session_update = "plan"
+        entries = [
+            {"content": "surface leftover progress", "status": "in_progress"},
+        ]
+
+    class ToolStart:
+        session_update = "tool_call"
+        tool_call_id = "t1"
+        title = "Read File"
+        kind = "read"
+        locations = None
+        raw_input = None
+
+    class Location:
+        path = "leftover/macbot.py"
+
+    class ToolProgress:
+        session_update = "tool_call_update"
+        tool_call_id = "t1"
+        title = "Read File"
+        kind = "read"
+        locations = [Location()]
+        raw_input = None
+
+    queue = asyncio.Queue()
+    bridge = acp_mod._Bridge(queue)
+    turn = acp_mod._TurnGate(
+        1, "session", queue, conn=object(), bridge=bridge, generation=object())
+    bridge.bind_turn(turn)
+    await bridge.session_update("session", PlanUpdate())
+    await bridge.session_update("session", ToolStart())
+    await bridge.session_update("session", ToolProgress())
+
+    items = []
+    while not queue.empty():
+        items.append(queue.get_nowait())
+    events = [(item.kind, item.text) for item in items if isinstance(item, acp_mod.Event)]
+    check("plan becomes a status event",
+          ("status", "surface leftover progress") in events, repr(events))
+    check("the first tool line is emitted even without a path",
+          ("tool", "Read File") in events, repr(events))
+    check("a later location refines the tool line once",
+          ("tool", "Read File leftover/macbot.py") in events, repr(events))
+
+
 async def test_acp_idle_timeout_cleans_up_silence() -> None:
     print("\n[9b] ACP idle timeout cancels and cleans up a silent prompt")
     from leftover.agents import acp_runner as acp_mod
@@ -1256,6 +1463,104 @@ async def test_acp_internal_activity_does_not_extend_idle_deadline() -> None:
           f"elapsed={elapsed:.3f}s, turn={turn}")
     check("idle timeout cancels and retires the internally busy prompt",
           state == {"cancel_calls": 1, "prompt_finished": True}
+          and not runner.live_session(), str(state))
+
+
+async def test_acp_long_running_tool_survives_idle_silence() -> None:
+    print("\n[9c2] an in-flight tool is a long task, not an idle hang")
+    from leftover.agents import acp_runner as acp_mod
+
+    class Result:
+        stop_reason = "end_turn"
+
+    class Connection:
+        async def prompt(self, session_id, prompt):
+            await runner._bridge.session_update(session_id, {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "bash-1",
+                "title": "bash",
+                "kind": "execute",
+                "status": "in_progress",
+            })
+            await asyncio.sleep(runner.spec.acp_idle_timeout * 3)
+            await runner._queue.put(acp_mod.Event("text", "tests passed"))
+            return Result()
+
+        async def cancel(self, session_id):
+            raise AssertionError(
+                "long-running tool must not be cancelled as idle")
+
+    queue = asyncio.Queue()
+    runner = acp_mod.AcpRunner(AgentSpec(
+        key="long", label="Long", acp_command=["unused"],
+        timeout=1, acp_idle_timeout=0.05))
+    runner._queue = queue
+    runner._bridge = acp_mod._Bridge(queue)
+    runner._conn = Connection()
+    runner._session_id = "session"
+    started = asyncio.get_running_loop().time()
+    turn = await runner.run("run the test suite")
+    elapsed = asyncio.get_running_loop().time() - started
+    check("a quiet in-flight tool survives past the idle boundary",
+          turn.ok and turn.text == "tests passed" and turn.tools == ["bash"]
+          and elapsed > runner.spec.acp_idle_timeout
+          and turn.meta.get("timeout_kind") is None,
+          f"elapsed={elapsed:.3f}s error={turn.error!r} tools={turn.tools} "
+          f"meta={turn.meta}")
+
+
+async def test_acp_idle_resumes_after_tool_completes() -> None:
+    print("\n[9c3] idle hang detection resumes once in-flight tools finish")
+    from leftover.agents import acp_runner as acp_mod
+
+    state = {"cancelled": 0, "prompt_finished": False}
+
+    class Connection:
+        async def prompt(self, session_id, prompt):
+            try:
+                await runner._bridge.session_update(session_id, {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "bash-1",
+                    "title": "bash",
+                    "status": "in_progress",
+                })
+                await asyncio.sleep(0.01)
+                await runner._bridge.session_update(session_id, {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "bash-1",
+                    "title": "bash",
+                    "status": "completed",
+                })
+                await asyncio.Event().wait()
+            finally:
+                state["prompt_finished"] = True
+
+        async def cancel(self, session_id):
+            state["cancelled"] += 1
+
+    queue = asyncio.Queue()
+    runner = acp_mod.AcpRunner(AgentSpec(
+        key="after", label="After", acp_command=["unused"],
+        timeout=1, acp_idle_timeout=0.05))
+    runner._queue = queue
+    runner._bridge = acp_mod._Bridge(queue)
+    runner._conn = Connection()
+    runner._session_id = "session"
+    original_grace = acp_mod._CANCEL_GRACE_TIMEOUT
+    acp_mod._CANCEL_GRACE_TIMEOUT = 0.01
+    started = asyncio.get_running_loop().time()
+    try:
+        turn = await asyncio.wait_for(runner.run("after tests"), timeout=0.4)
+    finally:
+        acp_mod._CANCEL_GRACE_TIMEOUT = original_grace
+    elapsed = asyncio.get_running_loop().time() - started
+    check("silence after a completed tool still hits the idle boundary",
+          turn.error == "ACP idle timed out after 0.05s without an update"
+          and turn.meta.get("timeout_kind") == "idle"
+          and 0.04 <= elapsed < 0.25,
+          f"elapsed={elapsed:.3f}s turn={turn}")
+    check("post-tool idle still cancels the hung prompt",
+          state == {"cancelled": 1, "prompt_finished": True}
           and not runner.live_session(), str(state))
 
 
@@ -5162,12 +5467,15 @@ async def main() -> int:
     test_codex_probe()
     test_keychain_write_keeps_the_token_off_argv()
     test_claude_usage_parse()
+    test_claude_refresh_uses_cli_user_agent()
+    test_claude_refresh_stops_on_rate_limit()
     test_grok_billing_parse()
     test_sub2api_codex_probe()
     test_cursor_usage_parse()
     test_quota_rhythm()
     test_ledger()
     await test_quota_fallback()
+    await test_forced_quota_keeps_live_failure()
     await test_quota_probe_preserves_concurrent_observed_limit()
     await test_fresh_quota_replaces_stale_observed_without_reset()
     await test_concurrent_probes_do_not_revive_stale_observed_limit()
@@ -5179,8 +5487,12 @@ async def main() -> int:
     await test_group_role_reservations()
     await test_debate_turn_timeout_is_bounded()
     await test_acp_idle_timeout_tracks_all_updates()
+    test_acp_plan_and_tool_progress_payloads()
+    await test_acp_session_update_emits_status_and_tool_paths()
     await test_acp_idle_timeout_cleans_up_silence()
     await test_acp_internal_activity_does_not_extend_idle_deadline()
+    await test_acp_long_running_tool_survives_idle_silence()
+    await test_acp_idle_resumes_after_tool_completes()
     await test_agent_pool_start_timeout_is_a_hard_boundary()
     await test_acp_close_is_a_hard_boundary()
     await test_acp_close_exits_asyncio_run_process()

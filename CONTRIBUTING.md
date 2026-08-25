@@ -1,8 +1,9 @@
 # Contributing
 
-Read [docs/core-features.md](docs/core-features.md) and [docs/maintenance.md](docs/maintenance.md) before changing behavior.
+Read [docs/core-features.md](docs/core-features.md), [docs/roadmap.md](docs/roadmap.md), and [docs/maintenance.md](docs/maintenance.md) before changing behavior.
 
-leftover is a thin router. Do not add a TUI, a proxy, or a second chat product.
+leftover is a thin router. Do not add a chat TUI, a proxy, or a second chat
+product. `leftover scope` is the skill-install switch (D19), not a pager.
 
 ## Checks
 
@@ -28,7 +29,7 @@ Python 3.10 through 3.13.
   `gemini-*` model. Neither may be pointed at another vendor's models.
 - `leftover --pick --json` `run` is `leftover --print …`, never a vendor TUI.
 - Classified quota text is a failure, not an answer.
-- `install-skills` writes symlinks.
+- `install-skills` writes symlinks. `leftover scope off` unlinks only leftover's own skill path.
 - Public name is leftover. `macbot` is an alias only.
 - A secret never travels as an argv element. Keychain writes go in on stdin.
 - `/quota` renders in English; its clock is the machine's unless

@@ -20,11 +20,13 @@ It does not draw a pager, sandbox, diff viewer, or subagent tree. Those stay ins
 |---|---|---|---|
 | Parent REPL | `macbot` then type; optional first argv | `leftover.chat` | compose, pick, group routes |
 | Headless one-shot | `leftover --print` / `-p "…"` | `run_print` / `run_discuss` | `test_run_print_*`, stdin replay |
+| Headless activity | `--print` stderr while the worker runs | `_Progress` / ACP `plan`+thought | `test_progress_is_visible_*`, plan payloads |
 | Headless JSON | `leftover -p --json "…"` | run envelope | `test_print_json_envelope_and_stdin` |
-| Headless timeout | `leftover -p --timeout 2m "…"` | per-attempt; exit 124 | parse + requires `-p` |
-| Skill handoff | `leftover --pick --json --agent $SELF "…"` | `decide`, `Pick.as_dict` | `--agent` vs `--use`, group `run` argv, process-exit completion |
+| Headless timeout | `leftover -p --timeout 2m "…"` | per-attempt; exit 124 | parse + requires `-p`; long in-flight tool stays 0 (`test_print_long_running_tool_does_not_exit_124`) |
+| Skill handoff | `leftover --pick --json --agent $SELF "…"` | `decide`, `Pick.as_dict` | `--agent` vs `--use`, group `run` argv, process-exit completion + parent poll while `--print` lives |
 | Preview | `macbot --dry-run "…"` | `_print_pick` | pick chain |
 | Why table | `macbot --why "…"` | `format_why` | lag/waste + remaining bar; no strength |
+| Why JSON | `leftover --why --json "…"` | `why_payload` | same columns; not a pick dump |
 | Seat / failover | TTY stderr/stdout | `ui.seat_line` / `failover_line` | usher-shaped, our axis |
 | Vendor TUI | `macbot --tui "…"` | `_exec` / `spawn_argv` | ACP command pins |
 | Plan | `/plan` or `--plan` | intent + `plan_key=claude` | `test_pick_plan_and_cu` |
@@ -35,8 +37,10 @@ It does not draw a pager, sandbox, diff viewer, or subagent tree. Those stay ins
 | Group: debate | `/debate` (needs 3 CLIs) | `_run_debate` | `test_debate_is_parallel_and_compact` |
 | Group: relay | `/relay` plan→implement→review | `_run_relay` | e2e |
 | Quota view | `leftover quota` or `/quota` | `router.report` + `rhythm` | parse probes + rhythm |
+| Quota JSON | `leftover quota --json` | `router.report_payload` | same windows; no tokens |
 | Doctor | `leftover doctor` | `doctor` | roster + remaining bar + paths |
-| Install skill | `leftover install-skills` | symlink `SKILL.md` | `test_skill_install_is_symlink` |
+| Install skill | `leftover install-skills` | symlink `SKILL.md` into every vendor CLI | `test_skill_install_is_symlink` |
+| Skill scope | `leftover scope` / `/scope` | per-CLI link/unlink of that skill | `test_skill_scope_toggles_vendor_cli_influence` |
 | Live session continuity | a successful in-process coding session keeps its backend | router + runner state | `test_sticky_requires_a_live_session` |
 | Workdir | `/cd` in REPL; `--print` uses `os.getcwd()` | `AgentPool.set_workdir` | `test_run_print_uses_current_workdir` |
 
@@ -77,7 +81,7 @@ It does not draw a pager, sandbox, diff viewer, or subagent tree. Those stay ins
 | Claude | `GET /api/oauth/usage` with the CLI's own OAuth | observed (`You've hit your weekly limit` as body) |
 | Grok | CLI-proxy `/v1/billing`; live ACP `x.ai/billing` only if already connected | local signals, then estimated |
 | Cursor | dashboard `GetCurrentPeriodUsage` via IDE `state.vscdb` token | plan name is not remaining quota |
-| Antigravity (`agy`) | none known | local ledger against `budget_5h_turns` / `budget_week_turns` |
+| Antigravity (`agy`) | none known | local ledger against `budget_5h_turns` / `budget_week_turns`, shown as `estimated local` |
 
 Probes reuse the vendor login. They must not spawn a Grok ACP session just to read billing, and must not hit grok.com gRPC-web.
 
@@ -92,7 +96,7 @@ Probes reuse the vendor login. They must not spawn a Grok ACP session just to re
 | Cursor on Claude/GPT models | — | Spends Cursor third-party pool |
 | Antigravity on Claude/GPT models | — | Same: `agy` offers Claude Opus/Sonnet and GPT-OSS, which spend Antigravity's third-party pool |
 | Guessing computer-use from generic text | `intent.py` | Only `/cu` and the explicit phrases |
-| leftover-drawn fullscreen UI | `ui.py` is chrome only | Want a pager → `--tui` |
+| leftover-drawn chat pager | `ui.py` is chrome; `scope.py` is five skill switches | Want a pager → `--tui` |
 
 `rhythm.py` is core (it is `/quota`). `render.py` is leftover (Telegram HTML).
 

@@ -1,6 +1,6 @@
 # Maintenance
 
-Policy for the leftover `0.1.x` line. Product inventory is [Core features](core-features.md). Shape is [Architecture](architecture.md). Why is [history/decisions.md](history/decisions.md).
+Policy for the leftover `0.1.x` line. Product inventory is [Core features](core-features.md). What may grow is [Roadmap](roadmap.md). Shape is [Architecture](architecture.md). Why is [history/decisions.md](history/decisions.md).
 
 ## Git root
 
@@ -13,10 +13,11 @@ This directory is the leftover git root (`github.com/XR-Lee/leftover`). Do not i
 ### CLI
 
 - `leftover` is the product entry. `agora` remains for doctor / frozen Telegram.
-- Additive flags may ship in 0.1.x. Removing `--pick` / `--print` / `--use` / `--agent` / `--tui` / `--why` is a breaking change. `-p` is an alias of `--print`.
+- Additive flags may ship in 0.1.x. Removing `--pick` / `--print` / `--use` / `--agent` / `--tui` / `--why` is a breaking change. `-p` is an alias of `--print`. `leftover scope` is additive (D19).
 - `--agent` must never become an alias of `--use`.
 - `leftover --pick --json` field names `kind`, `agent`, `agents`, `announce`, `run`, `completion`, `spawn`, `chain`, `reason` are a skill ABI. Rename only with a skill bump and a test.
 - Bare `--json` (no `-p`) stays a pick dump. `leftover -p --json` is a run envelope (`agent`, `kind`, `exit_code`, `output`, `attempts`).
+- `leftover quota --json` is the `/quota` windows (`source`, `used_percent`, `resets_at`, `note`). `leftover --why --json` is the lag+waste table (`lag`, `waste`, `total`). Neither is a pick dump. Neither grows a strength field.
 
 ### Agents
 
@@ -55,7 +56,7 @@ This directory is the leftover git root (`github.com/XR-Lee/leftover`). Do not i
 - ACP filesystem callbacks use a bounded daemon pool so blocked OS I/O cannot hold the event loop or interpreter open. A queued write that has not started is skipped after timeout. A write already inside synchronous OS I/O cannot be revoked; its timeout must say the outcome is uncertain and the write may complete later, so callers inspect the file before retrying.
 - Every ACP connection owns its event queue. A cancelled or superseded lifecycle generation must not publish a session or deliver late updates into a later turn.
 - A live ACP runner and session are reused for later explicit turns on the same agent and workdir. A prompt-level connection failure retires that runner so the next turn creates a clean session.
-- Whole-turn and ACP idle timeouts are terminal for the request. Do not replay a possibly state-changing task on a different backend; quick startup/auth/quota/transient failures may still follow `max_attempts`.
+- Whole-turn and ACP idle timeouts are terminal for the request. Do not replay a possibly state-changing task on a different backend; quick startup/auth/quota/transient failures may still follow `max_attempts`. ACP idle is paused while a tool is in-flight; it resumes when that tool completes. Internal protocol activity still does not reset it.
 - Exec `stream-json` timeout includes the period after stdout EOF while the child is still alive. Legal NDJSON records may exceed the default 64 KiB StreamReader limit. Per-turn metadata must be reset before every process.
 - An exec leader's returncode is the command boundary. If descendants retain inherited stdout/stderr after that exit, terminate the saved process group, drain the captured output, and complete the turn instead of waiting for the full model timeout.
 - Piped stdin is sampled with a finite non-blocking read. Readability does not imply EOF, so `--print` must never call an unbounded read-to-EOF before routing.
@@ -91,9 +92,12 @@ Needs a new entry in `docs/history/decisions.md`:
 - New default mode (for example making `--tui` the REPL default).
 - A Grok/Codex/Cursor plugin beyond `install-skills`.
 - Replacing runners with acpbot/OpenACP (D6), or folding the product into usher (D13).
-- A fifth built-in agent.
+- A sixth built-in agent (Antigravity is already the fifth; D17).
 - Growing Telegram, Discord, or any second frontend.
 - Forking a vendor TUI.
+
+Growth that is not a bugfix must pass the [roadmap](roadmap.md) filter
+(D18): official remaining, lag+waste, or the parent conversation.
 
 Never:
 
@@ -117,7 +121,7 @@ python tests/test_state_reliability.py
 python -m compileall -q leftover tests
 ```
 
-`test_macbot.py` is the product contract (intent, score, pick JSON, `--print` chain, ACP lifecycle). `test_routing.py` is probes, classification, timeout/fallback policy, and ACP process cleanup. `test_e2e.py` is group modes on mock ACP. `test_reliability.py` covers quota deadlines, ledger concurrency, stream-json EOF hangs, and per-turn exec metadata. `test_state_reliability.py` covers multi-process state merging and atomic reads.
+`test_macbot.py` is the product contract (intent, score, pick JSON, `--print` chain, ACP lifecycle, quiet in-flight tool must not exit 124). `test_routing.py` is probes, classification, timeout/fallback policy, and ACP process cleanup. `test_e2e.py` is group modes on mock ACP. `test_reliability.py` covers quota deadlines, ledger concurrency, stream-json EOF hangs, and per-turn exec metadata. `test_state_reliability.py` covers multi-process state merging and atomic reads.
 
 A quota-parser change that only updates `quota.py` is incomplete. Add a fixture-shaped payload next to the existing `parse_*` tests.
 
@@ -140,6 +144,7 @@ Router/group changes must keep:
 
 - successful explanations of 401/429/500/timeout do not trigger fallback
 - whole-turn and idle timeout do not cross backends
+- a quiet in-flight ACP tool must not make `--print` exit 124
 - debate role timeout does not replay on a spare
 - broadcast work stays parallel while emitted answers remain grouped
 - group delivery budgets exclude model compute gaps
@@ -172,6 +177,7 @@ Vendor CLIs are not Python dependencies. `doctor` tells the operator what is mis
 1. Run the five test files above plus `compileall`.
 2. `leftover doctor` on a machine with at least one CLI.
 3. Diff `BUILTIN_AGENTS` ACP/exec argv against `test_builtin_acp_commands`.
-4. Confirm `install-skills` still symlinks, not copies.
+4. Confirm `install-skills` still symlinks, not copies. `leftover scope off`
+   must unlink only leftover's skill path.
 5. Note any vendor field rename in `notes/platform-notes.md`.
 6. Do not tag a release from the mixed parent folder.

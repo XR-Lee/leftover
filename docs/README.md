@@ -5,6 +5,7 @@ leftover is a thin local router: classify a task, pick a subscription CLI, hand 
 | Doc | Use when |
 |---|---|
 | [Core features](core-features.md) | What the product is. What this repo must keep. |
+| [Roadmap](roadmap.md) | What to grow. What to refuse. |
 | [Architecture](architecture.md) | Module map and data flow. |
 | [Maintenance](maintenance.md) | Invariants, test gates. |
 | [Decisions](history/decisions.md) | Why those invariants exist. |

@@ -7,7 +7,7 @@ widening / narrowing = |calendar - used| vs the previous snapshot of that window
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Iterable
+from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 from .config import AgentSpec
@@ -26,6 +26,7 @@ _LABELS = {
     "monthly": "monthly",
     "monthly auto": "Models",
     "monthly api": "Other api%",
+    "extra": "extra",
 }
 
 
@@ -116,12 +117,14 @@ def same_window(a: Window, b: Window) -> bool:
 
 
 def just_reset(window: Window, now: float) -> bool:
+    if window.source == ESTIMATED:
+        return False
     if window.used_percent > 1:
         return False
     cal = calendar_pct(window, now)
     if cal is not None:
         return cal < 8
-    return window.resets_at is None
+    return False
 
 
 def _prev_window(prev: Quota | None, window: Window) -> Window | None:
@@ -174,16 +177,32 @@ def _join(parts: Iterable[str | None]) -> str:
     return " · ".join(p for p in parts if p)
 
 
+def _keep_window(window: Window, now: float) -> bool:
+    expired = window.resets_at is not None and window.resets_at <= now
+    if expired and not just_reset(window, now):
+        return False
+    return True
+
+
 def _real(quota: Quota, now: float) -> list[Window]:
-    out: list[Window] = []
-    for window in quota.windows:
-        if window.source == ESTIMATED:
-            continue
-        expired = window.resets_at is not None and window.resets_at <= now
-        if expired and not just_reset(window, now):
-            continue
-        out.append(window)
-    return out
+    vendor = [
+        window for window in quota.windows
+        if window.source != ESTIMATED and _keep_window(window, now)
+    ]
+    if vendor:
+        return vendor
+    return [
+        window for window in quota.windows
+        if window.source == ESTIMATED and _keep_window(window, now)
+    ]
+
+
+def _display_title(quota: Quota, fallback: str, windows: list[Window]) -> str:
+    title = quota.title or fallback
+    if windows and all(window.source == ESTIMATED for window in windows):
+        if "estimated" not in title.lower():
+            return f"{title} · estimated local"
+    return title
 
 
 def _primary(windows: list[Window], now: float) -> Window | None:
@@ -213,7 +232,10 @@ def render_grok(quota: Quota, prev: Quota | None, now: float, tz) -> str:
     window = windows[0]
     tags = pace_tags(window, _prev_window(prev, window),
                      now=now, prev_now=prev.checked_at if prev else None)
-    title = quota.title or "official weekly pool"
+    if window.source == ESTIMATED:
+        title = _display_title(quota, "Grok", windows)
+    else:
+        title = quota.title or "official weekly pool"
     lines = [_join([title, *tags])]
     cal = calendar_pct(window, now)
     used = window.used_percent
@@ -235,11 +257,15 @@ def render_grok(quota: Quota, prev: Quota | None, now: float, tz) -> str:
             footer.append(f"{name} {fmt_pct(pct)}")
     if footer:
         lines.append(" · ".join(footer))
+    if (quota.note and windows
+            and all(item.source == ESTIMATED for item in windows)):
+        lines.append(quota.note)
     return "\n".join(lines)
 
 
 def render_cursor(quota: Quota, prev: Quota | None, now: float, tz) -> str:
-    if not _real(quota, now):
+    windows = _real(quota, now)
+    if not windows:
         return _join([quota.title or "Cursor", quota.note or "no vendor number"])
     extras = quota.extras
     used = extras.get("included_used_usd")
@@ -247,7 +273,7 @@ def render_cursor(quota: Quota, prev: Quota | None, now: float, tz) -> str:
     remaining = extras.get("included_remaining_usd")
     monthly = next((w for w in quota.windows if w.name == "monthly"), None)
     prev_monthly = _prev_window(prev, monthly) if monthly else None
-    header = quota.title or "Cursor"
+    header = _display_title(quota, "Cursor", windows)
     if isinstance(used, (int, float)) and isinstance(limit, (int, float)) and limit:
         pct = used / limit * 100.0
         header = (f"{header} · included {fmt_usd(used)} / {fmt_usd(limit)}"
@@ -261,8 +287,8 @@ def render_cursor(quota: Quota, prev: Quota | None, now: float, tz) -> str:
         if money:
             header += " · " + money[0]
     lines = [header]
-    for window in quota.windows:
-        if window.name == "monthly" or window.source == ESTIMATED:
+    for window in windows:
+        if window.name == "monthly":
             continue
         cal = calendar_pct(window, now)
         tags = pace_tags(window, _prev_window(prev, window),
@@ -310,9 +336,9 @@ def _window_line(window: Window, prev: Quota | None, now: float, tz,
 def render_windows(spec: AgentSpec, quota: Quota, prev: Quota | None,
                    now: float, tz) -> str:
     windows = _real(quota, now)
-    identity = quota.title or spec.label
+    identity = _display_title(quota, spec.label, windows)
     if not windows:
-        return _join([identity, quota.note or "no vendor number"])
+        return _join([quota.title or spec.label, quota.note or "no vendor number"])
     fresh = [w for w in windows if just_reset(w, now)]
     live = [w for w in windows if w not in fresh]
     primary = _primary(live, now)
@@ -354,6 +380,9 @@ def render_windows(spec: AgentSpec, quota: Quota, prev: Quota | None,
         foot.append(f"{label_of(window)} just reset")
     if foot:
         lines.append("  ·  ".join(foot) if len(foot) > 1 else foot[0])
+    if (quota.note and windows
+            and all(item.source == ESTIMATED for item in windows)):
+        lines.append(quota.note)
     return "\n".join(lines)
 
 
@@ -364,6 +393,31 @@ def render_agent(spec: AgentSpec, quota: Quota, prev: Quota | None,
     if spec.key == "cursor":
         return render_cursor(quota, prev, now, tz)
     return render_windows(spec, quota, prev, now, tz)
+
+
+def payload(entries: list[tuple[AgentSpec, Quota, Quota | None]], *,
+            now: float, strategy: str = "", order: list[str] | None = None,
+            tz_name: str = "") -> dict[str, Any]:
+    """Same windows `/quota` prints, as a scriptable dict. No tokens."""
+    tz = _tz(tz_name)
+    agents = []
+    for spec, quota, _prev in entries:
+        agents.append({
+            "key": spec.key,
+            "label": spec.label,
+            "source": quota.best_source,
+            "note": quota.note,
+            "title": quota.title,
+            "checked_at": quota.checked_at,
+            "windows": [window.to_dict() for window in quota.windows],
+        })
+    return {
+        "checked_at": now,
+        "timezone": _tz_label(tz),
+        "strategy": strategy,
+        "order": list(order or []),
+        "agents": agents,
+    }
 
 
 def render(entries: list[tuple[AgentSpec, Quota, Quota | None]], *,

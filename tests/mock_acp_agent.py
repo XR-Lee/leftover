@@ -15,6 +15,7 @@ from acp import (
     run_agent,
     start_tool_call,
     update_agent_message_text,
+    update_tool_call,
 )
 from acp.interfaces import Agent
 from acp.schema import (
@@ -73,6 +74,37 @@ class MockAgent(Agent):
             raise RuntimeError("connection reset by peer")
         if behavior == "slow":
             await asyncio.sleep(float(os.environ.get("MOCK_SLOW_SECONDS", "5")))
+        if behavior == "long_tool":
+            # Quiet in-flight execute, like pytest / cargo test. leftover must
+            # not treat this silence as an ACP idle hang.
+            seconds = float(os.environ.get("MOCK_TOOL_SECONDS", "0.2"))
+            await self.conn.session_update(
+                session_id=session_id,
+                update=start_tool_call(
+                    tool_call_id="pytest-1",
+                    title="pytest",
+                    kind="execute",
+                    status="in_progress",
+                    raw_input={"command": ["pytest", "-q"]},
+                ),
+            )
+            await asyncio.sleep(seconds)
+            if session_id in self.cancelled:
+                self.cancelled.discard(session_id)
+                return PromptResponse(stop_reason="cancelled")
+            await self.conn.session_update(
+                session_id=session_id,
+                update=update_tool_call(
+                    tool_call_id="pytest-1",
+                    title="pytest",
+                    status="completed",
+                ),
+            )
+            await self.conn.session_update(
+                session_id=session_id,
+                update=update_agent_message_text("tests passed"),
+            )
+            return PromptResponse(stop_reason="end_turn")
 
         await self.conn.session_update(
             session_id=session_id,

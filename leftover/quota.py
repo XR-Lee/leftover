@@ -148,8 +148,15 @@ class Quota:
 
     @property
     def headroom(self) -> float:
-        """Worst-case remaining fraction across all live windows."""
-        live = [w for w in self.windows if not w.expired]
+        """Worst-case remaining fraction across live plan windows.
+
+        Extra/overage buckets are displayed, but they must not make a fresh
+        5h/weekly plan look empty for ranking.
+        """
+        live = [w for w in self.windows
+                if not w.expired and w.name != "extra"]
+        if not live:
+            live = [w for w in self.windows if not w.expired]
         return min((w.headroom for w in live), default=1.0)
 
     @property
@@ -1119,6 +1126,46 @@ _CLAUDE_FLAT = (
     ("seven_day_opus", "weekly opus"),
     ("seven_day_sonnet", "weekly sonnet"),
 )
+_CLAUDE_UA_FALLBACK = "claude-code/2.1.239"
+_CLAUDE_UA: str | None = None
+
+
+def _claude_user_agent() -> str:
+    """Same product UA the Claude Code CLI sends. Cloudflare 1010s Python's."""
+    global _CLAUDE_UA
+    if _CLAUDE_UA:
+        return _CLAUDE_UA
+    import shutil
+    binary = shutil.which("claude")
+    if binary:
+        try:
+            proc = subprocess.run(
+                [binary, "--version"], capture_output=True, text=True,
+                timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            proc = None
+        if proc is not None:
+            text = f"{proc.stdout or ''} {proc.stderr or ''}"
+            match = re.search(r"(\d+\.\d+\.\d+)", text)
+            if match:
+                _CLAUDE_UA = f"claude-code/{match.group(1)}"
+                return _CLAUDE_UA
+    _CLAUDE_UA = _CLAUDE_UA_FALLBACK
+    return _CLAUDE_UA
+
+
+def _claude_request_headers(token: str | None = None) -> dict[str, str]:
+    headers = {
+        "User-Agent": _claude_user_agent(),
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        headers["anthropic-beta"] = "oauth-2025-04-20"
+        headers["anthropic-version"] = "2023-06-01"
+        headers["x-app"] = "cli"
+    return headers
 
 
 def _claude_dir(home: Path | None = None) -> Path:
@@ -1214,10 +1261,14 @@ def _refresh_claude_oauth(blob: dict[str, Any], source: str,
     if isinstance(scopes, list) and scopes:
         payload["scope"] = " ".join(str(s) for s in scopes)
     result: Any = None
+    headers = _claude_request_headers()
     for url in _CLAUDE_TOKEN_URLS:
-        status, body = _http_json("POST", url, body=payload, timeout=10.0)
+        status, body = _http_json(
+            "POST", url, body=payload, headers=headers, timeout=10.0)
         if status == 200 and isinstance(body, dict) and body.get("access_token"):
             result = body
+            break
+        if status == 429:
             break
     if not isinstance(result, dict):
         return None
@@ -1316,12 +1367,25 @@ def parse_claude_usage(payload: dict[str, Any], *, plan: str = "",
                 detail="anthropic oauth/usage",
             ))
     extra_note = ""
+    extra_meta: dict[str, Any] = {}
     extra = payload.get("extra_usage")
     if isinstance(extra, dict) and extra.get("is_enabled"):
         used = extra.get("used_credits")
         limit = extra.get("monthly_limit")
         if isinstance(used, (int, float)) and isinstance(limit, (int, float)) and limit:
-            extra_note = f"extra ${used/100:.2f}/${limit/100:.2f}"
+            pct = min(100.0, max(0.0, float(used) / float(limit) * 100.0))
+            windows.append(Window(
+                name="extra",
+                used_percent=pct,
+                source=REPORTED,
+                detail="anthropic extra usage",
+            ))
+            extra_note = f"extra {pct:.0f}%"
+            extra_meta = {
+                "extra_used_credits": used,
+                "extra_limit": limit,
+                "extra_used_percent": pct,
+            }
     if not windows:
         return None
     note = "anthropic /api/oauth/usage"
@@ -1334,8 +1398,9 @@ def parse_claude_usage(payload: dict[str, Any], *, plan: str = "",
         title = f"Claude · {identity}"
     elif plan:
         title = f"Claude · {plan}"
+    extras = {"plan": plan, "identity": identity, **extra_meta}
     return Quota(agent="claude", windows=windows, note=note, title=title,
-                 extras={"plan": plan, "identity": identity})
+                 extras=extras)
 
 
 def probe_claude(home: Path | None = None) -> Quota | None:
@@ -1360,7 +1425,9 @@ def probe_claude(home: Path | None = None) -> Quota | None:
     exp_ms = expires_at if isinstance(expires_at, (int, float)) else None
     if exp_ms is not None and exp_ms < 1e12:
         exp_ms *= 1000
+    tried_refresh = False
     if source != "env" and (exp_ms is None or time.time() * 1000 > exp_ms - 60_000):
+        tried_refresh = True
         refreshed = _refresh_claude_oauth(blob, source, home)
         if refreshed is not None:
             blob = refreshed
@@ -1369,23 +1436,16 @@ def probe_claude(home: Path | None = None) -> Quota | None:
     if not isinstance(token, str) or not token:
         return Quota(agent="claude", windows=[],
                      note="Claude OAuth token missing — run `claude` to log in")
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "User-Agent": "claude-code/2.1.239",
-        "anthropic-beta": "oauth-2025-04-20",
-        "anthropic-version": "2023-06-01",
-        "x-app": "cli",
-    }
+    headers = _claude_request_headers(token)
     status, payload = _http_json(
         "GET", "https://api.anthropic.com/api/oauth/usage", headers=headers)
-    if status in (401, 403) and source != "env":
+    if status in (401, 403) and source != "env" and not tried_refresh:
         refreshed = _refresh_claude_oauth(blob, source, home)
         if refreshed is not None:
             oauth = refreshed.get("claudeAiOauth") or refreshed.get("claudeAi") or {}
             token = oauth.get("accessToken") or oauth.get("access")
             if isinstance(token, str) and token:
-                headers["Authorization"] = f"Bearer {token}"
+                headers = _claude_request_headers(token)
                 status, payload = _http_json(
                     "GET", "https://api.anthropic.com/api/oauth/usage",
                     headers=headers)

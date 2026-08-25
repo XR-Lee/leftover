@@ -37,6 +37,9 @@ from .process_tree import ProcessTree, terminate_process_tree
 
 _DONE = object()
 _ACTIVITY = object()
+_TERMINAL_TOOL_STATUS = frozenset({
+    "completed", "failed", "cancelled", "error", "success",
+})
 _CANCEL_RPC_TIMEOUT = 2.0
 _CANCEL_GRACE_TIMEOUT = 2.0
 _CLOSE_TIMEOUT = 6.0
@@ -127,6 +130,112 @@ def _block_text(content: Any) -> str:
     if isinstance(content, dict):
         return content.get("text", "")
     return ""
+
+
+def _field(obj: Any, *names: str) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        for name in names:
+            value = obj.get(name)
+            if value is not None:
+                return value
+        return None
+    for name in names:
+        value = getattr(obj, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _collapse(text: str, limit: int = 120) -> str:
+    collapsed = " ".join((text or "").split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[:limit].rstrip() + " ..."
+
+
+_PATH_KEYS = (
+    "path", "file", "file_path", "filePath", "target_file", "targetFile", "uri",
+)
+
+
+def _location_path(location: Any) -> str:
+    path = _field(location, "path", "uri")
+    return str(path).strip() if path else ""
+
+
+def _raw_input_hint(raw: Any) -> str:
+    if not isinstance(raw, dict):
+        return ""
+    for key in _PATH_KEYS:
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    command = raw.get("command", raw.get("cmd"))
+    if isinstance(command, str) and command.strip():
+        return command.strip()
+    if isinstance(command, list) and command:
+        return " ".join(str(part) for part in command if str(part).strip())
+    return ""
+
+
+def _tool_label(update: Any) -> str:
+    title = str(
+        _field(update, "title") or _field(update, "kind") or "tool"
+    ).strip() or "tool"
+    path = ""
+    for location in _field(update, "locations") or []:
+        path = _location_path(location)
+        if path:
+            break
+    if not path:
+        path = _raw_input_hint(_field(update, "raw_input", "rawInput"))
+    if path and path not in title:
+        return _collapse(f"{title} {path}")
+    return _collapse(title)
+
+
+def _tool_status(update: Any) -> str:
+    return str(_field(update, "status") or "").strip().lower()
+
+
+def _tool_label_better(new: str, old: str) -> bool:
+    if not new or new == old:
+        return False
+    if not old or old in {"tool", "other"}:
+        return True
+    if old in new and len(new) > len(old):
+        return True
+    return ("/" in new or "\\" in new) and "/" not in old and "\\" not in old
+
+
+def _plan_activity(update: Any) -> str:
+    entries = _field(update, "entries")
+    if entries is None:
+        plan = _field(update, "plan")
+        if plan is None:
+            return ""
+        entries = _field(plan, "entries")
+        if entries is None:
+            markdown = _field(plan, "content")
+            if markdown:
+                return _collapse(str(markdown))
+            uri = _field(plan, "uri")
+            return _collapse(str(uri)) if uri else ""
+    in_progress: list[str] = []
+    pending: list[str] = []
+    for entry in entries or []:
+        content = str(_field(entry, "content") or "").strip()
+        if not content:
+            continue
+        status = str(_field(entry, "status") or "").strip()
+        if status == "in_progress":
+            in_progress.append(content)
+        elif status == "pending":
+            pending.append(content)
+    chosen = in_progress or pending
+    return _collapse(chosen[0]) if chosen else ""
 
 
 def _update_payload(update: Any) -> Any:
@@ -400,7 +509,8 @@ class _Bridge(Client):
     def __init__(self, queue: asyncio.Queue[Any], trust_tools: bool = True) -> None:
         self.queue = queue
         self.trust_tools = trust_tools
-        self._seen_tools: set[str] = set()
+        self._seen_tools: dict[str, str] = {}
+        self.in_flight_tools: set[str] = set()
         self._turn: _TurnGate | None = None
         self._observed_updates: list[
             tuple[str, str, _TurnGate | None]] = []
@@ -447,6 +557,7 @@ class _Bridge(Client):
         self._turn = turn
         self.queue = turn.queue
         self._seen_tools.clear()
+        self.in_flight_tools.clear()
 
     def settle_turn(self, turn: _TurnGate, state: str, *, result: Any = None,
                     error: BaseException | None = None) -> bool:
@@ -473,22 +584,34 @@ class _Bridge(Client):
                 or not turn.accepting):
             self.dropped_updates += 1
             return
-        kind = getattr(update, "session_update", "")
+        kind = str(_field(update, "session_update", "sessionUpdate") or "")
         event: Any = _ACTIVITY
         if kind == "agent_message_chunk":
-            text = _block_text(getattr(update, "content", None))
+            text = _block_text(_field(update, "content"))
             if text:
                 event = Event("text", text)
         elif kind == "agent_thought_chunk":
-            text = _block_text(getattr(update, "content", None))
+            text = _block_text(_field(update, "content"))
             if text:
                 event = Event("thought", text)
         elif kind in ("tool_call", "tool_call_update"):
-            tool_id = str(getattr(update, "tool_call_id", ""))
-            title = getattr(update, "title", None) or getattr(update, "kind", "") or "tool"
-            if tool_id not in self._seen_tools:
-                self._seen_tools.add(tool_id)
-                event = Event("tool", str(title)[:120])
+            tool_id = str(_field(update, "tool_call_id", "toolCallId") or "") or "*"
+            label = _tool_label(update)
+            previous = self._seen_tools.get(tool_id)
+            if previous is None:
+                self._seen_tools[tool_id] = label
+                event = Event("tool", label)
+            elif _tool_label_better(label, previous):
+                self._seen_tools[tool_id] = label
+                event = Event("tool", label)
+            if _tool_status(update) in _TERMINAL_TOOL_STATUS:
+                self.in_flight_tools.discard(tool_id)
+            else:
+                self.in_flight_tools.add(tool_id)
+        elif kind in ("plan", "plan_update"):
+            text = _plan_activity(update)
+            if text:
+                event = Event("status", text)
         # Non-renderable activity wakes the consumer without extending the
         # user-visible idle deadline. A settled gate rejects all late updates.
         if not turn.emit(event):
@@ -556,6 +679,10 @@ class AcpRunner(BaseRunner):
 
     def live_session(self) -> bool:
         return self._conn is not None and self._session_id is not None
+
+    def _tools_in_flight(self) -> bool:
+        bridge = self._bridge
+        return bool(bridge is not None and bridge.in_flight_tools)
 
     async def start(self, workdir: str) -> None:
         async with self._lifecycle_lock:
@@ -826,16 +953,24 @@ class AcpRunner(BaseRunner):
                 idle_timeout = self.spec.acp_idle_timeout
                 idle_deadline = (loop.time() + idle_timeout
                                  if idle_timeout > 0 else None)
+                busy = False
                 while True:
                     now = loop.time()
                     remaining = deadline - now
                     if remaining <= 0:
                         raise TimeoutError
+                    in_flight = self._tools_in_flight()
+                    if idle_deadline is not None and busy and not in_flight:
+                        # The last in-flight tool just ended. Restart hang
+                        # detection from now so a 10-minute pytest is not an
+                        # instant stall the moment it prints "done".
+                        idle_deadline = now + idle_timeout
+                    busy = in_flight
                     try:
                         item = queue.get_nowait()
                     except asyncio.QueueEmpty:
                         wait_timeout = remaining
-                        if idle_deadline is not None:
+                        if idle_deadline is not None and not in_flight:
                             idle_remaining = idle_deadline - now
                             if idle_remaining <= 0:
                                 raise AcpIdleTimeout(idle_timeout)
@@ -845,7 +980,10 @@ class AcpRunner(BaseRunner):
                                 queue.get(), timeout=wait_timeout)
                         except asyncio.TimeoutError:
                             now = loop.time()
+                            if self._tools_in_flight() and now < deadline:
+                                continue
                             if (idle_deadline is not None
+                                    and not self._tools_in_flight()
                                     and idle_deadline <= now
                                     and idle_deadline <= deadline):
                                 raise AcpIdleTimeout(idle_timeout) from None
@@ -857,6 +995,7 @@ class AcpRunner(BaseRunner):
                         continue
                     if item is _ACTIVITY:
                         if (idle_deadline is not None
+                                and not self._tools_in_flight()
                                 and idle_deadline <= loop.time()):
                             raise AcpIdleTimeout(idle_timeout)
                         continue

@@ -1,6 +1,6 @@
 # Architecture
 
-Implemented shape of the `0.1.x` tree. Planned work stays in [Maintenance](maintenance.md) and [history/decisions.md](history/decisions.md).
+Implemented shape of the `0.1.x` tree. Planned work stays in [Roadmap](roadmap.md). Policy is [Maintenance](maintenance.md). Why is [history/decisions.md](history/decisions.md).
 
 ## Goals
 
@@ -47,6 +47,7 @@ The package still ships `agora bot` (Telegram) on the same orchestrator, behind 
 | Piece | File | Responsibility |
 |---|---|---|
 | CLI | `macbot.py` (CLI module) | argv, REPL, `--pick` JSON, `-p`/`--print`, `--tui`, `--why`, `--timeout`, skills |
+| Skill scope | `scope.py` | leftover's skill in other CLIs; `leftover scope` / `/scope` |
 | Intent | `intent.py` | slash / `@` / CU phrases → `Intent` |
 | Score | `score.py` | lag, waste, one number per agent |
 | Quota | `quota.py` | probes, `classify()`, ledger, Window/Quota serde |
@@ -57,7 +58,7 @@ The package still ships `agora bot` (Telegram) on the same orchestrator, behind 
 | Pool | `agents/` | one live runner per agent; ACP→exec on start failure |
 | Config | `config.py` | `~/.config/leftover/leftover.toml` then agora.toml; builtins |
 | UI | `ui.py` | seat/failover chrome, `StreamSink` |
-| Skill | `skills/leftover/SKILL.md` | how a vendor CLI re-enters leftover |
+| Skill | `skills/leftover/SKILL.md` | how a vendor CLI re-enters leftover; presence is `leftover scope` |
 | Doctor | `doctor.py` | roster, cached remaining, install hints, paths |
 
 State on disk:
@@ -94,8 +95,8 @@ Config search order: `~/.config/leftover/leftover.toml`, `~/.config/macbot/macbo
 Both the initial `--pick --json` query and the argv in `run` are synchronous and
 foreground. If either yields an execution handle, the parent waits on that same
 handle instead of starting another pick or handoff. The `leftover --print`
-process writes progress to stderr, writes the final answer to stdout, then
-exits. Process exit is the only completion callback across this boundary; a
+process writes progress to stderr (tools, in-progress plan, compact thought,
+heartbeat), writes the final answer to stdout, then exits. Process exit is the only completion callback across this boundary; a
 stderr heartbeat cannot wake a parent agent that is not waiting on the command
 handle.
 
@@ -170,23 +171,25 @@ hold `asyncio.run()` teardown open.
 
 Timeouts remain distinct: queue wait, task deadline, ACP visible-progress idle
 deadline, event-sink delivery, and cleanup grace each have their own boundary.
-Protocol activity without visible thought, tool, or text output does not extend
-the ACP idle deadline. Turn, idle, and event-sink timeouts become visible to
-the parent before ACP abort cleanup; shutdown also owns direct prepare/startup
-tasks so a warmup cannot retain the pool's read gate unnoticed.
+Protocol activity without visible thought, plan/status, tool, or text output
+does not extend the ACP idle deadline. Turn, idle, and event-sink timeouts
+become visible to the parent before ACP abort cleanup; shutdown also owns
+direct prepare/startup tasks so a warmup cannot retain the pool's read gate
+unnoticed.
 
 ## Built-in agents
 
-Defined in `config.BUILTIN_AGENTS`. Keys are stable: `claude`, `gpt`, `grok`, `cursor`.
+Defined in `config.BUILTIN_AGENTS`. Keys are stable: `claude`, `gpt`, `grok`, `cursor`, `antigravity`.
 
 | Key | Interactive | ACP (current pin) | Coding pool |
 |---|---|---|---|
 | `gpt` | `codex` | `npx -y @agentclientprotocol/codex-acp@1.6.2` | yes |
 | `grok` | `grok` (no argv prompt) | `grok agent stdio` | yes |
 | `cursor` | `cursor-agent --model grok-4.6` | same + `acp` | yes |
+| `antigravity` | `agy --model gemini-3.1-pro-high` | none (exec only) | yes, last |
 | `claude` | `claude` | `npx -y @agentclientprotocol/claude-agent-acp` | no (plan + last resort) |
 
-Vendor flags drift. Change the pin in builtins **and** `test_builtin_acp_commands`. Do not add a fifth agent unless it speaks ACP or a headless print mode and has a quota probe or an honest estimated budget.
+Vendor flags drift. Change the pin in builtins **and** `test_builtin_acp_commands`. Do not add a sixth agent unless it speaks ACP or a headless print mode and has a quota probe or an honest estimated budget.
 
 ## Two routers, one job split
 

@@ -73,6 +73,14 @@ def ok(text: str) -> str:
     return paint(text, _C.green)
 
 
+def compact_activity(text: str, limit: int = 120) -> str:
+    """One progress line: whitespace collapsed, truncated."""
+    collapsed = " ".join((text or "").split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[:limit].rstrip() + " ..."
+
+
 def announce(name: str | None, kind: str = "") -> str:
     """Plain routing-entry line for JSON / skills. No fallback chain."""
     if not name:
@@ -236,7 +244,7 @@ _STREAM_WRITER = _DaemonStreamWriter()
 
 
 class StreamSink:
-    """Render one agent turn: badge, streamed text, compact tool lines."""
+    """Render one agent turn: badge, streamed text, compact tool/status lines."""
 
     def __init__(self, spec_label: str, out: TextIO = sys.stdout,
                  show_header: bool = True) -> None:
@@ -244,6 +252,7 @@ class StreamSink:
         self.out = out
         self._header = not show_header
         self._nl = True
+        self._thought = ""
         self._writer = _STREAM_WRITER
 
     def _ensure_header(self) -> None:
@@ -254,19 +263,41 @@ class StreamSink:
         self._header = True
         self._nl = True
 
+    def _write_note(self, text: str, bullet: str = "▸") -> None:
+        text = compact_activity(text, 100)
+        if not text:
+            return
+        self._ensure_header()
+        if not self._nl:
+            self.out.write("\n")
+        self.out.write(dim(f"  {bullet} {text}") + "\n")
+        self._nl = True
+        self.out.flush()
+
+    def _flush_thought(self) -> None:
+        text = compact_activity(self._thought)
+        self._thought = ""
+        if text:
+            self._write_note(text, "·")
+
     def _write_event(self, kind: str, text: str) -> None:
+        if kind == "thought" and text:
+            self._thought += text
+            collapsed = compact_activity(self._thought)
+            if "\n" in text or len(collapsed) >= 120:
+                self._flush_thought()
+            return
+        if kind != "thought":
+            self._flush_thought()
         if kind == "text" and text:
             self._ensure_header()
             self.out.write(text)
             self._nl = text.endswith("\n")
             self.out.flush()
         elif kind == "tool" and text:
-            self._ensure_header()
-            if not self._nl:
-                self.out.write("\n")
-            self.out.write(dim(f"  ▸ {text[:100]}") + "\n")
-            self._nl = True
-            self.out.flush()
+            self._write_note(text, "▸")
+        elif kind == "status" and text:
+            self._write_note(text, "·")
         elif kind == "error" and text:
             self._ensure_header()
             if not self._nl:

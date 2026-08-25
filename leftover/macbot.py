@@ -4,7 +4,8 @@ Existing wheels this uses:
 - leftover.quota     Codex/Grok probes, refusal classifier, local ledger
 - leftover.router    fallback + circuit breaker (strategy=lag_waste)
 - official CLIs      claude / codex / grok / cursor-agent  (no proxy, no keys)
-- Agent Skills       SKILL.md dropped into ~/.codex ~/.claude ~/.agents
+- Agent Skills       SKILL.md dropped into ~/.codex ~/.claude ~/.agents;
+                     leftover scope turns that influence on or off
 """
 from __future__ import annotations
 
@@ -23,11 +24,13 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from . import config as config_mod
 from . import doctor as doctor_mod
 from . import intent as intent_mod
 from . import quota as q
+from . import scope as scope_mod
 from .config import DEFAULT_DATA_DIR, LEGACY_DATA_DIR, AgentSpec, Config
 from .router import Router, State
 from .score import AgentScore
@@ -67,8 +70,9 @@ DISCUSS_COMMANDS = {
     "relay": "/relay",
 }
 
-BANNER = "leftover  ·  /plan /cu /quota /cd /reset /quit"
+BANNER = "leftover  ·  /plan /cu /quota /scope /cd /reset /quit"
 PROGRESS_HEARTBEAT_SECONDS = 30.0
+PROGRESS_ACTIVITY_SECONDS = 1.5
 
 WORK = (
     "You are a subagent spawned by leftover, the user's only conversation. "
@@ -98,6 +102,10 @@ class _Progress:
         self.out = sys.stderr if out is None else out
         self._last_visible = 0.0
         self._active = context
+        self._agent_label = ""
+        self._thought_buf = ""
+        self._activity_shown = ""
+        self._activity_emit = 0.0
         self._heartbeat: asyncio.Task | None = None
         self._seated = False
 
@@ -132,18 +140,82 @@ class _Progress:
     async def _heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(self.heartbeat_seconds)
+            if self._flush_thought(force=True):
+                continue
             now = asyncio.get_running_loop().time()
             if now - self._last_visible < self.heartbeat_seconds:
                 continue
             target = self._active or self.context
             self._line(f"leftover: still working ({target})")
 
+    def _show_activity(self, detail: str, *, force: bool = False) -> bool:
+        """Print a compact 'what the agent is doing' line, throttled."""
+        detail = ui.compact_activity(detail)
+        if not detail:
+            return False
+        label = self._agent_label or self.context
+        self._active = f"{label} · {detail}"
+        if detail == self._activity_shown:
+            self._touch()
+            return False
+        now = asyncio.get_running_loop().time()
+        if (not force and self._activity_shown
+                and now - self._activity_emit < PROGRESS_ACTIVITY_SECONDS):
+            return False
+        self._activity_emit = now
+        self._activity_shown = detail
+        self._line(f"leftover: {label}: {detail}")
+        return True
+
+    def _flush_thought(self, *, force: bool = False) -> bool:
+        compact = ui.compact_activity(self._thought_buf)
+        if not compact:
+            return False
+        emitted = self._show_activity(compact, force=force)
+        if emitted or force:
+            self._thought_buf = ""
+        return emitted
+
+    def _note_event(self, label: str, kind: str, text: str, *, echo: bool) -> None:
+        if kind == "tool" and text:
+            self._thought_buf = ""
+            self._active = f"{label} · {ui.compact_activity(text)}"
+            if echo:
+                self._line(f"leftover: {label} tool: {text[:120]}")
+            else:
+                self._touch()
+            return
+        if kind == "status" and text:
+            self._thought_buf = ""
+            if echo:
+                self._show_activity(text, force=True)
+            else:
+                self._active = f"{label} · {ui.compact_activity(text)}"
+                self._touch()
+            return
+        if kind == "thought" and text:
+            self._thought_buf += text
+            compact = ui.compact_activity(self._thought_buf)
+            self._active = f"{label} · {compact}" if compact else label
+            ended = "\n" in text or text.rstrip().endswith((".", "?", "!", "。"))
+            if echo and compact and (ended or len(compact) >= 40):
+                if self._show_activity(compact, force=ended) and ended:
+                    self._thought_buf = ""
+            elif not echo:
+                self._touch()
+            return
+        if kind in {"text", "error"} and text:
+            self._touch()
+
     def sink(self, downstream=None, *, announce_attempt: bool = True,
              kind: str = "", headless: bool = False):
         """Wrap a Router sink, reporting only progress that is not answer text."""
 
         async def start(spec: AgentSpec):
+            self._agent_label = spec.label
             self._active = spec.label
+            self._thought_buf = ""
+            self._activity_shown = ""
             if announce_attempt and not self._seated:
                 self._line(ui.seat_line(spec.label, kind, headless=headless))
                 self._seated = True
@@ -154,13 +226,10 @@ class _Progress:
             async def event(ev) -> None:
                 kind_ev = getattr(ev, "kind", "")
                 text = getattr(ev, "text", "") or ""
-                if on_event is None:
-                    if kind_ev == "tool" and text:
-                        self._line(f"leftover: {spec.label} tool: {text[:120]}")
-                else:
+                if on_event is not None:
                     await on_event(ev)
-                    if kind_ev in {"text", "tool", "error"} and text:
-                        self._touch()
+                self._note_event(
+                    spec.label, kind_ev, text, echo=on_event is None)
 
             return event
 
@@ -274,6 +343,61 @@ def format_why(pick: Pick) -> str:
     elif pick.reason:
         lines.append(f"→ nobody  ({pick.reason})")
     return "\n".join(lines)
+
+
+def why_payload(pick: Pick) -> dict[str, Any]:
+    """Machine-readable `--why`. Same columns as the table: lag / waste / total."""
+    if pick.kind in DISCUSS and pick.labels:
+        return {
+            "kind": pick.kind,
+            "axis": "lag+waste",
+            "sticky": pick.sticky,
+            "agent": None,
+            "label": None,
+            "reason": pick.reason,
+            "chain": pick.chain,
+            "panel": list(pick.labels),
+            "agents": [],
+        }
+    agents = []
+    for key in pick.chain:
+        score = pick.scores.get(key)
+        launching = pick.spec is not None and pick.spec.key == key
+        if score is None:
+            agents.append({"key": key, "scored": False, "launching": launching})
+            continue
+        agents.append({
+            "key": key,
+            "scored": True,
+            "launching": launching,
+            "lag": round(score.lag, 4),
+            "waste": round(score.waste, 4),
+            "total": round(score.total, 4),
+            "source": score.source,
+            "detail": score.detail,
+            "windows": [
+                {
+                    "name": window.name,
+                    "lag": round(window.lag, 4),
+                    "waste": round(window.waste, 4),
+                    "total": round(window.total, 4),
+                    "used_percent": window.used_percent,
+                    "hours_left": window.hours_left,
+                }
+                for window in score.windows
+            ],
+        })
+    return {
+        "kind": pick.kind,
+        "axis": "lag+waste",
+        "sticky": pick.sticky,
+        "agent": None if pick.spec is None else pick.spec.key,
+        "label": None if pick.spec is None else pick.spec.label,
+        "reason": pick.reason,
+        "chain": pick.chain,
+        "panel": [],
+        "agents": agents,
+    }
 
 
 def _state_path(cfg: Config) -> Path:
@@ -942,7 +1066,8 @@ async def chat(cfg: Config, first: str = "") -> int:
     if off:
         roster += ui.dim("  off: " + " · ".join(off))
     print(ui.dim("  ") + roster)
-    print(ui.dim("  /plan /cu /rt /debate /relay   /quota /cd /quit") + "\n")
+    print(scope_mod.doctor_line())
+    print(ui.dim("  /plan /cu /rt /debate /relay   /quota /scope /cd /quit") + "\n")
     loop = asyncio.get_running_loop()
 
     async def handle(line: str) -> bool:
@@ -953,7 +1078,17 @@ async def chat(cfg: Config, first: str = "") -> int:
             return False
         if raw in ("/help", "?"):
             print(ui.dim("  task  /plan  /cu  /rt  /debate  /relay  /all"))
-            print(ui.dim("  @name  @claude @gpt …  /quota /cd /reset /quit"))
+            print(ui.dim("  @name  @claude @gpt …  /quota /scope /cd /reset /quit"))
+            return True
+        if raw == "/scope" or raw.startswith("/scope "):
+            try:
+                text = scope_mod.dispatch(raw.split()[1:])
+            except SystemExit as exc:
+                msg = exc.code if isinstance(exc.code, str) else "leftover scope failed"
+                print(ui.err(f"  {msg}"))
+                return True
+            if text:
+                print(text)
             return True
         if raw == "/who":
             for a in cfg.agents:
@@ -1175,52 +1310,37 @@ async def run_print(cfg: Config, pick: Pick, *,
         await pool.shutdown()
 
 
-def _skill_source() -> Path:
-    return Path(__file__).resolve().parent / "skills" / "leftover" / "SKILL.md"
-
-
-def skill_destinations() -> list[Path]:
-    return [
-        Path.home() / ".codex" / "skills" / "leftover" / "SKILL.md",
-        Path.home() / ".agents" / "skills" / "leftover" / "SKILL.md",
-        Path.home() / ".claude" / "skills" / "leftover" / "SKILL.md",
-        Path.home() / ".grok" / "skills" / "leftover" / "SKILL.md",
-        Path.home() / ".cursor" / "skills" / "leftover" / "SKILL.md",
-    ]
-
-
-def link_skill(src: Path, dest: Path) -> Path:
-    """Point dest at src. Replace a copied file so later edits stay in sync."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    target = src.resolve()
-    if dest.is_symlink() or dest.exists():
-        dest.unlink()
-    dest.symlink_to(target)
-    return dest
-
-
-def install_skills() -> str:
-    src = _skill_source()
-    if not src.is_file():
-        return f"skill file missing: {src}"
-    written = [str(link_skill(src, dest)) for dest in skill_destinations()]
-    return "linked:\n" + "\n".join(f"  {p}" for p in written)
-
-
 def _parse_argv(argv: list[str] | None) -> argparse.Namespace:
     # Allow `leftover quota` and `leftover fix the tests` without subcommands colliding.
     argv = list(sys.argv[1:] if argv is None else argv)
-    commands = {"quota", "doctor", "install-skills"}
+    commands = {"quota", "doctor", "install-skills", "scope"}
     if argv and argv[0] in commands:
         ns = argparse.Namespace(
             command=argv[0], prompt=[], config=None, pick=False, headless=False,
             dry_run=False, why=False, plan=False, cu=False, agent=None,
-            use=None, json=False, tui=False, timeout=None)
+            use=None, json=False, tui=False, timeout=None, show_help=False)
         rest = argv[1:]
-        if rest and rest[0] in ("--config", "-c"):
-            if len(rest) < 2:
-                raise SystemExit(f"leftover {argv[0]}: {rest[0]} needs a path")
-            ns.config = rest[1]
+        i = 0
+        while i < len(rest):
+            tok = rest[i]
+            if tok in ("--config", "-c"):
+                if i + 1 >= len(rest):
+                    raise SystemExit(f"leftover {argv[0]}: {tok} needs a path")
+                ns.config = rest[i + 1]
+                i += 2
+                continue
+            if tok == "--json":
+                ns.json = True
+                i += 1
+                continue
+            if argv[0] == "scope" and tok in ("-h", "--help"):
+                ns.show_help = True
+                i += 1
+                continue
+            if tok.startswith("-"):
+                raise SystemExit(f"leftover {argv[0]}: unknown argument {tok}")
+            ns.prompt.append(tok)
+            i += 1
         return ns
     p = argparse.ArgumentParser(prog="leftover")
     p.add_argument("--config", "-c", default=None)
@@ -1252,8 +1372,13 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("leftover needs Python 3.10+")
     args = _parse_argv(argv)
     if args.command == "install-skills":
-        print(install_skills())
+        print(scope_mod.install_all())
         return 0
+    if args.command == "scope":
+        if getattr(args, "show_help", False):
+            print(scope_mod.HELP.strip())
+            return 0
+        return scope_mod.run(args.prompt, as_json=args.json)
 
     cfg = config_mod.load(args.config)
     if getattr(args, "timeout", None) is not None and not args.headless:
@@ -1261,14 +1386,24 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     _apply_timeout(cfg, getattr(args, "timeout", None))
     if args.command == "doctor":
-        cached = load_state(cfg).get("quota") or {}
-        print(asyncio.run(doctor_mod.run(cfg, cached if isinstance(cached, dict) else {})))
+        cfg.routing.strategy = "lag_waste"
+        router = Router(cfg, _NullPool())
+        restore_health(router, load_state(cfg))
+        entries = asyncio.run(router.snapshot())
+        persist_health(cfg, router, load_state(cfg))
+        quotas = {spec.key: quota for spec, quota, _prev in entries}
+        print(asyncio.run(doctor_mod.run(cfg, quotas=quotas)))
         return 0
     if args.command == "quota":
         cfg.routing.strategy = "lag_waste"
         router = Router(cfg, _NullPool())
         restore_health(router, load_state(cfg))
-        print(asyncio.run(router.report()))
+        if args.json:
+            print(json.dumps(
+                asyncio.run(router.report_payload()),
+                indent=2, ensure_ascii=False))
+        else:
+            print(asyncio.run(router.report()))
         persist_health(cfg, router, load_state(cfg))
         return 0
 
@@ -1294,14 +1429,17 @@ def main(argv: list[str] | None = None) -> int:
                  if show_routing_progress
                  else decide(cfg, parsed, os.getcwd()))
         pick = asyncio.run(route)
+        if args.why:
+            if args.json:
+                print(json.dumps(why_payload(pick), indent=2, ensure_ascii=False))
+            else:
+                print(format_why(pick))
+            return 0 if pick.available else 2
         if dump_pick:
             blob = pick.as_dict()
             if args.agent:
                 blob["self"] = args.agent
             print(json.dumps(blob, indent=2, ensure_ascii=False))
-            return 0 if pick.available else 2
-        if args.why:
-            print(format_why(pick))
             return 0 if pick.available else 2
         if args.dry_run:
             _print_pick(pick, verbose=True)

@@ -299,8 +299,8 @@ BUILTIN_AGENTS: list[dict[str, Any]] = [
         "tier": "heavy",
         "timeout": 900,
         "fallback": ["gpt", "cursor"],
-        # No vendor usage endpoint is known, so ranking uses the local ledger
-        # against these budgets. They are a starting guess: set yours in toml.
+        # No vendor usage endpoint is known. Ranking uses the local ledger
+        # against these budgets; /quota draws them as estimated local.
         "budget_5h_turns": 30,
         "budget_week_turns": 300,
         "persona": "You are Antigravity CLI on first-party Gemini. Implement "

@@ -458,6 +458,8 @@ class Router:
             w.source in (q.REPORTED, q.OBSERVED) and not w.expired
             for w in found.windows
         ))
+        # A silent or empty refresh must not wipe a live reported window.
+        # Ranking, leftover quota, and doctor all keep that last real number.
         result = found if found_real or not cached.windows else cached
         if result is None:
             result = cached
@@ -479,11 +481,9 @@ class Router:
                         and identity not in existing):
                     result.windows.append(window)
                     existing.add(identity)
-        # Do not invent a 0% "5h budget" and print it as quota. Estimated
-        # turn counts are not vendor remaining. Ranking ignores them anyway.
         result.agent = spec.key
-        # Ranking may use a turn budget when the vendor is silent. /quota
-        # hides these — they are not remaining plan credits.
+        # Ranking uses a turn budget when the vendor is silent. /quota now
+        # draws those windows as "estimated local", not as vendor remaining.
         real = [w for w in result.windows
                 if w.source in (q.REPORTED, q.OBSERVED) and not w.expired]
         if not real:
@@ -719,17 +719,28 @@ class Router:
 
     # -- reporting ------------------------------------------------------------
 
-    async def report(self) -> str:
-        from . import rhythm
-        now = time.time()
+    async def snapshot(self) -> list[tuple[AgentSpec, q.Quota, q.Quota | None]]:
         specs = [spec for spec in self.config.agents if spec.enabled]
         previous = [self.h(spec).quota for spec in specs]
         quotas = await asyncio.gather(*(
             self.quota_for(spec, force=True) for spec in specs
         ))
-        entries = list(zip(specs, quotas, previous))
+        return list(zip(specs, quotas, previous))
+
+    async def report(self) -> str:
+        from . import rhythm
+        now = time.time()
         return rhythm.render(
-            entries, now=now,
+            await self.snapshot(), now=now,
+            strategy=self.config.routing.strategy,
+            order=self.config.routing.order,
+            tz_name=self.config.timezone)
+
+    async def report_payload(self) -> dict[str, Any]:
+        from . import rhythm
+        now = time.time()
+        return rhythm.payload(
+            await self.snapshot(), now=now,
             strategy=self.config.routing.strategy,
             order=self.config.routing.order,
             tz_name=self.config.timezone)

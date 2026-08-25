@@ -49,7 +49,8 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 
 leftover doctor
-leftover install-skills
+leftover install-skills   # leftover answers from every official CLI
+leftover scope            # later: turn that off, per CLI
 ```
 
 Copy `leftover.example.toml` to `~/.config/leftover/leftover.toml` if you want
@@ -81,15 +82,37 @@ you> /quit
 | `/relay …` | plan → implement → review |
 | `/all …` | parallel, independent |
 | `/quota` `/cd` `/reset` `/who` `/quit` | quota, workdir, reset, exit |
+| `/scope` or `leftover scope` | leftover's skill in other CLIs: on or off, per CLI |
 | `--tui` | exec into the winner's own UI (usher's path) |
 | `-p` / `--print` | headless; stdout is the answer |
 | `--why` | lag+waste table |
+| `leftover quota --json` / `--why --json` | same windows / scores, scriptable |
 | `--pick --json` | skill ABI |
+
+## Skill scope
+
+`leftover install-skills` drops leftover into each official CLI. After that,
+Grok / Codex / Claude / Cursor / Antigravity ask leftover where work should
+go. That hijack is optional and reversible.
+
+```
+leftover scope                 # TTY switches, or a table if not a TTY
+leftover scope off grok        # Grok works on its own
+leftover scope on cursor       # leftover answers from Cursor again
+leftover scope off             # remove leftover from every CLI
+leftover scope --json
+```
+
+On a TTY the panel is five rows: `space` toggles, `j`/`k` move, `a` all on,
+`n` none, `q` done. Each toggle immediately links or unlinks
+`~/.codex|/.grok|/.claude|/.cursor|/.agents/skills/leftover/`. Disk is the
+source of truth. `--tui` is still the vendor TUI; this panel is not a second
+chat product.
 
 ## Runtime guarantees
 
 - ACP is preferred when available. Cursor and Codex keep their native ACP runner and session across explicit turns; exec is only a startup fallback or an explicit override.
-- A full-turn or ACP-idle timeout ends that request and is never replayed on another backend. Fast startup, authentication, quota, and transient failures may still follow the configured fallback chain.
+- A full-turn or ACP-idle timeout ends that request and is never replayed on another backend. Idle hang detection pauses while a tool is in-flight (a quiet `pytest` is work, not a hang) and resumes when that tool completes. Fast startup, authentication, quota, and transient failures may still follow the configured fallback chain.
 - Quiet `--print` routes report route/attempt/tool progress and a 30-second heartbeat on stderr. Stdout remains answer-only.
 - Skill handoffs wait on the returned process handle; they never defer the next check from a model-generated duration estimate. If an exec leader exits while descendants retain its pipes, leftover reaps that process group and returns the captured answer immediately.
 - `/all` workers and `/debate` advocates run in parallel, but each completed answer is emitted as one grouped block. Debate roles and event delivery have finite deadlines.
@@ -123,6 +146,7 @@ every host contacted, and every auto-approve flag.
 | Doc | Use when |
 |---|---|
 | [Core features](docs/core-features.md) | What the product is |
+| [Roadmap](docs/roadmap.md) | What to grow. What to refuse |
 | [Architecture](docs/architecture.md) | Module map |
 | [Maintenance](docs/maintenance.md) | Invariants and tests |
 | [Security](SECURITY.md) | What it reads, sends, writes |

@@ -1,5 +1,6 @@
 # ~/.config/leftover/leftover.toml
 # Everything here is optional - leftover ships working defaults for all four CLIs.
+# leftover's skill in other CLIs is not a toml flag. Toggle it with `leftover scope`.
 
 [leftover]
 default_workdir   = "~/code"   # where agents start; change live with /cd
@@ -58,8 +59,9 @@ allowed_user_ids = []
 # Only the fields you list are overridden; the rest keep their defaults.
 # Run `agora doctor` to see what is actually installed.
 # `timeout` caps the full turn. `acp_idle_timeout` (default 180s) caps silence
-# between visible ACP text/thought/new-tool updates. Internal protocol activity
-# does not reset it, and <= 0 disables it.
+# between visible ACP text/thought/new-tool updates while no tool is running.
+# An in-flight tool pauses that clock (a long `pytest` is work, not a hang).
+# Internal protocol activity does not reset it, and <= 0 disables it.
 # Either timeout stops the request instead of replaying file-changing work on
 # another backend. Normal fast failures still follow `routing.max_attempts`.
 
@@ -116,8 +118,9 @@ key = "antigravity"
 exec_command = ["agy", "--output-format", "json", "--dangerously-skip-permissions",
                 "--print-timeout", "15m", "--model", "gemini-3.1-pro-high", "-p"]
 timeout = 900
-# No vendor usage endpoint is known, so ranking counts your own turns against
-# these. Replace them with your real plan limits if you know them.
+# No vendor usage endpoint is known. Ranking counts your own turns against
+# these, and `/quota` / doctor draw them as "estimated local". Replace them
+# with your real plan limits if you know them.
 budget_5h_turns = 30
 budget_week_turns = 300
 

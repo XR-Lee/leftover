@@ -21,7 +21,8 @@ from leftover.config import (                                       # noqa: E402
 from leftover import ui as ui_mod                                    # noqa: E402
 from leftover.macbot import (                                        # noqa: E402
     Pick, apply_use, decide, format_why, load_state, parse_duration,
-    prepare_task, run_argv, run_print, run_discuss, save_state)
+    prepare_task, run_argv, run_print, run_discuss, save_state,
+    why_payload)
 from leftover.agents.base import BaseRunner, Event, Turn             # noqa: E402
 from leftover.quota import Quota, Window, REPORTED, ESTIMATED        # noqa: E402
 from leftover.score import AgentScore, WindowScore, score_quota      # noqa: E402
@@ -336,6 +337,22 @@ def test_why_table_is_lag_waste_not_reputation() -> None:
         check("--why prints the table and does not run an agent",
               code == 0 and "axis: lag+waste" in out and "→ Codex" in out
               and stderr.getvalue() == "", repr(out))
+        blob = why_payload(pick)
+        check("--why JSON keeps the lag+waste columns and no strength",
+              blob["axis"] == "lag+waste" and blob["agent"] == "gpt"
+              and "strength" not in blob
+              and blob["agents"][0]["launching"]
+              and blob["agents"][0]["windows"][0]["name"] == "5h"
+              and blob["agents"][1]["waste"] == 0.01, repr(blob))
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(stderr):
+            code = macbot_mod.main(["--why", "--json", "fix tests"])
+        dumped = json.loads(stdout.getvalue())
+        check("--why --json prints the table payload, not a pick dump",
+              code == 0 and dumped["axis"] == "lag+waste"
+              and dumped["agent"] == "gpt" and "run" not in dumped
+              and stderr.getvalue() == "", stdout.getvalue())
     finally:
         macbot_mod.decide = original_decide
         macbot_mod.config_mod.load = original_load
@@ -499,7 +516,7 @@ async def test_routing_progress_stops_after_cancel() -> None:
 
 def test_skill_install_is_symlink() -> None:
     print("\n[macbot.8] install-skills links, does not copy")
-    from leftover.macbot import _skill_source, link_skill, skill_destinations
+    from leftover.scope import link_skill, skill_destinations, skill_source
     dests = [str(path) for path in skill_destinations()]
     check("leftover skill is installed",
           any("/skills/leftover/SKILL.md" in path for path in dests))
@@ -507,7 +524,7 @@ def test_skill_install_is_symlink() -> None:
           len(dests) == 5
           and not any("/skills/macbot/SKILL.md" in path for path in dests),
           repr(dests))
-    skill = _skill_source().read_text()
+    skill = skill_source().read_text()
     check("handoff skill polls the returned process handle promptly",
           "session_id" in skill and "cell_id" in skill
           and "max_poll_interval_seconds" in skill
@@ -535,6 +552,101 @@ def test_skill_install_is_symlink() -> None:
         check("source edit shows up without reinstall", dest.read_text() == "v2")
 
 
+def test_skill_scope_toggles_vendor_cli_influence() -> None:
+    print("\n[macbot.8b] leftover scope adds or removes influence per CLI")
+    from leftover.scope import (
+        Cursor, apply, apply_key, dispatch, format_table, payload, resolve,
+        skill_homes, snapshot)
+    from leftover import macbot as macbot_mod
+
+    check("codex alias is gpt",
+          resolve("codex") == "gpt" and resolve("@agy") == "antigravity")
+    check("five vendor skill homes",
+          [item.key for item in skill_homes()]
+          == ["claude", "gpt", "grok", "cursor", "antigravity"])
+    ns = macbot_mod._parse_argv(["scope", "off", "claude", "--json"])
+    check("scope off claude --json is a subcommand",
+          ns.command == "scope" and ns.prompt == ["off", "claude"] and ns.json)
+    ns = macbot_mod._parse_argv(["scope", "--help"])
+    check("scope --help is kept", ns.command == "scope" and ns.show_help)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        src = Path(tmp) / "SKILL.md"
+        src.write_text("skill-v1")
+        other = home / ".grok" / "skills" / "other" / "SKILL.md"
+        other.parent.mkdir(parents=True)
+        other.write_text("keep")
+        grok = home / ".grok" / "skills" / "leftover" / "SKILL.md"
+        claude = home / ".claude" / "skills" / "leftover" / "SKILL.md"
+
+        apply(True, ["grok", "claude"], home=home, src=src)
+        check("on links the leftover skill",
+              grok.is_symlink() and grok.read_text() == "skill-v1"
+              and claude.is_symlink())
+        table = dispatch(["off", "grok"], home=home, src=src, interactive=False)
+        check("off grok unlinks only grok",
+              not grok.exists() and claude.is_symlink()
+              and other.read_text() == "keep"
+              and "off" in table and "Grok" in table, table)
+        leftover_dir = grok.parent
+        check("empty leftover dir is removed", not leftover_dir.exists())
+        check("neighbor skills stay", other.read_text() == "keep")
+
+        blob = payload(home=home)
+        grok_row = next(row for row in blob["homes"] if row["key"] == "grok")
+        claude_row = next(row for row in blob["homes"] if row["key"] == "claude")
+        check("json payload tracks on/off",
+              grok_row["on"] is False and claude_row["on"] is True)
+
+        dispatch(["on", "@codex"], home=home, src=src, interactive=False)
+        codex = home / ".codex" / "skills" / "leftover" / "SKILL.md"
+        check("@codex turns Codex on", codex.is_symlink())
+
+        try:
+            dispatch(["on", "mystery"], home=home, src=src, interactive=False)
+            unknown = False
+        except SystemExit as exc:
+            unknown = "mystery" in str(exc)
+        check("unknown name is a usage error", unknown)
+
+        try:
+            dispatch(["toggle"], home=home, src=src, interactive=False)
+            bad_verb = False
+        except SystemExit as exc:
+            bad_verb = "on|off" in str(exc)
+        check("bare name is not a toggle", bad_verb)
+
+        apply(False, ["claude", "gpt"], home=home, src=src)
+        cursor = Cursor(index=0)
+        apply_key(" ", cursor, home=home, src=src)
+        rows = snapshot(home=home)
+        check("space toggles the focused CLI",
+              rows[0].key == "claude" and rows[0].on)
+        apply_key("n", cursor, home=home, src=src)
+        check("n turns every home off",
+              not any(row.on for row in snapshot(home=home)))
+        apply_key("a", cursor, home=home, src=src)
+        check("a turns every home on",
+              all(row.on for row in snapshot(home=home)))
+        apply_key("j", cursor, home=home, src=src)
+        check("j moves the cursor", cursor.index == 1)
+        apply_key("2", cursor, home=home, src=src)
+        rows = snapshot(home=home)
+        check("digit toggles that row",
+              cursor.index == 1 and rows[1].key == "gpt" and not rows[1].on)
+        check("q leaves the panel",
+              apply_key("q", cursor, home=home, src=src) is False)
+
+        listed = format_table(home=home)
+        check("table names leftover skill scope",
+              listed.startswith("leftover skill scope") and "Codex" in listed,
+              listed)
+        json_text = dispatch([], home=home, as_json=True, interactive=False)
+        check("scope --json is the homes list",
+              json.loads(json_text)["homes"][0]["key"] == "claude")
+
+
 def test_quota_serde() -> None:
     print("\n[macbot.6] quota snapshot round-trip")
     now = 1_000_000.0
@@ -546,6 +658,27 @@ def test_quota_serde() -> None:
     check("round-trip window",
           back is not None and back.windows[0].used_percent == 59.0
           and back.windows[0].source == REPORTED)
+
+    from leftover.rhythm import payload
+    spec = AgentSpec(key="grok", label="Grok", emoji="X")
+    empty = Quota(agent="antigravity", note="no vendor number", windows=[])
+    blob = payload(
+        [(spec, original, None),
+         (AgentSpec(key="antigravity", label="Antigravity", emoji="A"),
+          empty, None)],
+        now=now, strategy="lag_waste", order=["gpt", "grok"],
+        tz_name="UTC")
+    grok = blob["agents"][0]
+    agy = blob["agents"][1]
+    check("quota JSON is the same windows /quota already shows",
+          blob["strategy"] == "lag_waste" and grok["source"] == REPORTED
+          and grok["windows"][0]["used_percent"] == 59.0
+          and grok["windows"][0]["name"] == "weekly"
+          and agy["note"] == "no vendor number"
+          and agy["windows"] == [], repr(blob))
+    check("quota JSON does not grow a strength or token field",
+          "strength" not in blob and "token" not in grok
+          and "accessToken" not in json.dumps(blob))
 
 
 async def test_quota_disk_cache() -> None:
@@ -761,7 +894,11 @@ async def test_progress_is_visible_and_output_stays_clean() -> None:
             if type(self).raise_in_run:
                 raise RuntimeError("runner exploded")
             if on_event is not None:
-                await on_event(Event("tool", "inspect repository"))
+                await on_event(Event(
+                    "thought", "looking at leftover progress rendering now"))
+                await on_event(Event(
+                    "status", "surface the in-progress plan step"))
+                await on_event(Event("tool", "inspect repository leftover/macbot.py"))
             await asyncio.sleep(0.035)
             return Turn(agent=spec, text=f"FINAL {spec.key}")
 
@@ -797,10 +934,22 @@ async def test_progress_is_visible_and_output_stays_clean() -> None:
                   repr(stdout.getvalue()))
             check("--print reports attempts and tools on stderr",
                   "→ Codex  (coding · headless)" in progress
-                  and "leftover: Codex tool: inspect repository" in progress,
+                  and "leftover: Codex tool: inspect repository leftover/macbot.py"
+                  in progress,
                   repr(progress))
+            check("--print reports thought and plan status on stderr",
+                  "leftover: Codex: looking at leftover progress rendering now"
+                  in progress
+                  and "leftover: Codex: surface the in-progress plan step"
+                  in progress,
+                  repr(progress))
+            check("--print stdout stays the final answer",
+                  "looking at leftover" not in stdout.getvalue()
+                  and "surface the in-progress" not in stdout.getvalue(),
+                  repr(stdout.getvalue()))
             check("--print emits a heartbeat during a quiet interval",
-                  "leftover: still working (Codex)" in progress,
+                  "leftover: still working (Codex · inspect repository leftover/macbot.py)"
+                  in progress,
                   repr(progress))
             check("--print shuts its pool down after success",
                   ProgressPool.shutdowns == 1,
@@ -837,7 +986,8 @@ async def test_progress_is_visible_and_output_stays_clean() -> None:
                     cfg, router, Transcript(), pick, "inspect",
                     heartbeat_seconds=0.01)
             check("interactive turns heartbeat without corrupting streamed text",
-                  "leftover: still working (Codex)" in stderr.getvalue(),
+                  "leftover: still working (Codex · inspect repository leftover/macbot.py)"
+                  in stderr.getvalue(),
                   repr(stderr.getvalue()))
 
             stderr = io.StringIO()
@@ -852,6 +1002,55 @@ async def test_progress_is_visible_and_output_stays_clean() -> None:
                   repr(stderr.getvalue()))
     finally:
         agents_mod.AgentPool = original
+
+
+async def test_print_long_running_tool_does_not_exit_124() -> None:
+    print("\n[macbot.10c] --print keeps a quiet in-flight tool alive")
+    mock = str(ROOT / "tests" / "mock_acp_agent.py")
+    idle = 0.05
+    tool_seconds = 0.2
+    with tempfile.TemporaryDirectory() as tmp:
+        spec = AgentSpec(
+            key="cursor", label="Cursor", transport="acp",
+            acp_command=[sys.executable, mock],
+            env={"MOCK_BEHAVIOR": "long_tool",
+                 "MOCK_TOOL_SECONDS": str(tool_seconds)},
+            timeout=2, acp_idle_timeout=idle)
+        cfg = Config(
+            agents=[spec], data_dir=tmp,
+            routing=Routing(strategy="order", order=["cursor"],
+                            coding_keys=["cursor"], max_attempts=1))
+        pick = Pick(spec, ["cursor"], {}, "test", "coding", "run pytest")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        polls = 0
+        alive_past_idle = False
+        with contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(stderr):
+            task = asyncio.create_task(
+                run_print(cfg, pick, heartbeat_seconds=0.05))
+            # Skill contract: wait on process exit, poll at a compressed
+            # analog of completion.max_poll_interval_seconds.
+            while not task.done():
+                await asyncio.sleep(0.02)
+                polls += 1
+                if not task.done() and loop.time() - started > idle:
+                    alive_past_idle = True
+            code = await task
+        elapsed = loop.time() - started
+        chatter = stderr.getvalue()
+        check("a quiet pytest-like tool does not exit 124",
+              code == 0 and stdout.getvalue() == "tests passed\n",
+              f"code={code} stdout={stdout.getvalue()!r} elapsed={elapsed:.3f}s "
+              f"stderr={chatter!r}")
+        check("the --print process stays alive past the idle boundary",
+              alive_past_idle and elapsed > idle and polls >= 2,
+              f"alive={alive_past_idle} elapsed={elapsed:.3f}s polls={polls}")
+        check("--print heartbeats during the quiet in-flight tool",
+              "leftover: still working" in chatter
+              and "pytest" in chatter,
+              chatter)
 
 
 async def test_group_routes_survive_cli_handoff() -> None:
@@ -1848,6 +2047,32 @@ async def test_stream_sink_keeps_sync_io_off_the_loop() -> None:
           repr([thread.name for thread in writer_threads]))
 
 
+async def test_stream_sink_shows_plan_and_thought() -> None:
+    print("\n[macbot.26b] StreamSink prints compact plan/thought, not just tools")
+    buf = io.StringIO()
+    sink = ui_mod.StreamSink("Codex", out=buf, show_header=False)
+    await sink(Event("thought", "looking at leftover progress rendering"))
+    await sink(Event("status", "surface the in-progress plan step"))
+    await sink(Event("tool", "Read File leftover/macbot.py"))
+    await sink(Event("done"))
+    deadline = asyncio.get_running_loop().time() + 0.3
+    out = ""
+    while asyncio.get_running_loop().time() < deadline:
+        out = buf.getvalue()
+        if ("looking at leftover progress rendering" in out
+                and "surface the in-progress plan step" in out
+                and "Read File leftover/macbot.py" in out):
+            break
+        await asyncio.sleep(0.01)
+    check("thought becomes a dim status line",
+          "· looking at leftover progress rendering" in out, repr(out))
+    check("plan status is visible next to tools",
+          "· surface the in-progress plan step" in out
+          and "▸ Read File leftover/macbot.py" in out, repr(out))
+    check("activity is not treated as answer text without a bullet",
+          not out.lstrip().startswith("looking at leftover"), repr(out))
+
+
 def test_usher_ux_surface() -> None:
     print("\n[macbot.12] usher UX: doctor, seat, timeout")
     from leftover import doctor as doctor_mod
@@ -1863,6 +2088,11 @@ def test_usher_ux_surface() -> None:
         rejected = True
     check("bad duration is rejected", rejected)
     seat = ui_mod.seat_line("Codex", "coding", reason="lag+waste")
+    check("compact activity collapses whitespace and truncates",
+          ui_mod.compact_activity("  looking\n  at   leftover  ")
+          == "looking at leftover"
+          and ui_mod.compact_activity("x" * 130).endswith(" ...")
+          and len(ui_mod.compact_activity("x" * 130)) == 124)
     check("seat line is usher-shaped, lag+waste not reputation",
           seat.startswith("→ Codex") and "lag+waste" in seat
           and "override with @name" in seat and "strength" not in seat, seat)
@@ -1893,6 +2123,30 @@ def test_usher_ux_surface() -> None:
     roster = asyncio.run(doctor_mod.run(Config(agents=[present]), cached))
     check("doctor remaining bar uses cached reported remaining",
           "80%" in roster and "remaining" in roster and "5h" in roster, roster)
+    extra_cached = {
+        "gpt": Quota(
+            agent="gpt",
+            windows=[
+                Window(name="5h", used_percent=0.0, source=REPORTED),
+                Window(name="extra", used_percent=93.0, source=REPORTED),
+            ],
+        ).to_dict()
+    }
+    roster = asyncio.run(doctor_mod.run(Config(agents=[present]), extra_cached))
+    check("doctor keeps the plan bar and suffixes extra remaining",
+          "100%" in roster and "5h" in roster and "extra" in roster
+          and "7%" in roster, roster)
+    estimated_cached = {
+        "gpt": Quota(
+            agent="gpt",
+            windows=[Window(name="5h budget", used_percent=40.0,
+                            source=ESTIMATED)],
+        ).to_dict()
+    }
+    roster = asyncio.run(doctor_mod.run(
+        Config(agents=[present]), estimated_cached))
+    check("doctor remaining uses estimated percent when vendor is silent",
+          "60%" in roster and "5h budget" in roster, roster)
 
     original_load = macbot_mod.config_mod.load
     macbot_mod.config_mod.load = lambda _path: Config(agents=[present])
@@ -1922,6 +2176,11 @@ def test_subcommand_config_flag() -> None:
               repr(ns.config))
     ns = macbot_mod._parse_argv(["quota", "--config", "/tmp/x.toml"])
     check("quota --config PATH is kept", ns.config == "/tmp/x.toml")
+    ns = macbot_mod._parse_argv(["quota", "--json", "--config", "/tmp/x.toml"])
+    check("quota --json --config is kept",
+          ns.command == "quota" and ns.json and ns.config == "/tmp/x.toml")
+    ns = macbot_mod._parse_argv(["quota", "--config", "/tmp/x.toml", "--json"])
+    check("quota --config --json either order", ns.json and ns.config == "/tmp/x.toml")
     try:
         macbot_mod._parse_argv(["quota", "--config"])
         clean = False
@@ -2060,11 +2319,13 @@ def main() -> int:
     test_cli_routing_progress_is_human_only()
     asyncio.run(test_routing_progress_stops_after_cancel())
     test_skill_install_is_symlink()
+    test_skill_scope_toggles_vendor_cli_influence()
     test_quota_serde()
     asyncio.run(test_quota_disk_cache())
     asyncio.run(test_run_print_uses_current_workdir())
     asyncio.run(test_run_print_respects_pick_chain())
     asyncio.run(test_progress_is_visible_and_output_stays_clean())
+    asyncio.run(test_print_long_running_tool_does_not_exit_124())
     asyncio.run(test_group_routes_survive_cli_handoff())
     test_builtin_acp_commands()
     test_antigravity_is_exec_only_and_stays_first_party()
@@ -2082,6 +2343,7 @@ def main() -> int:
     asyncio.run(test_debate_is_parallel_and_compact())
     asyncio.run(test_event_sink_obeys_the_turn_deadline())
     asyncio.run(test_stream_sink_keeps_sync_io_off_the_loop())
+    asyncio.run(test_stream_sink_shows_plan_and_thought())
     ok = all(RESULTS)
     print(f"\n{sum(RESULTS)}/{len(RESULTS)} checks passed")
     print("ALL CHECKS PASSED" if ok else "SOME CHECKS FAILED")

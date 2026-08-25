@@ -4,8 +4,53 @@ Notable changes per release. Dates are release dates.
 
 ## Unreleased
 
+### Tests
+
+- **`--print` long-tool path is covered.** The 0.1.1 idle-pause fix had a
+  runner-only example. `test_print_long_running_tool_does_not_exit_124` now
+  drives a real mock ACP process through `run_print`: a quiet in-flight
+  `pytest` lasts past `acp_idle_timeout`, the parent-style poll keeps seeing
+  a live task, stderr heartbeats, and the exit code stays 0 instead of 124.
+
+## 0.1.1 — 2026-08-25
+
+Skill scope is a switch, not a one-way install. Long ACP tools no longer look
+like hangs.
+
+### Fixed
+
+- **Long ACP tools no longer trip idle timeout.** leftover treated 180s
+  without a new text/thought/tool event as a hang, so a quiet `pytest` /
+  `cargo test` / similar in-flight tool killed the turn and leftover
+  `--print` exited 124. Idle hang detection now pauses while a tool is
+  in-flight and restarts when it completes. Internal protocol chatter
+  still does not count as progress. `tests/test_routing.py` has the
+  long-task example (`test_acp_long_running_tool_survives_idle_silence`).
+
 ### Added
 
+- **`leftover scope`.** leftover's influence on other CLIs is the `SKILL.md`
+  symlink in each vendor skill directory. That is now a switch, not a one-way
+  install. `leftover scope` is a five-row TTY panel (`space` toggle, `a` all,
+  `n` none, `q` done). Off a TTY, or with `on|off [name…]`, it prints or
+  mutates the same homes. `/scope` is the REPL entry. `install-skills` still
+  turns every home on. Disk is the source of truth; leftover does not draw a
+  chat pager (`--tui` is still the vendor TUI).
+- **Live activity on long `--print` turns.** ACP already parsed
+  `agent_thought_chunk`, and `plan` / `plan_update` already arrived as
+  protocol noise. Headless leftover only printed tool titles (`Read File`,
+  `grep`), so a parent chat could not see what the worker was doing. Progress
+  on stderr now includes the in-progress plan step, a compact thought line,
+  tool paths when ACP sends locations, and a heartbeat that repeats the last
+  activity. Streamed answer text still stays on stdout.
+- **`leftover quota --json` and `leftover --why --json`.** Scriptable views of
+  the windows and lag+waste scores leftover already prints. Same columns, no
+  strength field, no tokens. `--why --json` is the table, not a pick dump.
+- **Roadmap and D18.** Long-term growth is filtered: official remaining,
+  lag+waste, or the parent conversation. Community-facing next work is listed
+  in `docs/roadmap.md`; wrappers, proxies, and a second frontend are closed.
+- **Skill table includes Antigravity.** `--agent antigravity` and the coding
+  pool now name `agy --model gemini-3.1-pro-high` next to the other four CLIs.
 - **Explicit turn handles and completion callbacks.** `AgentPool.submit()` now
   returns a one-shot `TurnHandle` with queued/running/terminal states,
   observational waits, explicit cancellation, a separate cleanup boundary,
@@ -45,6 +90,14 @@ Notable changes per release. Dates are release dates.
 
 ### Fixed
 
+- **Claude and Antigravity quota/doctor remaining.** `leftover quota` and
+  `leftover doctor` now always take a live snapshot. Claude's OAuth refresh
+  sends the same `User-Agent: claude-code/…` the CLI uses, so Cloudflare no
+  longer 403s the token endpoint as a browser. Extra credits are a percent
+  window (still excluded from ranking headroom). A 0% window with no reset
+  clock is no longer labelled "just reset". When a vendor is silent,
+  estimated local remaining is drawn and labelled `estimated local` instead
+  of `no vendor number`.
 - ACP long sessions now register their terminal waiter before prompt execution,
   settle each prompt exactly once, and reject updates captured for an older
   prompt epoch. Timeout/cancellation becomes visible before abort cleanup, and
