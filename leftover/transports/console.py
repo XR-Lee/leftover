@@ -9,6 +9,7 @@ import os
 import sys
 from pathlib import Path
 
+from .. import ui
 from ..agents import AgentPool, Event
 from ..config import AgentSpec, Config
 from ..orchestrator import Orchestrator, summarise
@@ -28,6 +29,8 @@ def _sink_factory(stream=sys.stdout):
                 stream.write(ev.text)
             elif ev.kind == "tool":
                 stream.write(f"\n  [{ev.text}]\n  ")
+            elif ev.kind == "status":
+                stream.write(f"\n  {ev.text}\n  ")
             elif ev.kind == "error":
                 stream.write(f"\n  !! {ev.text}\n")
             elif ev.kind == "done":
@@ -36,6 +39,7 @@ def _sink_factory(stream=sys.stdout):
 
         return on_event
 
+    sink.leftover_turn_status = True  # type: ignore[attr-defined]
     return sink
 
 
@@ -82,7 +86,9 @@ async def _repl(config: Config) -> None:
             if plan is None or not plan.actionable:
                 print("  nothing to do - try /help")
                 continue
-            turns = await orch.execute(plan, sink)
+            progress = (None if plan.mode == "ask"
+                        else ui.Roster(mode=plan.mode))
+            turns = await orch.execute(plan, sink, progress=progress)
             note = orch.last_decision.describe() if orch.last_decision else ""
             print(f"\n[{plan.mode}] {summarise(turns)}"
                   + (f"\n  routed: {note}" if note else "") + "\n")

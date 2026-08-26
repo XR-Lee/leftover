@@ -191,14 +191,16 @@ async def _close_runner(
 
 async def _cancel_runner(
         runner: BaseRunner, timeout: float | None = None,
-        track_detached: Callable[[asyncio.Task[Any]], None] | None = None
+        track_detached: Callable[[asyncio.Task[Any]], None] | None = None,
+        *, task: asyncio.Task[Any] | None = None,
         ) -> bool:
     limit = (_RUNNER_CONTROL_TIMEOUT if timeout is None
              else min(_RUNNER_CONTROL_TIMEOUT, max(timeout, 0.0)))
     if limit <= 0:
         return False
-    task = asyncio.create_task(
-        runner.cancel(), name=f"leftover-cancel-{runner.spec.key}")
+    if task is None:
+        task = asyncio.create_task(
+            runner.cancel(), name=f"leftover-cancel-{runner.spec.key}")
 
     def detach() -> None:
         if track_detached is not None:
@@ -410,6 +412,8 @@ class AgentPool:
             asyncio.Task[Any], BaseRunner] = {}
         self._runner_startups: dict[BaseRunner, asyncio.Task[Any]] = {}
         self._warmup_owners: set[asyncio.Task[Any]] = set()
+        self._runner_cancel_tasks: dict[
+            BaseRunner, asyncio.Task[Any]] = {}
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._background_expect_true: set[asyncio.Task[Any]] = set()
         self._background_outcomes: dict[asyncio.Task[Any], bool] = {}
@@ -456,6 +460,23 @@ class AgentPool:
 
     def _runner_lock(self, key: str) -> asyncio.Lock:
         return self._runner_locks.setdefault(key, asyncio.Lock())
+
+    def _runner_cancel_task(self, runner: BaseRunner) -> asyncio.Task[Any]:
+        task = self._runner_cancel_tasks.get(runner)
+        if task is not None and not task.done():
+            return task
+        task = asyncio.create_task(
+            runner.cancel(), name=f"leftover-cancel-{runner.spec.key}")
+        self._runner_cancel_tasks[runner] = task
+        task.add_done_callback(
+            lambda done, owner=runner:
+            self._runner_cancel_finished(owner, done))
+        return task
+
+    def _runner_cancel_finished(
+            self, runner: BaseRunner, task: asyncio.Task[Any]) -> None:
+        if self._runner_cancel_tasks.get(runner) is task:
+            self._runner_cancel_tasks.pop(runner, None)
 
     @contextlib.asynccontextmanager
     async def _warmup_owner(self):
@@ -910,17 +931,47 @@ class AgentPool:
         self._active_turns.pop(handle.turn_id, None)
         _consume_task_result(task)
 
+    async def _emit_lifecycle(
+            self, on_event: OnEvent | None, handle: TurnHandle,
+            state: TurnState | str) -> None:
+        """Publish reliable pool state without making UI delivery fatal."""
+        if (on_event is None
+                or not getattr(on_event, "leftover_lifecycle", False)):
+            return
+        value = state.value if isinstance(state, TurnState) else state
+        event = Event(
+            "lifecycle",
+            value,
+            {
+                "turn_id": handle.turn_id,
+                "parent_id": handle.parent_id,
+                "state": value,
+                "created_at": handle.created_at,
+                "started_at": handle.started_at,
+            },
+        )
+        try:
+            await on_event(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - progress is advisory
+            log.warning("%s lifecycle delivery failed: %s",
+                        handle.agent.label, exc)
+
     async def _execute_handle(
             self, handle: TurnHandle, spec: AgentSpec, prompt: str,
             on_event: OnEvent | None, shutdown_epoch: int,
             cancel_epoch: int) -> None:
         try:
+            await self._emit_lifecycle(on_event, handle, TurnState.QUEUED)
             self._check_shutdown_epoch(shutdown_epoch, spec)
             self._check_cancel_epoch(cancel_epoch)
             async with self._runner_slot(spec):
                 async with self._operations.read():
                     self._check_shutdown_epoch(shutdown_epoch, spec)
                     self._check_cancel_epoch(cancel_epoch)
+                    await self._emit_lifecycle(
+                        on_event, handle, "preparing")
                     initial = self._runners.get(spec.key)
                     try:
                         runner = await self._prepare_unlocked(spec)
@@ -931,6 +982,8 @@ class AgentPool:
                         raise
                     if not handle._mark_running(float(spec.timeout)):
                         raise asyncio.CancelledError
+                    await self._emit_lifecycle(
+                        on_event, handle, TurnState.RUNNING)
                     settler = handle._settle_result
                     settler_token = runner._bind_turn_settler(settler)
                     try:
@@ -1044,7 +1097,8 @@ class AgentPool:
             results = await asyncio.gather(*(
                 _cancel_runner(
                     runner, remaining,
-                    track_detached=self._track_background_task)
+                    track_detached=self._track_background_task,
+                    task=self._runner_cancel_task(runner))
                 for runner in list(self._runners.values())),
                 return_exceptions=True)
             cancelled_cleanly = all(result is True for result in results)

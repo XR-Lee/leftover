@@ -25,7 +25,8 @@ from leftover.macbot import (                                        # noqa: E40
     why_payload)
 from leftover.agents.base import BaseRunner, Event, Turn             # noqa: E402
 from leftover.quota import Quota, Window, REPORTED, ESTIMATED        # noqa: E402
-from leftover.score import AgentScore, WindowScore, score_quota      # noqa: E402
+from leftover.score import (                                        # noqa: E402
+    AgentScore, WindowScore, pick_plan, rank_tuple, score_quota)
 
 RESULTS: list[bool] = []
 
@@ -47,15 +48,28 @@ def test_compose_followup_is_bare() -> None:
     later = _compose(spec, "add a test", tr, followup=True, kind="coding")
     check("first turn boots the harness", "Do the work now" in first)
     check("spawned worker must not re-enter macbot", "Do not run leftover" in first)
+    check("worker speaks to the human, not leftover",
+          "leftover is routing, not your reader" in first
+          and "top-level assistant" not in first
+          and "status report for leftover" in first)
     check("follow-up is just the user line", later == "add a test")
     plan = _compose(spec, "split worker", Transcript(), followup=False, kind="plan")
     check("plan turn forbids edits", "Plan only" in plan)
     check("plan worker must not re-enter macbot", "Do not run leftover" in plan)
+    check("plan is for the human, not leftover",
+          "Report the plan back to leftover" not in plan
+          and "leftover is routing, not your reader" in plan)
     heavy = _compose(spec, "should we split", Transcript(), followup=False,
                      kind="heavy")
     check("heavy first turn is discussion/collab, not dump-and-done",
           "leftover heavy" in heavy and "Do the work now" not in heavy
           and "Do not run leftover" in heavy)
+    check("heavy also speaks to the human",
+          "leftover is routing, not your reader" in heavy)
+    from leftover.orchestrator import _GROUP_FRAME
+    check("group frame does not treat depth as license to ramble",
+          "needs depth" not in _GROUP_FRAME
+          and "leftover is routing, not your reader" in _GROUP_FRAME)
 
 
 def test_intent() -> None:
@@ -183,8 +197,349 @@ def test_repl_completes_commands_and_mentions() -> None:
               repr(delims))
 
 
+def test_roster_is_per_agent_status_not_logos() -> None:
+    print("\n[macbot.1c] group roster exposes phase, role, and stable seats")
+    grok = AgentSpec(key="grok", label="Grok", emoji="X")
+    claude = AgentSpec(key="claude", label="Claude", emoji="C")
+    cursor = AgentSpec(key="cursor", label="Cursor", emoji="K")
+    buf = io.StringIO()
+
+    async def exercise() -> tuple[str, bool]:
+        roster = ui_mod.Roster(
+            mode="heavy", out=buf, width=78, heartbeat_seconds=0)
+        await roster.begin_phase(
+            mode="heavy", title="independent", index=1, total=2,
+            seats=[(grok, "leader"), (claude, "worker")], parallel=True)
+
+        grok_events = await roster.sink(grok, "leader")(grok)
+        await grok_events(Event(
+            "lifecycle", "queued", {"state": "queued"}))
+        await grok_events(Event(
+            "lifecycle", "preparing", {"state": "preparing"}))
+        await grok_events(Event(
+            "lifecycle", "running",
+            {"state": "running", "turn_id": "turn-grok"}))
+        await grok_events(Event("thought", "checking the worker boundary"))
+        await grok_events(Event("error", "quota exhausted"))
+        await grok_events(Event("done"))
+        failed_stayed_failed = any(
+            row.key == "grok" and row.state == "failed"
+            for row in roster._rows.values())
+
+        cursor_events = await roster.sink(grok, "leader")(cursor)
+        await cursor_events(Event(
+            "lifecycle", "queued", {"state": "queued"}))
+        await cursor_events(Event(
+            "lifecycle", "preparing", {"state": "preparing"}))
+        await cursor_events(Event(
+            "lifecycle", "running", {"state": "running"}))
+        await cursor_events(Event("tool", "Read leftover/macbot.py"))
+        await cursor_events(Event("done"))
+        await roster.finish(
+            grok, Turn(agent=cursor, text="replacement answer",
+                       tools=["Read leftover/macbot.py"], seconds=4.0),
+            "leader")
+
+        claude_events = await roster.sink(claude, "worker")(claude)
+        await claude_events(Event("status", "comparing approaches"))
+        await claude_events(Event("done"))
+        await roster.finish(
+            claude, Turn(agent=claude, text="worker answer", seconds=3.0),
+            "worker")
+        snapshot = "\n".join(roster.lines())
+        await roster.end_phase()
+        return snapshot, failed_stayed_failed
+
+    text, failed_stayed_failed = asyncio.run(exercise())
+    check("roster shows mode, phase, progress, and parallel shape",
+          "heavy" in text and "phase 1/2" in text
+          and "2/2 finished" in text and "parallel" in text, text)
+    check("rows keep badges, roles, current activity, and final metrics",
+          "X Grok" in text and "K Cursor" in text and "C Claude" in text
+          and "leader" in text and "worker" in text
+          and "Read leftover/macbot.py" not in text
+          and "1 tool" in text and "4s" in text, text)
+    check("fallback keeps the seat and names the replacement",
+          "replaced" in text and "continued by Cursor" in text, text)
+    check("an error followed by done cannot become success",
+          failed_stayed_failed, text)
+    log = buf.getvalue()
+    check("non-tty logs retain phase, role, fallback, and completion context",
+          "heavy · phase 1/2 · independent" in log
+          and "leader · replaced · continued by Cursor" in log
+          and "2/2 finished" in log and "complete" in log, log)
+    check("append-only lifecycle advances without starting-to-queued reversal",
+          " · starting · " not in log
+          and log.count("Grok · leader · queued") == 1
+          and log.count("Cursor · leader · queued") == 1
+          and log.find("Grok · leader · queued")
+          < log.find("Grok · leader · preparing")
+          and log.find("Cursor · leader · queued")
+          < log.find("Cursor · leader · preparing"),
+          log)
+
+    stopped_buf = io.StringIO()
+
+    async def stop_sequential_phase() -> str:
+        roster = ui_mod.Roster(
+            mode="roundtable", out=stopped_buf, width=78,
+            heartbeat_seconds=0)
+        await roster.begin_phase(
+            mode="roundtable", title="opening positions", index=1, total=1,
+            seats=[
+                (grok, "opening"),
+                (claude, "response"),
+                (cursor, "review"),
+            ], parallel=False)
+        grok_events = await roster.sink(grok, "opening")(grok)
+        await grok_events(Event(
+            "lifecycle", "queued", {"state": "queued"}))
+        await grok_events(Event(
+            "lifecycle", "preparing", {"state": "preparing"}))
+        await grok_events(Event(
+            "lifecycle", "running", {"state": "running"}))
+        await roster.end_phase()
+        return stopped_buf.getvalue()
+
+    stopped_log = asyncio.run(stop_sequential_phase())
+    check("append-only cancellation retains every seat, role, and stopped state",
+          "Grok · opening · stopped" in stopped_log
+          and "Claude · response · stopped" in stopped_log
+          and "Cursor · review · stopped" in stopped_log
+          and "3/3 finished · 3 failed" in stopped_log
+          and "sequential · complete" in stopped_log,
+          stopped_log)
+
+    narrow = ui_mod.Roster(
+        [AgentSpec(key="long", label="VeryLongModelName", emoji="V")],
+        title="independent", out=io.StringIO(), width=40,
+        heartbeat_seconds=0)
+    narrow.mark(
+        narrow.ensure(AgentSpec(
+            key="long", label="VeryLongModelName", emoji="V")),
+        "tool", "A very long tool activity that must not wrap")
+    narrow_lines = narrow.lines()
+    check("narrow terminal rows stay within the physical width",
+          all(ui_mod._display_width(line) <= 40 for line in narrow_lines),
+          repr(narrow_lines))
+
+    wide_glyphs = ui_mod.Roster(
+        [AgentSpec(key="wide", label="模型", emoji="🤖")],
+        title="并行分析", out=io.StringIO(), width=20,
+        heartbeat_seconds=0)
+    wide_glyphs.mark(
+        wide_glyphs.ensure(AgentSpec(
+            key="wide", label="模型", emoji="🤖")),
+        "tool", "检查实现细节")
+    wide_lines = wide_glyphs.lines()
+    check("emoji and CJK rows stay within terminal cell width",
+          all(ui_mod._display_width(line) <= 20 for line in wide_lines),
+          repr([(ui_mod._display_width(line), line) for line in wide_lines]))
+    emoji_clusters = ["❤️", "1️⃣", "👨‍👩‍👧‍👦"]
+    clipped_family = ui_mod.Roster._clip("👨‍👩‍👧‍👦 family", 5)
+    check("VS16, keycap, and ZWJ emoji each occupy one two-cell cluster",
+          [ui_mod._display_width(value) for value in emoji_clusters]
+          == [2, 2, 2],
+          repr([(value, ui_mod._display_width(value))
+                for value in emoji_clusters]))
+    check("clipping never splits a joined emoji cluster",
+          clipped_family == "👨‍👩‍👧‍👦..."
+          and ui_mod._display_width(clipped_family) == 5,
+          repr(clipped_family))
+
+    class NarrowStderr(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+        def fileno(self) -> int:
+            return 731
+
+    stderr = NarrowStderr()
+    original_get_terminal_size = ui_mod.os.get_terminal_size
+    original_stdout = ui_mod.sys.stdout
+    original_stderr = ui_mod.sys.stderr
+    terminal_fds: list[int] = []
+    try:
+        def fake_terminal_size(fd: int) -> os.terminal_size:
+            terminal_fds.append(fd)
+            return os.terminal_size((20, 24))
+
+        ui_mod.os.get_terminal_size = fake_terminal_size
+        ui_mod.sys.stdout = io.StringIO()
+        ui_mod.sys.stderr = stderr
+        fd_roster = ui_mod.Roster(
+            [AgentSpec(key="stderr", label="NarrowStderrModel", emoji="S")],
+            title="independent", heartbeat_seconds=0)
+        fd_lines = fd_roster.lines()
+    finally:
+        ui_mod.os.get_terminal_size = original_get_terminal_size
+        ui_mod.sys.stdout = original_stdout
+        ui_mod.sys.stderr = original_stderr
+    check("roster width follows its stderr fd when stdout is redirected",
+          fd_roster.out is stderr and terminal_fds == [731]
+          and all(ui_mod._display_width(line) <= 20 for line in fd_lines),
+          f"fds={terminal_fds}, lines={fd_lines!r}")
+
+
+def test_roster_tty_snapshots_cover_terminal_states() -> None:
+    print("\n[macbot.1d] group roster snapshots stay width-safe and clean")
+
+    def fake_tty() -> io.StringIO:
+        out = io.StringIO()
+        out.isatty = lambda: True  # type: ignore[attr-defined]
+        return out
+
+    def cursor_moves_match_blocks(raw: str) -> bool:
+        cursor = "\033["
+        suffix = "A\033[J"
+        offset = 0
+        found = False
+        while True:
+            start = raw.find(cursor, offset)
+            if start < 0:
+                return found
+            end = raw.find(suffix, start + len(cursor))
+            if end < 0:
+                return False
+            try:
+                move = int(raw[start + len(cursor):end])
+            except ValueError:
+                return False
+            if raw[offset:start].count("\n") != move:
+                return False
+            offset = end + len(suffix)
+            found = True
+
+    async def exercise(width: int) -> tuple[
+            list[str], list[str], str, str]:
+        grok = AgentSpec(key="grok", label="Grok", emoji="X")
+        claude = AgentSpec(key="claude", label="Claude", emoji="C")
+        codex = AgentSpec(key="gpt", label="Codex", emoji="G")
+        cursor = AgentSpec(key="cursor", label="Cursor", emoji="K")
+        out = fake_tty()
+        roster = ui_mod.Roster(
+            mode="heavy", out=out, width=width,
+            heartbeat_seconds=0, close_timeout=0.2)
+        await roster.begin_phase(
+            mode="heavy", title="independent", index=1, total=2,
+            seats=[
+                (grok, "leader"),
+                (claude, "worker"),
+                (codex, "worker"),
+            ],
+            parallel=True,
+        )
+        await roster.flush()
+
+        grok_events = await roster.sink(grok, "leader")(grok)
+        await grok_events(Event("error", "quota exhausted"))
+        await grok_events(Event("done"))
+        await roster.flush()
+        cursor_events = await roster.sink(grok, "leader")(cursor)
+        await cursor_events(Event("tool", "Read leftover/orchestrator.py"))
+        await cursor_events(Event("done"))
+        await roster.finish(
+            grok,
+            Turn(agent=cursor, text="replacement answer",
+                 tools=["Read leftover/orchestrator.py"], seconds=4.0),
+            "leader",
+        )
+
+        claude_events = await roster.sink(claude, "worker")(claude)
+        await claude_events(Event(
+            "lifecycle", "running", {"state": "running"}))
+        await roster.finish(
+            claude,
+            Turn(agent=claude, error="turn timed out", seconds=7.0,
+                 meta={"timeout_kind": "turn"}),
+            "worker",
+        )
+        codex_events = await roster.sink(codex, "worker")(codex)
+        await codex_events(Event("status", "reviewing the plan"))
+        await roster.finish(
+            codex,
+            Turn(agent=codex, error="stopped", seconds=3.0,
+                 meta={"cancelled": True}),
+            "worker",
+        )
+        first_lines = roster.lines()
+        await roster.end_phase()
+        first_raw = out.getvalue()
+        boundary = len(first_raw)
+
+        await roster.begin_phase(
+            mode="heavy", title="compare-notes", index=2, total=2,
+            seats=[(cursor, "synthesis"), (claude, "discuss")],
+            parallel=True,
+        )
+        await roster.flush()
+        cursor_events = await roster.sink(cursor, "synthesis")(cursor)
+        await cursor_events(Event("text", "final answer"))
+        await cursor_events(Event("done"))
+        await roster.finish(
+            cursor, Turn(agent=cursor, text="final answer", seconds=2.0),
+            "synthesis",
+        )
+        claude_events = await roster.sink(claude, "discuss")(claude)
+        await claude_events(Event("done"))
+        await roster.finish(
+            claude, Turn(agent=claude, seconds=1.0), "discuss")
+        second_lines = roster.lines()
+        await roster.end_phase()
+        return first_lines, second_lines, first_raw, out.getvalue()[boundary:]
+
+    old_no_color = os.environ.get("NO_COLOR")
+    os.environ["NO_COLOR"] = "1"
+    try:
+        snapshots = {
+            width: asyncio.run(exercise(width))
+            for width in (20, 40, 80, 120)
+        }
+    finally:
+        if old_no_color is None:
+            os.environ.pop("NO_COLOR", None)
+        else:
+            os.environ["NO_COLOR"] = old_no_color
+
+    check("20/40/80/120-column snapshots never wrap logical rows",
+          all(ui_mod._display_width(line) <= width
+              for width, (first, second, _raw1, _raw2) in snapshots.items()
+              for line in (*first, *second)),
+          repr({
+              width: [
+                  max(map(ui_mod._display_width, first)),
+                  max(map(ui_mod._display_width, second)),
+              ]
+              for width, (first, second, _raw1, _raw2) in snapshots.items()
+          }))
+    wide_first = "\n".join(snapshots[120][0])
+    wide_second = "\n".join(snapshots[120][1])
+    check("fallback, timeout, cancel, and metrics remain distinct",
+          "replaced" in wide_first and "continued by Cursor" in wide_first
+          and "timeout" in wide_first and "stopped" in wide_first
+          and "1 tool" in wide_first,
+          wide_first)
+    check("the second phase exposes synthesis, discuss, ready, and empty",
+          "phase 2/2" in wide_second and "compare-notes" in wide_second
+          and "synthesis" in wide_second and "discuss" in wide_second
+          and "ready" in wide_second and "empty" in wide_second,
+          wide_second)
+    raw_phases = [
+        raw
+        for _width, (_first, _second, raw1, raw2) in snapshots.items()
+        for raw in (raw1, raw2)
+    ]
+    check("NO_COLOR keeps TTY redraws but removes color escapes",
+          all("\033[" in raw and "\033[2m" not in raw
+              and "\033[0m" not in raw for raw in raw_phases),
+          repr(raw_phases[0]))
+    check("every cursor-up count matches the prior physical block",
+          all(cursor_moves_match_blocks(raw) for raw in raw_phases),
+          repr(raw_phases[0]))
+
+
 def test_score_short_window_beats_fat_monthly() -> None:
-    print("\n[macbot.2] waste prefers a 5h window about to reset")
+    print("\n[macbot.2] a session-only agent still scores on that window")
     now = 1_000_000.0
     codex = Quota(agent="gpt", windows=[Window(
         name="5h", used_percent=20.0, resets_at=now + 1800, source=REPORTED)])
@@ -193,8 +548,10 @@ def test_score_short_window_beats_fat_monthly() -> None:
         source=ESTIMATED)])
     s_gpt = score_quota("gpt", codex, now=now)
     s_cur = score_quota("cursor", cursor, now=now)
-    check("codex total > cursor total", s_gpt.total > s_cur.total,
+    check("session-only Codex uses 5h as the plan window",
+          s_gpt.focus == "5h" and s_gpt.total > s_cur.total,
           f"gpt {s_gpt.total:.3f} vs cursor {s_cur.total:.3f}")
+    check("estimated monthly has no waste", s_cur.waste == 0.0)
     check("codex waste is the reason", s_gpt.waste > s_cur.waste)
 
 
@@ -236,8 +593,192 @@ def test_score_fresh_short_window_does_not_starve_overdue_weekly() -> None:
           next(w for w in s_gpt.windows if w.name == "5h").waste == 0.0)
 
 
+async def test_route_respects_ahead_weekly_window() -> None:
+    print("\n[macbot.3c] an ahead weekly window gates Codex routing")
+    from leftover.router import Router
+
+    now = time.time()
+    weekly_reset = now + 163 * 3600
+    codex_quota = Quota(agent="gpt", checked_at=now, windows=[
+        Window(name="5h", used_percent=0.0, source=REPORTED),
+        Window(name="weekly", used_percent=4.0,
+               resets_at=weekly_reset,
+               started_at=weekly_reset - 7 * 86400,
+               source=REPORTED),
+    ])
+    grok_reset = now + 115 * 3600
+    grok_quota = Quota(agent="grok", checked_at=now, windows=[Window(
+        name="weekly", used_percent=19.0,
+        resets_at=grok_reset,
+        started_at=grok_reset - 7 * 86400,
+        source=REPORTED,
+    )])
+
+    undated = score_quota(
+        "gpt", Quota(agent="gpt", windows=[codex_quota.windows[0]]),
+        now=now)
+    check("an undated reported 5h window has no invented urgency",
+          undated.total == 0.0 and undated.windows[0].lag == 0.0
+          and "no reset clock" in undated.detail,
+          undated.detail)
+
+    gated = score_quota("gpt", Quota(agent="gpt", windows=[
+        Window(name="5h", used_percent=0.0,
+               resets_at=now + 3600, started_at=now - 4 * 3600,
+               source=REPORTED),
+        codex_quota.windows[1],
+    ]), now=now)
+    check("weekly ahead gates even a behind 5h window",
+          gated.total == 0.0 and "weekly" in gated.detail
+          and "ahead of pace" in gated.detail,
+          gated.detail)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        gpt = AgentSpec(key="gpt", label="Codex")
+        grok = AgentSpec(key="grok", label="Grok")
+        cursor = AgentSpec(key="cursor", label="Cursor")
+        cfg = Config(
+            agents=[gpt, grok, cursor], data_dir=tmp,
+            routing=Routing(
+                strategy="lag_waste",
+                coding_keys=["gpt", "grok", "cursor"]))
+        router = Router(cfg, object())
+        router.h(gpt).quota = codex_quota
+        router.h(gpt).quota_checked = now
+        router.h(grok).quota = grok_quota
+        router.h(grok).quota_checked = now
+        router.h(cursor).quota = Quota(
+            agent="cursor", checked_at=now,
+            windows=[Window(
+                name="monthly", used_percent=0.0, source=REPORTED)])
+        router.h(cursor).quota_checked = now
+        ranked = await router.rank([gpt, grok, cursor])
+
+    check("behind and neutral windows both route before ahead Codex",
+          [spec.key for spec in ranked] == ["grok", "cursor", "gpt"]
+          and router.last_scores["gpt"].total == 0.0
+          and router.last_scores["gpt"].ahead > 0.0
+          and router.last_scores["grok"].total > 0.0,
+          repr([spec.key for spec in ranked]))
+
+
+def test_score_allocation_window_outranks_rotting_session() -> None:
+    print("\n[macbot.3e] on-pace weekly + rotting 5h loses to a behind weekly")
+    now = 1_000_000.0
+    week_left = 84 * 3600
+    week_start = now + week_left - 7 * 86400
+    grok = Quota(agent="grok", windows=[Window(
+        name="weekly", used_percent=20.0, resets_at=now + week_left,
+        started_at=week_start, source=REPORTED)])
+    codex = Quota(agent="gpt", windows=[
+        Window(name="5h", used_percent=0.0, resets_at=now + 1800,
+               started_at=now + 1800 - 5 * 3600, source=REPORTED),
+        Window(name="weekly", used_percent=50.0, resets_at=now + week_left,
+               started_at=week_start, source=REPORTED),
+    ])
+    cursor = Quota(agent="cursor", windows=[
+        Window(name="monthly", used_percent=10.0,
+               resets_at=now + 20 * 86400,
+               started_at=now + 20 * 86400 - 30 * 86400,
+               source=REPORTED),
+        Window(name="monthly auto", used_percent=80.0, source=REPORTED),
+    ])
+    s_grok = score_quota("grok", grok, now=now)
+    s_gpt = score_quota("gpt", codex, now=now)
+    s_cur = score_quota("cursor", cursor, now=now)
+    check("Codex focus stays weekly, not the rotting 5h",
+          s_gpt.focus == "weekly" and pick_plan(codex.windows).name == "weekly",
+          s_gpt.detail)
+    check("behind Grok outranks on-pace Codex even with a dying 5h",
+          s_grok.total > s_gpt.total,
+          f"grok {s_grok.total:.3f} vs gpt {s_gpt.total:.3f} "
+          f"session {s_gpt.session_total:.3f}")
+    check("rotting 5h is a tie-break, not total",
+          s_gpt.total == 0.0 and s_gpt.session_total > s_grok.total)
+    check("Cursor ranks on monthly, not monthly auto",
+          s_cur.focus == "monthly", s_cur.detail)
+    check("behind monthly beats on-pace weekly + rotting 5h",
+          s_cur.total > s_gpt.total,
+          f"cursor {s_cur.total:.3f} vs gpt {s_gpt.total:.3f}")
+    check("close weeklies let the rotting 5h break the tie",
+          rank_tuple(s_gpt) < rank_tuple(AgentScore(
+              key="other", lag=s_gpt.lag, waste=s_gpt.waste, total=s_gpt.total,
+              source=REPORTED, detail="", windows=s_gpt.windows,
+              focus="weekly")))
+
+
+def test_score_session_ahead_does_not_gate_behind_weekly() -> None:
+    print("\n[macbot.3f] a hot 5h does not zero an overdue weekly")
+    now = 1_000_000.0
+    week_left = 84 * 3600
+    week_start = now + week_left - 7 * 86400
+    hot = score_quota("gpt", Quota(agent="gpt", windows=[
+        Window(name="5h", used_percent=90.0, resets_at=now + 3600,
+               started_at=now + 3600 - 5 * 3600, source=REPORTED),
+        Window(name="weekly", used_percent=20.0, resets_at=now + week_left,
+               started_at=week_start, source=REPORTED),
+    ]), now=now)
+    check("weekly behind still has urgency",
+          hot.total > 0.0 and hot.ahead == 0.0 and hot.focus == "weekly",
+          hot.detail)
+    full = score_quota("gpt", Quota(agent="gpt", windows=[
+        Window(name="5h", used_percent=100.0, resets_at=now + 3600,
+               started_at=now + 3600 - 5 * 3600, source=REPORTED),
+        Window(name="weekly", used_percent=20.0, resets_at=now + week_left,
+               started_at=week_start, source=REPORTED),
+    ]), now=now)
+    check("a full 5h is skipped without erasing weekly lag",
+          full.session_blocked and full.total > 0.0
+          and "skip" in full.detail,
+          full.detail)
+    grok = score_quota("grok", Quota(agent="grok", windows=[Window(
+        name="weekly", used_percent=30.0, resets_at=now + week_left,
+        started_at=week_start, source=REPORTED)]), now=now)
+    check("full 5h ranks after an available behind weekly",
+          rank_tuple(grok) < rank_tuple(full)
+          and grok.total < full.total)
+
+
+async def test_route_skips_full_session_window() -> None:
+    print("\n[macbot.3g] a full 5h is last even when its weekly is more behind")
+    from leftover.router import Router
+
+    now = time.time()
+    week_left = 84 * 3600
+    week_start = now + week_left - 7 * 86400
+    gpt = AgentSpec(key="gpt", label="Codex")
+    grok = AgentSpec(key="grok", label="Grok")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(
+            agents=[gpt, grok], data_dir=tmp,
+            routing=Routing(strategy="lag_waste",
+                            coding_keys=["gpt", "grok"]))
+        router = Router(cfg, object())
+        router.h(gpt).quota = Quota(agent="gpt", checked_at=now, windows=[
+            Window(name="5h", used_percent=100.0, resets_at=now + 3600,
+                   started_at=now + 3600 - 5 * 3600, source=REPORTED),
+            Window(name="weekly", used_percent=20.0,
+                   resets_at=now + week_left, started_at=week_start,
+                   source=REPORTED),
+        ])
+        router.h(gpt).quota_checked = now
+        router.h(grok).quota = Quota(agent="grok", checked_at=now, windows=[
+            Window(name="weekly", used_percent=30.0,
+                   resets_at=now + week_left, started_at=week_start,
+                   source=REPORTED),
+        ])
+        router.h(grok).quota_checked = now
+        ranked = await router.rank([gpt, grok])
+    check("available Grok beats full-session Codex",
+          [spec.key for spec in ranked] == ["grok", "gpt"]
+          and router.last_scores["gpt"].session_blocked
+          and router.last_scores["gpt"].total
+          > router.last_scores["grok"].total,
+          repr([spec.key for spec in ranked]))
+
+
 async def test_sticky_requires_a_live_session() -> None:
-    print("\n[macbot.3c] persisted cwd choice cannot override fresh quota ranking")
+    print("\n[macbot.3d] persisted cwd choice cannot override fresh quota ranking")
     from leftover.router import Router
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -1153,8 +1694,8 @@ async def test_progress_is_visible_and_output_stays_clean() -> None:
                   in stderr.getvalue(),
                   repr(stderr.getvalue()))
 
-            stderr = io.StringIO()
-            with contextlib.redirect_stdout(io.StringIO()), \
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), \
                     contextlib.redirect_stderr(stderr):
                 ok = await _discuss(
                     cfg, router, Transcript(),
@@ -1163,6 +1704,10 @@ async def test_progress_is_visible_and_output_stays_clean() -> None:
             check("group discussions heartbeat during quiet agents",
                   ok and "leftover: still working" in stderr.getvalue(),
                   repr(stderr.getvalue()))
+            check("group answer blocks include role and round metadata",
+                  "speaker 1 · round 1" in stdout.getvalue()
+                  and "speaker 2 · round 1" in stdout.getvalue(),
+                  repr(stdout.getvalue()))
     finally:
         agents_mod.AgentPool = original
 
@@ -2069,7 +2614,10 @@ async def test_heavy_is_parallel_leader_and_discuss() -> None:
         orch = Orchestrator(cfg, pool, Router(cfg, pool))
         topic = "Should we split the worker?"
         started = asyncio.get_running_loop().time()
-        turns = await orch.execute(Plan("heavy", topic, agents, {}), None)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            turns = await orch.execute(
+                Plan("heavy", topic, agents, {}), None)
         elapsed = asyncio.get_running_loop().time() - started
 
     independent = [p for _, p in pool.prompts
@@ -2080,6 +2628,8 @@ async def test_heavy_is_parallel_leader_and_discuss() -> None:
     check("independent takes and compare-notes both overlap",
           pool.phase_peak[0] == 3 and pool.phase_peak[1] == 3,
           f"peaks={pool.phase_peak}, elapsed={elapsed:.3f}s")
+    check("orchestrator has no terminal UI side effect without an observer",
+          stderr.getvalue() == "", repr(stderr.getvalue()))
     check("leader and workers then synthesis and discuss",
           len(turns) == 6
           and [t.meta.get("discussion_role") for t in turns]
@@ -2104,6 +2654,64 @@ async def test_heavy_is_parallel_leader_and_discuss() -> None:
           and all("Do not edit files" in p for p in independent + discuss)
           and len(synthesis) == 1 and "EDIT_FILES_NOW" in synthesis[0]
           and "make the change in the working directory" in synthesis[0])
+
+    observed_pool = HeavyPool()
+    observed_orch = Orchestrator(
+        cfg, observed_pool, Router(cfg, observed_pool))
+    progress_log = io.StringIO()
+    view = ui_mod.Roster(
+        mode="heavy", out=progress_log, heartbeat_seconds=0)
+    await observed_orch.execute(
+        Plan("heavy", topic, agents, {}), None, progress=view)
+    rendered = progress_log.getvalue()
+    check("heavy observer receives both phases and every live role",
+          "phase 1/2 · independent" in rendered
+          and "phase 2/2 · compare-notes" in rendered
+          and "leader" in rendered and "worker" in rendered
+          and "synthesis" in rendered and "discuss" in rendered
+          and rendered.count("3/3 finished") >= 2,
+          rendered)
+
+
+async def test_pool_lifecycle_events_are_structured() -> None:
+    print("\n[macbot.24c] pool publishes queued, preparing, and running")
+    from leftover import agents as agents_mod
+
+    class LifecycleRunner(BaseRunner):
+        async def run(self, prompt: str, on_event=None) -> Turn:
+            if on_event is not None:
+                await on_event(Event("text", "READY"))
+                await on_event(Event("done"))
+            return Turn(agent=self.spec, text="READY")
+
+    original_build = agents_mod.build_runner
+    agents_mod.build_runner = lambda spec: LifecycleRunner(spec)
+    spec = AgentSpec(key="lifecycle", label="Lifecycle")
+    events: list[Event] = []
+
+    async def collect(event: Event) -> None:
+        events.append(event)
+
+    collect.leftover_lifecycle = True  # type: ignore[attr-defined]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = agents_mod.AgentPool(Config(
+            agents=[spec], data_dir=tmp, default_workdir=tmp))
+        try:
+            turn = await pool.run(spec, "work", collect)
+        finally:
+            await pool.shutdown()
+            agents_mod.build_runner = original_build
+    lifecycle = [event for event in events if event.kind == "lifecycle"]
+    check("lifecycle order follows the real pool boundary",
+          [event.text for event in lifecycle]
+          == ["queued", "preparing", "running"],
+          repr([(event.kind, event.text) for event in events]))
+    check("lifecycle events include a stable turn id and structured state",
+          turn.ok and len({event.data.get("turn_id") for event in lifecycle}) == 1
+          and all(event.data.get("state") == event.text for event in lifecycle)
+          and bool(lifecycle[0].data.get("turn_id")),
+          repr([event.data for event in lifecycle]))
 
 
 async def test_event_sink_obeys_the_turn_deadline() -> None:
@@ -2292,6 +2900,210 @@ async def test_stream_sink_keeps_sync_io_off_the_loop() -> None:
     check("many blocked sinks share one bounded daemon writer",
           len(writer_threads) <= 1,
           repr([thread.name for thread in writer_threads]))
+
+
+async def test_roster_keeps_sync_io_off_the_loop() -> None:
+    print("\n[macbot.26a] Roster output is ordered, bounded, and flushable")
+
+    class BlockingTTY(io.StringIO):
+        def __init__(self, shared: list[tuple[str, str]]) -> None:
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.parts: list[str] = []
+            self.shared = shared
+            self._block_next = True
+
+        def isatty(self) -> bool:
+            return True
+
+        def write(self, text: str) -> int:
+            if self._block_next:
+                self._block_next = False
+                self.entered.set()
+                self.release.wait(timeout=1)
+            self.parts.append(text)
+            self.shared.append(("roster", text))
+            return super().write(text)
+
+        def flush(self) -> None:
+            return None
+
+    class AnswerOutput(io.StringIO):
+        def __init__(self, shared: list[tuple[str, str]]) -> None:
+            super().__init__()
+            self.shared = shared
+
+        def write(self, text: str) -> int:
+            self.shared.append(("answer", text))
+            return super().write(text)
+
+    async def wait_until(predicate, timeout: float = 0.2) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while not predicate():
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("condition was not reached")
+            await asyncio.sleep(0.002)
+
+    spec = AgentSpec(key="gpt", label="Codex", emoji="G")
+
+    snapshot_out = io.StringIO()
+    snapshot_out.isatty = lambda: True  # type: ignore[attr-defined]
+    snapshot = ui_mod.Roster(
+        mode="broadcast", out=snapshot_out, width=72,
+        heartbeat_seconds=0, close_timeout=0.2)
+    await snapshot.begin_phase(
+        mode="broadcast", title="independent answers", index=1, total=1,
+        seats=[(spec, "member")], parallel=True)
+    await asyncio.sleep(0.02)
+    snapshot_events = await snapshot.sink(spec, "member")(spec)
+    await snapshot_events(Event("status", "checking routes"))
+    await snapshot.finish(
+        spec, Turn(agent=spec, text="READY", seconds=2.0), "member")
+    snapshot_flushed = await snapshot.end_phase()
+    ordered = snapshot_out.getvalue()
+
+    pty_master, pty_slave = os.openpty()
+    pty_out = os.fdopen(os.dup(pty_slave), "w", buffering=1)
+    pty_roster = ui_mod.Roster(
+        mode="broadcast", out=pty_out, width=72,
+        heartbeat_seconds=0, close_timeout=0.2)
+    await pty_roster.begin_phase(
+        mode="broadcast", title="independent answers", index=1, total=1,
+        seats=[(spec, "member")], parallel=True)
+    pty_events = await pty_roster.sink(spec, "member")(spec)
+    await pty_events(Event("tool", "inspect routes"))
+    await pty_roster.finish(
+        spec, Turn(agent=spec, text="READY", seconds=1.0), "member")
+    await pty_roster.end_phase()
+    os.set_blocking(pty_master, False)
+    pty_parts: list[bytes] = []
+    while True:
+        try:
+            part = os.read(pty_master, 4096)
+        except (BlockingIOError, OSError):
+            break
+        if not part:
+            break
+        pty_parts.append(part)
+    pty_out.close()
+    os.close(pty_slave)
+    os.close(pty_master)
+    pty_text = b"".join(pty_parts).decode("utf-8", errors="replace")
+
+    shared_output: list[tuple[str, str]] = []
+    out = BlockingTTY(shared_output)
+    roster = ui_mod.Roster(
+        mode="broadcast", out=out, width=72, heartbeat_seconds=0,
+        close_timeout=0.08)
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0.003)
+
+    ticker_task = asyncio.create_task(ticker())
+    began = asyncio.get_running_loop().time()
+    await roster.begin_phase(
+        mode="broadcast",
+        title="\033[3A\033[Jindependent answers\rspoof",
+        index=1, total=1,
+        seats=[(spec, "member")], parallel=True)
+    begin_elapsed = asyncio.get_running_loop().time() - began
+    await wait_until(out.entered.is_set)
+
+    answer_out = AnswerOutput(shared_output)
+    answer_sink = ui_mod.StreamSink(
+        "Healthy", out=answer_out, show_header=False)
+    answer_started = asyncio.get_running_loop().time()
+    answer_delivered = True
+    try:
+        await asyncio.wait_for(
+            answer_sink(Event("text", "ANSWER")), timeout=0.2)
+        await asyncio.wait_for(answer_sink(Event("done")), timeout=0.2)
+    except (TimeoutError, asyncio.TimeoutError):
+        answer_delivered = False
+    answer_elapsed = asyncio.get_running_loop().time() - answer_started
+
+    on_event = await roster.sink(spec, "member")(spec)
+    for index in range(64):
+        await on_event(Event("status", f"step {index}"))
+    await roster.finish(
+        spec, Turn(agent=spec, text="READY", seconds=2.0), "member")
+    pending_writes = len(roster._writes)
+
+    close_started = asyncio.get_running_loop().time()
+    close_task = asyncio.create_task(roster.end_phase())
+    await asyncio.wait_for(close_task, timeout=0.3)
+    close_elapsed = asyncio.get_running_loop().time() - close_started
+    closed_lines = roster.lines()
+    await on_event(Event("status", "late update after close"))
+    await roster.finish(
+        spec, Turn(agent=spec, text="LATE", seconds=9.0), "member")
+    roster.mark(spec, "failed", "late mark after close")
+    late_update_ignored = (
+        roster.lines() == closed_lines
+        and not roster._writes and roster._write_task is None)
+    responsive_ticks = ticks
+    out.release.set()
+    await wait_until(
+        lambda: any(owner == "roster" for owner, _text in shared_output))
+    shared_text = "".join(text for _owner, text in shared_output)
+    after_answer = shared_text.partition("ANSWER\n")[2]
+
+    await roster.begin_phase(
+        mode="broadcast", title="next phase", index=1, total=1,
+        seats=[(spec, "member")], parallel=True)
+    await on_event(Event("tool", "stale update after reopen"))
+    reopened_events = await roster.sink(spec, "member")(spec)
+    await reopened_events(Event(
+        "tool", "\033[9A\033[Jfresh update after reopen\x07"))
+    await roster.finish(
+        spec, Turn(agent=spec, text="READY", seconds=1.0), "member")
+    await roster.end_phase()
+    reopened_text = "".join(out.parts)
+
+    ticker_task.cancel()
+    await asyncio.gather(ticker_task, return_exceptions=True)
+    cursor = ordered.find("\033[3A\033[J")
+    queued = ordered.find("queued")
+    done = ordered.find("done", max(0, cursor))
+    check("a blocked roster write does not stall the event loop",
+          begin_elapsed < 0.05 and responsive_ticks >= 5,
+          f"begin={begin_elapsed:.3f}s, ticks={responsive_ticks}")
+    check("blocked roster output cannot delay or drop streamed answers",
+          answer_delivered and answer_elapsed < 0.2
+          and answer_out.getvalue() == "ANSWER\n",
+          (f"delivered={answer_delivered}, elapsed={answer_elapsed:.3f}s, "
+           f"output={answer_out.getvalue()!r}"))
+    check("late generic TextIO output cannot erase a delivered answer",
+          not roster._tty and bool(after_answer) and "\033[" not in after_answer
+          and "\r" not in after_answer,
+          repr(shared_output))
+    check("a real POSIX TTY uses append-only progress without cursor control",
+          not pty_roster._tty and "\033[" not in pty_text
+          and "started" in pty_text and "complete" in pty_text,
+          repr(pty_text))
+    check("rapid roster snapshots stay bounded while output is blocked",
+          pending_writes <= 2,
+          f"pending={pending_writes}, limit={roster._WRITE_QUEUE_SIZE}")
+    check("a permanently blocked roster close returns at its deadline",
+          close_task.done() and close_elapsed < 0.2,
+          f"elapsed={close_elapsed:.3f}s")
+    check("closed rosters reject late events without restarting the pump",
+          late_update_ignored,
+          f"writes={list(roster._writes)!r}, task={roster._write_task!r}")
+    check("a reopened phase rejects callbacks from the prior epoch",
+          "stale update after reopen" not in reopened_text
+          and "fresh update after reopen" in reopened_text
+          and "\033[" not in reopened_text and "\x07" not in reopened_text,
+          repr(reopened_text))
+    check("the exact in-memory TTY flushes initial, final, then freeze in order",
+          snapshot_flushed is None and ordered.endswith("\n\n")
+          and queued >= 0 and cursor > queued and done > cursor,
+          repr(ordered))
 
 
 async def test_stream_sink_shows_plan_and_thought() -> None:
@@ -2553,9 +3365,15 @@ def main() -> int:
     test_compose_followup_is_bare()
     test_intent()
     test_repl_completes_commands_and_mentions()
+    test_roster_is_per_agent_status_not_logos()
+    test_roster_tty_snapshots_cover_terminal_states()
     test_score_short_window_beats_fat_monthly()
     test_score_depleted_short_window_loses()
     test_score_fresh_short_window_does_not_starve_overdue_weekly()
+    asyncio.run(test_route_respects_ahead_weekly_window())
+    test_score_allocation_window_outranks_rotting_session()
+    test_score_session_ahead_does_not_gate_behind_weekly()
+    asyncio.run(test_route_skips_full_session_window())
     asyncio.run(test_sticky_requires_a_live_session())
     asyncio.run(test_pick_plan_and_cu())
     asyncio.run(test_pick_heavy_is_local_multi_model_collab())
@@ -2591,8 +3409,10 @@ def main() -> int:
     asyncio.run(test_exec_structured_error_is_failure())
     asyncio.run(test_debate_is_parallel_and_compact())
     asyncio.run(test_heavy_is_parallel_leader_and_discuss())
+    asyncio.run(test_pool_lifecycle_events_are_structured())
     asyncio.run(test_event_sink_obeys_the_turn_deadline())
     asyncio.run(test_stream_sink_keeps_sync_io_off_the_loop())
+    asyncio.run(test_roster_keeps_sync_io_off_the_loop())
     asyncio.run(test_stream_sink_shows_plan_and_thought())
     ok = all(RESULTS)
     print(f"\n{sum(RESULTS)}/{len(RESULTS)} checks passed")

@@ -530,7 +530,7 @@ class Router:
                                                    self._priority(s)))
         elif strategy == "lag_waste":
             quotas = await asyncio.gather(*(self.quota_for(s) for s in usable))
-            from .score import score_quota
+            from .score import rank_tuple, score_quota
             r = self.config.routing
             scores = {
                 s.key: score_quota(s.key, qq, lag_weight=r.lag_weight,
@@ -538,8 +538,10 @@ class Router:
                 for s, qq in zip(usable, quotas)
             }
             self.last_scores = scores
-            ranked = sorted(usable, key=lambda s: (-scores[s.key].total,
-                                                   self._priority(s)))
+            ranked = sorted(
+                usable,
+                key=lambda s: rank_tuple(scores[s.key], self._priority(s)),
+            )
         else:                                          # headroom
             quotas = await asyncio.gather(*(self.quota_for(s) for s in usable))
             scores = {

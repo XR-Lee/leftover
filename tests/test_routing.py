@@ -412,8 +412,11 @@ def test_sub2api_codex_probe() -> None:
     check("usage payload parsed", quota is not None)
     assert quota
     names = {w.name: w for w in quota.windows}
-    check("inactive 0/0 5h shell is discarded",
-          set(names) == {"weekly"}, str(set(names)))
+    check("just-refreshed 0/0 5h is still a live 0%",
+          set(names) == {"5h", "weekly"}
+          and names["5h"].used_percent == 0
+          and names["5h"].resets_at is None
+          and names["5h"].requests is None, str(set(names)))
     check("weekly 38% with remaining_seconds",
           abs(names["weekly"].used_percent - 38) < 0.01
           and names["weekly"].resets_at is not None
@@ -460,6 +463,38 @@ def test_sub2api_codex_probe() -> None:
           and zero.windows[0].used_percent == 0,
           zero.describe() if zero else "none")
 
+    live_refresh = q.parse_sub2api_usage({
+        "data": {
+            "five_hour": {
+                "utilization": 0,
+                "resets_at": time.strftime(
+                    "%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+                "remaining_seconds": 0,
+                "window_stats": {
+                    "requests": 630,
+                    "cost": 54.55,
+                },
+            },
+            "seven_day": {
+                "utilization": 1,
+                "remaining_seconds": 595820,
+                "resets_at": time.time() + 595820,
+            },
+        },
+    }, account_name="calmabacus", account_extra={
+        "codex_5h_used_percent": 0,
+        "codex_5h_window_minutes": 0,
+        "codex_7d_used_percent": 1,
+        "codex_7d_window_minutes": 10080,
+    })
+    check("live just-refreshed Codex 5h stays 0% even when extra says disabled",
+          live_refresh is not None
+          and {w.name: w.used_percent for w in live_refresh.windows}
+          == {"5h": 0.0, "weekly": 1.0}
+          and next(w for w in live_refresh.windows if w.name == "5h").requests
+          is None,
+          live_refresh.describe() if live_refresh else "none")
+
     shell = q.parse_sub2api_usage({
         "data": {
             "five_hour": {
@@ -469,8 +504,12 @@ def test_sub2api_codex_probe() -> None:
             },
         },
     }, account_name="acme-team", account_extra=stale_extra)
-    check("disabled metadata filters only a matching inactive live shell",
-          shell is None, shell.describe() if shell else "none")
+    check("disabled extra does not hide a just-refreshed 0%",
+          shell is not None and len(shell.windows) == 1
+          and shell.windows[0].name == "5h"
+          and shell.windows[0].used_percent == 0
+          and shell.windows[0].resets_at is None,
+          shell.describe() if shell else "none")
 
     extra = q.parse_sub2api_account({
         "id": 1, "name": "acme-team", "platform": "openai", "type": "oauth",
@@ -545,10 +584,10 @@ def test_sub2api_codex_probe() -> None:
     q._http_json = fake_http  # type: ignore[assignment]
     try:
         found = q.probe_sub2api(Fake())
-        check("probe hits usage and ignores the disabled 5h shell",
+        check("probe hits usage and keeps the just-refreshed 5h 0%",
               found is not None
               and {w.name: w.used_percent for w in found.windows}
-              == {"weekly": 38.0}
+              == {"5h": 0.0, "weekly": 38.0}
               and found.best_source == q.REPORTED,
               found.describe() if found else "none")
         via_codex = q.probe_codex(sub2api=Fake())
@@ -617,6 +656,11 @@ def test_quota_rhythm() -> None:
     undated = q.Window("5h", 0.0, source=q.REPORTED)
     check("0% without a reset clock is not just-reset",
           not rh.just_reset(undated, now))
+    early_week = q.Window(
+        "weekly", 1.0, resets_at=now + 7 * 86400 - 2.5 * 3600,
+        started_at=now - 2.5 * 3600, source=q.REPORTED)
+    check("1% early in a refreshed weekly window is still a live percent",
+          not rh.just_reset(early_week, now))
     spec_agy = AgentSpec(key="antigravity", label="Antigravity", emoji="A")
     estimated = rh.render_windows(
         spec_agy,
@@ -676,8 +720,19 @@ def test_quota_rhythm() -> None:
         AgentSpec(key="gpt", label="Codex", emoji="G"),
         q.Quota("gpt", [gpt_5h, gpt_week], title="you@example.com"),
         None, now, london)
-    check("codex 5h is a footnote, not bars",
-          "5h just reset" in gpt_block and gpt_block.count("calendar █") == 1)
+    check("codex 5h is a footnote with its 0%, not bars",
+          "5h 0% just reset" in gpt_block
+          and gpt_block.count("calendar █") == 1)
+    refreshed = rh.render_windows(
+        AgentSpec(key="gpt", label="Codex", emoji="G"),
+        q.Quota("gpt", [
+            q.Window("5h", 0.0, source=q.REPORTED),
+            gpt_week,
+        ], title="calmabacus@gmail.com"),
+        None, now, london)
+    check("just-refreshed 5h without a clock still prints 0%",
+          "5h 0%" in refreshed and "just reset" not in refreshed,
+          refreshed)
     check("codex keeps the 7d req/$ line",
           "2.8K req" in gpt_block and "$399.38" in gpt_block)
     page = rh.render(
@@ -4558,10 +4613,14 @@ async def test_pool_retains_stubborn_control_cleanup() -> None:
     original_build = agents_mod.build_runner
     original_control = agents_mod._RUNNER_CONTROL_TIMEOUT
     original_transition = agents_mod.POOL_TRANSITION_TIMEOUT
-    agents_mod._RUNNER_CONTROL_TIMEOUT = 0.01
     agents_mod.POOL_TRANSITION_TIMEOUT = 0.03
     try:
         for operation in ("cancel", "close"):
+            # Make cancel consume the entire transition budget so the runner
+            # deterministically remains registered for the repeated shutdown.
+            agents_mod._RUNNER_CONTROL_TIMEOUT = (
+                agents_mod.POOL_TRANSITION_TIMEOUT
+                if operation == "cancel" else 0.01)
             entered = asyncio.Event()
             cancelled = asyncio.Event()
             release = asyncio.Event()
@@ -4579,6 +4638,9 @@ async def test_pool_retains_stubborn_control_cleanup() -> None:
 
                 async def _block_control(self):
                     state["calls"] += 1
+                    if release.is_set():
+                        finished.set()
+                        return
                     entered.set()
                     try:
                         await asyncio.Event().wait()
@@ -4594,6 +4656,7 @@ async def test_pool_retains_stubborn_control_cleanup() -> None:
                 pool = AgentPool(Config(
                     agents=[spec], default_workdir=tmp, data_dir=tmp))
                 await pool.prepare(spec)
+                runner = pool.peek(spec)
                 try:
                     first_error = None
                     started = asyncio.get_running_loop().time()
@@ -4608,7 +4671,12 @@ async def test_pool_retains_stubborn_control_cleanup() -> None:
                     check(f"stubborn {operation} obeys the shutdown deadline",
                           first_error == (
                               "agent pool shutdown timed out after 0.03s")
-                          and elapsed < 0.15 and len(owned) == 1,
+                          and elapsed < 0.15 and len(owned) == 1
+                          and (operation != "cancel"
+                               or (runner is not None
+                                   and pool.peek(spec) is runner
+                                   and pool._runner_cancel_tasks.get(runner)
+                                   in owned)),
                           f"elapsed={elapsed:.3f}s, error={first_error!r}, "
                           f"owned={len(owned)}")
 
@@ -4626,12 +4694,17 @@ async def test_pool_retains_stubborn_control_cleanup() -> None:
 
                     release.set()
                     await asyncio.wait_for(finished.wait(), timeout=0.2)
-                    while pool._background_tasks:
+                    while (pool._background_tasks
+                           or pool._runner_cancel_tasks):
                         await asyncio.sleep(0)
                     await pool.shutdown()
+                    await asyncio.sleep(0)
                     names = {task.get_name() for task in asyncio.all_tasks()}
                     check(f"released {operation} cleanup retires completely",
                           not pool._background_tasks
+                          and not pool._runner_cancel_tasks
+                          and state["calls"] == (
+                              2 if operation == "cancel" else 1)
                           and not any(name.startswith((
                               "leftover-cancel-", "leftover-close-"))
                               for name in names),

@@ -28,16 +28,17 @@ It does not draw a pager, sandbox, diff viewer, or subagent tree. Those stay ins
 | Why table | `macbot --why "…"` | `format_why` | lag/waste + remaining bar; no strength |
 | Why JSON | `leftover --why --json "…"` | `why_payload` | same columns; not a pick dump |
 | Seat / failover | TTY stderr/stdout | `ui.seat_line` / `failover_line` | usher-shaped, our axis |
+| Group progress | every multi-model group mode; append-only terminal/redirected phase and seat logs | optional `orchestrator.GroupProgress`; terminal-frontend-owned `ui.Roster` | `test_roster_is_per_agent_status_not_logos`, observer neutrality, lifecycle opt-in |
 | Vendor TUI | `macbot --tui "…"` | `_exec` / `spawn_argv` | ACP command pins |
 | Plan | `/plan` or `--plan` | intent + `plan_key=claude` | `test_pick_plan_and_cu` |
 | Computer use | `/cu` or `--cu` or explicit “点界面” | always Codex (`gpt`) | same + no fallback past Codex |
 | Named backend | `@codex` `@grok` `@cursor` `@antigravity` `@claude` | `intent.named` | intent + `--use` |
 | Heavy collab | `/heavy` `--heavy` `/discuss` or `should we` / `一起写` / `?` | Grok leader; independent + compare-notes in parallel; one CLI ok | `test_pick_heavy_is_local_multi_model_collab`, `test_heavy_is_parallel_leader_and_discuss` |
-| Group: heavy | `/heavy` | `_run_heavy` | parallel independent + compare-notes; e2e + macbot.24b |
-| Group: roundtable | `/rt` or two+ `@` mentions | `orchestrator._run_sequence` | group pick JSON + e2e |
-| Group: broadcast | `/all` | `_run_parallel` | e2e |
-| Group: debate | `/debate` (needs 3 CLIs) | `_run_debate` | `test_debate_is_parallel_and_compact` |
-| Group: relay | `/relay` plan→implement→review | `_run_relay` | e2e |
+| Group: heavy | `/heavy`; parallel `independent` (`leader` / `worker`) → parallel `compare-notes` (`synthesis` / `discuss`); terminal roster uses seat-order answers, observer-free transports keep completion order | `_run_heavy` | e2e + `test_heavy_is_parallel_leader_and_discuss` |
+| Group: roundtable | `/rt` or two+ `@` mentions; sequential `shared context`, `speaker i/n` | `orchestrator._run_sequence` | group pick JSON + e2e |
+| Group: broadcast | `/all`; parallel `independent answers`, `member`; completion-order blocks | `_run_parallel` | e2e |
+| Group: debate | `/debate` (needs 3 CLIs); parallel `for` / `against` arguments → sequential `judge` verdict | `_run_debate` | `test_debate_is_parallel_and_compact` |
+| Group: relay | `/relay`; sequential `plan` → `implement` → `review` | `_run_relay` | e2e |
 | Quota view | `leftover quota` or `/quota` | `router.report` + `rhythm` | parse probes + rhythm |
 | Quota JSON | `leftover quota --json` | `router.report_payload` | same windows; no tokens |
 | Doctor | `leftover doctor` | `doctor` | roster + remaining bar + paths |
@@ -53,7 +54,7 @@ It does not draw a pager, sandbox, diff viewer, or subagent tree. Those stay ins
 | Default task is coding | Claude is not in the lag race |
 | `/heavy` → Grok is leader; independent + compare-notes in parallel | Local collab, not a sequential roundtable |
 | Coding pool = `gpt`, `grok`, `cursor`, `antigravity` | Cursor pinned to `--model grok-4.6`, Antigravity pinned to `--model gemini-3.1-pro-high` — both first-party |
-| Score = `0.5 * lag + 1.0 * waste` | Overdue windows rise; fresh short windows do not starve them |
+| Score = `0.5 * lag + 1.0 * waste` on the allocation window | Weekly, else monthly; a 5h window is skip + tie-break, not the rank |
 | `waste = 0` on `estimated` | Turn budgets must not fake a 5h emergency |
 | `/plan` → Claude first, coding pool as fallback | Planning is the only default Claude job |
 | `/cu` → Codex only, no further fallback | Computer use is a Codex harness, not a model id |
@@ -72,9 +73,11 @@ It does not draw a pager, sandbox, diff viewer, or subagent tree. Those stay ins
 | ACP first, exec if ACP missing or start fails | `AgentPool`, D3 |
 | First turn injects WORK/PLAN_ONLY; follow-up is the bare user line | `_compose` |
 | Subagent prompt forbids re-entering `leftover` | WORK / PLAN_ONLY |
+| Worker answers address the human; leftover is routing | VOICE (D22) |
 | Refusal classified in the router, including short *result text* | D4, 300-char scan |
 | Benched agent is not called | circuit breaker |
 | Tool permissions auto-approved | exec/ACP flags in `config.BUILTIN_AGENTS` |
+| Group progress is optional and transport-neutral; lifecycle metadata requires `leftover_lifecycle=True` | `Orchestrator.execute(..., progress=None)` has no terminal UI side effects; CLI `_discuss` and `agora console` own `ui.Roster`; normal sinks never receive lifecycle events |
 
 ## Quota probes (reported → observed → estimated)
 

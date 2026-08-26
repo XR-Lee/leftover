@@ -16,7 +16,8 @@ debate_judge_key  = "cursor"  # lower-latency default; explicit @names win
 [routing]
 # leftover uses lag_waste for the coding pool. The frozen Telegram transport
 # still defaults to headroom unless you change this.
-#   lag_waste spend the window that is most behind / about to reset unused
+#   lag_waste spend the weekly/monthly window that is most behind;
+#             a full 5h is skipped, a behind 5h only breaks ties
 #   headroom  pick whoever has the most quota left
 #   order     always try `order` top to bottom
 #   cheapest  light-tier agents first, escalate on refusal

@@ -11,6 +11,7 @@ product. `leftover scope` is the skill-install switch (D19), not a pager.
 python tests/test_macbot.py            # product contract
 python tests/test_routing.py           # probes, classification, fallback policy
 python tests/test_e2e.py               # group modes on a mock ACP agent
+python tests/test_telegram.py           # Telegram privacy and safe HTML chunks
 python tests/test_reliability.py       # deadlines, process trees, ledger
 python tests/test_state_reliability.py # multi-process state merging
 ruff check leftover tests scripts
@@ -23,7 +24,9 @@ Python 3.10 through 3.13.
 ## Invariants (fail the PR if broken)
 
 - `--agent` is caller identity; `--use` forces routing.
-- Coding pick uses lag+waste; estimated windows have `waste = 0`.
+- Coding pick uses lag+waste on the allocation window (weekly, else
+  monthly). Estimated windows have `waste = 0`. A 5h window does not set
+  `total` when a weekly/monthly window is live.
 - `/cu` is Codex only.
 - Cursor stays on `--model grok-4.6`; Antigravity stays on a first-party
   `gemini-*` model. Neither may be pointed at another vendor's models.

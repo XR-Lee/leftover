@@ -139,6 +139,84 @@ async def main() -> int:
                 "already said this round" in orch._compose(
                     cfg.agents[1], "x", floor=turns[:1]))
 
+    print("\n[3a] marked sequential sinks receive final role captions")
+
+    class SequentialStatusPool:
+        async def run(self, spec, prompt, on_event=None):
+            if on_event is not None:
+                await on_event(Event("tool", "inspect"))
+                await on_event(Event("text", f"{spec.key} answer"))
+                await on_event(Event("done"))
+            return Turn(
+                agent=spec, text=f"{spec.key} answer", tools=["inspect"])
+
+    sequential_agents = [
+        AgentSpec(key=key, label=key.title())
+        for key in ("planner", "builder", "reviewer")
+    ]
+    sequential_cfg = Config(
+        agents=sequential_agents,
+        data_dir=tempfile.mkdtemp(prefix="agora-sequential-status-test-"),
+    )
+    sequential_pool = SequentialStatusPool()
+    sequential_orch = Orchestrator(
+        sequential_cfg,
+        sequential_pool,
+        Router(sequential_cfg, sequential_pool),
+    )
+    marked_events: list[tuple[str, str, str]] = []
+
+    async def marked_sink(spec):
+        async def on_event(ev):
+            marked_events.append((spec.key, ev.kind, ev.text))
+        return on_event
+
+    marked_sink.leftover_turn_status = True  # type: ignore[attr-defined]
+    roundtable_turns = await sequential_orch.execute(
+        Plan("roundtable", "topic", sequential_agents, {}), marked_sink)
+    roundtable_statuses = [
+        text for _key, kind, text in marked_events if kind == "status"
+    ]
+    ok &= check("roundtable live captions include speaker and round",
+                len(roundtable_statuses) == 3
+                and all(status.startswith(f"speaker {index} · round 1")
+                        and "1 tool" in status
+                        for index, status in enumerate(
+                            roundtable_statuses, start=1))
+                and [turn.meta.get("discussion_role")
+                     for turn in roundtable_turns]
+                == ["SPEAKER 1", "SPEAKER 2", "SPEAKER 3"],
+                repr(roundtable_statuses))
+
+    marked_events.clear()
+    relay_turns = await sequential_orch.execute(
+        Plan("relay", "topic", sequential_agents, {}), marked_sink)
+    relay_statuses = [
+        text for _key, kind, text in marked_events if kind == "status"
+    ]
+    ok &= check("relay live captions identify plan, implement, and review",
+                [status.split(" · ", 1)[0] for status in relay_statuses]
+                == ["plan", "implement", "review"]
+                and all("1 tool" in status for status in relay_statuses)
+                and [turn.meta.get("discussion_role") for turn in relay_turns]
+                == ["PLAN", "IMPLEMENT", "REVIEW"],
+                repr(relay_statuses))
+
+    unmarked_events: list[str] = []
+
+    async def unmarked_sink(_spec):
+        async def on_event(ev):
+            unmarked_events.append(ev.kind)
+        return on_event
+
+    await sequential_orch.execute(
+        Plan("roundtable", "topic", sequential_agents[:2], {}),
+        unmarked_sink,
+    )
+    ok &= check("unmarked sequential sinks keep the prior event protocol",
+                unmarked_events == ["tool", "text", "done"] * 2,
+                repr(unmarked_events))
+
     print("\n[4] broadcast runs in parallel")
     orch.transcript.clear()
     plan = orch.parse("/all quick take", in_group=True)
@@ -183,21 +261,40 @@ async def main() -> int:
             emitted.append((spec.key, ev.kind, ev.text))
         return on_event
 
+    grouped_sink.leftover_turn_status = True  # type: ignore[attr-defined]
     turns = await parallel_orch.execute(
         Plan("broadcast", "topic", parallel_agents, {}), grouped_sink)
     ok &= check("parallel work still completes for every slot",
                 [turn.agent.key for turn in turns] == ["one", "two"])
     ok &= check("stdout-facing events are flushed one agent at a time",
                 [key for key, _, _ in emitted]
-                == ["two", "two", "two", "one", "one", "one"],
+                == ["two"] * 4 + ["one"] * 4,
                 repr(emitted))
     ok &= check("fast broadcast slot emits before the slow slot finishes",
                 bool(first_emitted_after) and first_emitted_after[0] < 0.06,
                 repr(first_emitted_after))
     ok &= check("buffered output retains tool visibility",
                 [kind for _, kind, _ in emitted]
-                == ["tool", "text", "done", "tool", "text", "done"],
+                == ["status", "tool", "text", "done"] * 2
+                and emitted[0][2] == "member · 1 tool",
                 repr(emitted))
+
+    legacy_events: list[str] = []
+
+    async def legacy_sink(_spec):
+        async def on_event(event):
+            if event.kind not in {"tool", "text", "error", "done"}:
+                raise AssertionError(f"unexpected legacy event: {event.kind}")
+            legacy_events.append(event.kind)
+
+        return on_event
+
+    legacy_turns = await parallel_orch.execute(
+        Plan("broadcast", "topic", [parallel_agents[1]], {}), legacy_sink)
+    ok &= check("unmarked sinks keep the pre-roster event protocol",
+                legacy_events == ["tool", "text", "done"]
+                and "delivery_error" not in legacy_turns[0].meta,
+                repr((legacy_events, legacy_turns[0].meta)))
 
     print("\n[4c] broadcast fallback has exclusive spare ownership")
 
@@ -348,6 +445,7 @@ async def main() -> int:
             debate_emitted.append((spec.key, ev.kind))
         return on_event
 
+    debate_sink.leftover_turn_status = True  # type: ignore[attr-defined]
     debate_chunk_turns = await debate_chunk_orch.execute(
         Plan("debate", "topic", debate_chunk_agents, {"rounds": "1"}),
         debate_sink,
@@ -356,7 +454,8 @@ async def main() -> int:
                 [turn.agent.key for turn in debate_chunk_turns]
                 == ["pro", "con"])
     ok &= check("fast debate slot emits before the slow side finishes",
-                debate_emitted[:2] == [("con", "text"), ("con", "done")]
+                debate_emitted[:3]
+                == [("con", "status"), ("con", "text"), ("con", "done")]
                 and bool(debate_first_after) and debate_first_after[0] < 0.06,
                 f"events={debate_emitted}, delay={debate_first_after}")
 
@@ -670,15 +769,151 @@ async def main() -> int:
             heavy_emitted.append((spec.key, ev.kind))
         return on_event
 
+    heavy_sink.leftover_turn_status = True  # type: ignore[attr-defined]
     heavy_chunk_turns = await heavy_chunk_orch.execute(
         Plan("heavy", "topic", heavy_chunk_agents, {}), heavy_sink)
     ok &= check("heavy return value keeps leader then worker slot order",
                 [turn.agent.key for turn in heavy_chunk_turns[:2]]
                 == ["grok", "claude"])
     ok &= check("fast heavy worker emits before the slow leader finishes",
-                heavy_emitted[:2] == [("claude", "text"), ("claude", "done")]
+                heavy_emitted[:3]
+                == [("claude", "status"), ("claude", "text"),
+                    ("claude", "done")]
                 and bool(heavy_first_after) and heavy_first_after[0] < 0.06,
                 f"events={heavy_emitted}, delay={heavy_first_after}")
+
+    print("\n[5g] every group mode reports its real execution phases")
+
+    class ProgressPool:
+        async def run(self, spec, prompt, on_event=None):
+            if on_event is not None:
+                await on_event(Event("status", "working"))
+                await on_event(Event("text", f"{spec.key}-answer"))
+                await on_event(Event("done"))
+            return Turn(agent=spec, text=f"{spec.key}-answer", seconds=0.01)
+
+    class ProgressProbe:
+        def __init__(self):
+            self.phases: list[tuple[
+                str, str, int, int, bool, tuple[str, ...]]] = []
+            self.attempts: list[tuple[str, str, str]] = []
+            self.finished: list[tuple[str, str, str]] = []
+            self.ended = 0
+
+        async def begin_phase(
+                self, *, mode, title, index, total, seats, parallel):
+            self.phases.append((
+                mode, title, index, total, parallel,
+                tuple(role for _spec, role in seats),
+            ))
+
+        def sink(self, seat, role=""):
+            async def start(spec):
+                self.attempts.append((seat.key, spec.key, role))
+
+                async def on_event(_event):
+                    return None
+
+                return on_event
+
+            return start
+
+        async def finish(self, seat, turn, role=""):
+            self.finished.append((seat.key, turn.agent.key, role))
+
+        async def end_phase(self):
+            self.ended += 1
+
+    progress_agents = [
+        AgentSpec(key="alpha", label="Alpha"),
+        AgentSpec(key="beta", label="Beta"),
+        AgentSpec(key="gamma", label="Gamma"),
+    ]
+    progress_cfg = Config(
+        agents=progress_agents, max_parallel=3,
+        data_dir=tempfile.mkdtemp(prefix="agora-progress-test-"),
+    )
+
+    async def observe(plan):
+        probe = ProgressProbe()
+        progress_pool = ProgressPool()
+        progress_orch = Orchestrator(
+            progress_cfg, progress_pool,
+            Router(progress_cfg, progress_pool))
+        turns = await progress_orch.execute(plan, None, progress=probe)
+        return probe, turns
+
+    rt_probe, rt_turns = await observe(Plan(
+        "roundtable", "topic", progress_agents, {}))
+    all_probe, all_turns = await observe(Plan(
+        "broadcast", "topic", progress_agents, {}))
+    debate_probe, debate_turns = await observe(Plan(
+        "debate", "topic", progress_agents, {"rounds": "2"}))
+    heavy_probe, heavy_turns = await observe(Plan(
+        "heavy", "topic", progress_agents, {}))
+    relay_probe, relay_turns = await observe(Plan(
+        "relay", "topic", progress_agents, {}))
+
+    ok &= check("roundtable reports one sequential speaker phase",
+                rt_probe.phases == [(
+                    "roundtable", "shared context", 1, 1, False,
+                    ("speaker 1/3", "speaker 2/3", "speaker 3/3"),
+                )]
+                and rt_probe.ended == 1 and len(rt_turns) == 3,
+                repr(rt_probe.phases))
+    ok &= check("broadcast reports one parallel member phase",
+                all_probe.phases == [(
+                    "broadcast", "independent answers", 1, 1, True,
+                    ("member", "member", "member"),
+                )]
+                and all_probe.ended == 1 and len(all_turns) == 3,
+                repr(all_probe.phases))
+    ok &= check("debate reports parallel rounds then a sequential verdict",
+                debate_probe.phases == [
+                    ("debate", "arguments", 1, 3, True,
+                     ("for", "against")),
+                    ("debate", "arguments", 2, 3, True,
+                     ("for", "against")),
+                    ("debate", "verdict", 3, 3, False, ("judge",)),
+                ]
+                and debate_probe.ended == 3 and len(debate_turns) == 5,
+                repr(debate_probe.phases))
+    ok &= check("heavy reports its two parallel role sets",
+                heavy_probe.phases == [
+                    ("heavy", "independent", 1, 2, True,
+                     ("leader", "worker", "worker")),
+                    ("heavy", "compare-notes", 2, 2, True,
+                     ("synthesis", "discuss", "discuss")),
+                ]
+                and heavy_probe.ended == 2 and len(heavy_turns) == 6,
+                repr(heavy_probe.phases))
+    ok &= check("relay reports three sequential single-seat phases",
+                relay_probe.phases == [
+                    ("relay", "plan", 1, 3, False, ("plan",)),
+                    ("relay", "implement", 2, 3, False, ("implement",)),
+                    ("relay", "review", 3, 3, False, ("review",)),
+                ]
+                and relay_probe.ended == 3 and len(relay_turns) == 3,
+                repr(relay_probe.phases))
+    ok &= check("every observed seat gets attempt and terminal callbacks",
+                all(len(probe.attempts) == len(probe.finished)
+                    == len(turns) for probe, turns in (
+                        (rt_probe, rt_turns),
+                        (all_probe, all_turns),
+                        (debate_probe, debate_turns),
+                        (heavy_probe, heavy_turns),
+                        (relay_probe, relay_turns),
+                    )),
+                repr({
+                    "rt": (len(rt_probe.attempts), len(rt_probe.finished)),
+                    "all": (len(all_probe.attempts), len(all_probe.finished)),
+                    "debate": (len(debate_probe.attempts),
+                               len(debate_probe.finished)),
+                    "heavy": (len(heavy_probe.attempts),
+                              len(heavy_probe.finished)),
+                    "relay": (len(relay_probe.attempts),
+                              len(relay_probe.finished)),
+                }))
 
     orch.transcript.clear()
     plan = orch.parse("/relay add a healthcheck endpoint", in_group=True)

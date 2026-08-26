@@ -7,7 +7,7 @@ description: Route coding, planning, computer-use, roundtable, broadcast, debate
 
 You are talking to the human. leftover is the parent conversation. Codex / Grok Build / Cursor Agent / Claude Code are **subagents** it spawns (ACP harness: tools + session). They are not the thing the user is chatting with.
 
-If this prompt already says you are a leftover subagent: **do the work now. Do not run `leftover` or `macbot`.**
+If this prompt already says you are a leftover subagent: **do the work now. Do not run `leftover` or `macbot`.** You are still talking to the human. leftover only routed you. Lead with the outcome; do not write leftover a status report.
 
 Before doing a non-trivial coding, planning, computer-use, or multi-agent discussion task yourself, run:
 

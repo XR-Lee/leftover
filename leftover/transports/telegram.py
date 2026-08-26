@@ -6,6 +6,7 @@ import html
 import logging
 import os
 import time
+from html.parser import HTMLParser
 from pathlib import Path
 
 from telegram import Update
@@ -27,12 +28,160 @@ from ..router import Router
 
 log = logging.getLogger("leftover.telegram")
 
+_STATUS_LIMIT = 120
+
+
+def _compact_note(text: str, limit: int = _STATUS_LIMIT) -> str:
+    """Keep progress metadata short, single-line, and safe for a header."""
+    note = " ".join(text.split())
+    if len(note) <= limit:
+        return note
+    return note[:limit - 3].rstrip() + "..."
+
+
+def _utf16_units(text: str) -> int:
+    return sum(2 if ord(char) > 0xFFFF else 1 for char in text)
+
+
+class _HTMLSegments(HTMLParser):
+    """Collect visible HTML tokens with the formatting active around them."""
+
+    _ALLOWED = {"b", "i", "code", "pre"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.stack: list[tuple[str, str]] = []
+        self.segments: list[
+            tuple[tuple[tuple[str, str], ...], list[str]]
+        ] = []
+
+    @staticmethod
+    def _opening(tag: str, attrs: list[tuple[str, str | None]]) -> str:
+        if tag == "code":
+            language = next(
+                (value for name, value in attrs
+                 if name == "class" and value and value.startswith("language-")),
+                "",
+            )
+            if language and _utf16_units(language) <= 80:
+                return f'<code class="{html.escape(language, quote=True)}">'
+        return f"<{tag}>"
+
+    def _append(self, tokens: list[str]) -> None:
+        if not tokens:
+            return
+        wrappers = tuple(self.stack)
+        if self.segments and self.segments[-1][0] == wrappers:
+            self.segments[-1][1].extend(tokens)
+        else:
+            self.segments.append((wrappers, tokens))
+
+    def handle_starttag(
+            self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag in self._ALLOWED:
+            self.stack.append((tag, self._opening(tag, attrs)))
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.stack[index][0] == tag:
+                del self.stack[index:]
+                return
+
+    def handle_data(self, data: str) -> None:
+        self._append(list(data))
+
+    def handle_entityref(self, name: str) -> None:
+        self._append([f"&{name};"])
+
+    def handle_charref(self, name: str) -> None:
+        self._append([f"&#{name};"])
+
+
+def _split_rendered_html(rendered: str, first_limit: int) -> list[str]:
+    """Split rendered HTML while closing every tag in every message."""
+    parser = _HTMLSegments()
+    parser.feed(rendered)
+    parser.close()
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_units = 0
+    limit = first_limit
+
+    def finish(*, allow_empty: bool = False) -> None:
+        nonlocal current, current_units, limit
+        if current or allow_empty:
+            chunks.append("".join(current))
+        current = []
+        current_units = 0
+        limit = render.TELEGRAM_LIMIT
+
+    for wrappers, tokens in parser.segments:
+        opening = "".join(value for _tag, value in wrappers)
+        closing = "".join(f"</{tag}>" for tag, _value in reversed(wrappers))
+        wrapper_units = _utf16_units(opening) + _utf16_units(closing)
+        index = 0
+        while index < len(tokens):
+            available = limit - current_units - wrapper_units
+            if available <= 0:
+                if not current and limit == render.TELEGRAM_LIMIT:
+                    raise ValueError("Telegram HTML wrapper exceeds the message limit")
+                finish(allow_empty=not chunks and not current)
+                continue
+
+            start = index
+            token_units = 0
+            while index < len(tokens):
+                units = _utf16_units(tokens[index])
+                if token_units + units > available:
+                    break
+                token_units += units
+                index += 1
+
+            if index == start:
+                if not current and limit == render.TELEGRAM_LIMIT:
+                    raise ValueError("Telegram HTML token exceeds the message limit")
+                finish(allow_empty=not chunks and not current)
+                continue
+
+            current.extend((opening, "".join(tokens[start:index]), closing))
+            current_units += wrapper_units + token_units
+            if index < len(tokens):
+                finish()
+
+    if current:
+        finish()
+    if not chunks:
+        chunks.append("")
+    return chunks
+
+
+def _telegram_messages(head: str, body: str) -> list[str]:
+    """Render complete HTML messages without cutting tags or entities."""
+    rendered = render.to_html(body)
+    prefix = head + "\n"
+    if _utf16_units(prefix + rendered) <= render.TELEGRAM_LIMIT:
+        return [prefix + rendered]
+    first_limit = render.TELEGRAM_LIMIT - _utf16_units(prefix)
+    if first_limit < 0:
+        raise ValueError("Telegram header exceeds the message limit")
+    pieces = _split_rendered_html(rendered, first_limit)
+    messages = [prefix + pieces[0], *pieces[1:]]
+    if not all(_utf16_units(message) <= render.TELEGRAM_LIMIT
+               for message in messages):
+        raise ValueError("Telegram message exceeds the message limit")
+    return messages
+
+
 HELP = """<b>agora</b> - your local CLI agents, in this chat.
 
 <b>Talk to one</b>
   @claude / @gpt / @grok / @cursor  &lt;question&gt;
 
 <b>Talk to several</b>
+  /heavy &lt;question&gt;  independent takes, then compare-notes
   /rt &lt;question&gt;      roundtable, each sees the last answer
   /all &lt;question&gt;     everyone answers in parallel
   /debate &lt;claim&gt;     two argue, a third judges
@@ -96,36 +245,47 @@ class Bot:
             msg = await ctx.bot.send_message(
                 chat_id, render.header(spec.emoji, spec.label, "thinking..."),
                 parse_mode=ParseMode.HTML)
-            state = {"buf": "", "tools": [], "last": 0.0, "shown": ""}
+            state = {
+                "buf": "", "tools": [], "status": "",
+                "last": 0.0, "shown": "",
+            }
 
             async def flush(final: bool = False) -> None:
                 body = state["buf"].strip()
                 tools = state["tools"][-3:]
-                note = "" if final else (tools[-1] if tools else "thinking...")
-                head = render.header(spec.emoji, spec.label, note)
-                pieces = render.split(body or ("..." if not final else "(no output)"))
-                text = head + "\n" + render.to_html(pieces[0])
-                if text == state["shown"]:
-                    return
-                state["shown"] = text
-                try:
-                    await ctx.bot.edit_message_text(
-                        text[:render.TELEGRAM_LIMIT], chat_id=chat_id,
-                        message_id=msg.message_id, parse_mode=ParseMode.HTML)
-                except BadRequest as exc:
-                    if "not modified" not in str(exc).lower():
-                        log.warning("edit failed: %s", exc)
                 if final:
-                    for extra in pieces[1:]:
-                        await ctx.bot.send_message(
-                            chat_id, render.to_html(extra),
+                    note = state["status"]
+                else:
+                    note = (tools[-1] if tools else
+                            state["status"] or "thinking...")
+                note = _compact_note(note)
+                head = render.header(spec.emoji, spec.label, note)
+                messages = _telegram_messages(
+                    head, body or ("..." if not final else "(no output)"))
+                text = messages[0]
+                if text != state["shown"]:
+                    state["shown"] = text
+                    try:
+                        await ctx.bot.edit_message_text(
+                            text, chat_id=chat_id, message_id=msg.message_id,
                             parse_mode=ParseMode.HTML)
+                    except BadRequest as exc:
+                        if "not modified" not in str(exc).lower():
+                            log.warning("edit failed: %s", exc)
+                if final:
+                    for extra in messages[1:]:
+                        await ctx.bot.send_message(
+                            chat_id, extra, parse_mode=ParseMode.HTML)
 
             async def on_event(ev: Event) -> None:
                 if ev.kind == "text":
                     state["buf"] += ev.text
                 elif ev.kind == "tool":
                     state["tools"].append(ev.text)
+                elif ev.kind == "status":
+                    state["status"] = _compact_note(ev.text)
+                elif ev.kind == "thought":
+                    return
                 elif ev.kind == "error":
                     state["buf"] += f"\n\n[error] {ev.text}"
                 elif ev.kind == "done":
@@ -138,6 +298,7 @@ class Bot:
 
             return on_event
 
+        sink.leftover_turn_status = True  # type: ignore[attr-defined]
         return sink
 
     # --- handlers ------------------------------------------------------------

@@ -6,6 +6,22 @@
 
 ---
 
+## D22 — worker 的读者是人，leftover 只负责路由
+
+**2026-08-26 · 生效**
+
+任务一变难，worker 就越来越不像对人说话。根因不是模型「变笨」，是 leftover 把**听众**写错了。
+
+WORK 原先写「Report what you changed」「Do not address the user as if you are the top-level assistant」。PLAN_ONLY 写「Report the plan back to leftover」。本意是：禁止再进 leftover、禁止冒充父对话。副作用是：难度上升 → 要报的东西变多 → worker 给 leftover 写工单（过程、行话、覆盖清单），而不是给父对话里的人做决定。组模式的「Keep it tight unless the task needs depth」把同一件事合法化了：难 = 可以写长。
+
+这和 D18 第三条护城河打架。父对话是 leftover 的产品。stdout 就是人读的答案。leftover 不是读者。
+
+**改什么：** 反重入、反角色扮演留下。听众改回人。难度上升时压缩，不膨胀。VOICE 一处，WORK / PLAN_ONLY / HEAVY 共用。组模式同样：depth 是更锋利的判断，不是更长的 briefing。
+
+**不采用：** 再写一套 leftover 人格层；加一篇「说人话」长 skill（提示词更重，淹死得更快）；follow-up 每轮重贴 VOICE（ACP session 自己就是上下文，D 已钉死 follow-up 是裸用户行）。
+
+---
+
 ## D21 — leftover heavy 的执行形状是 Grok Heavy：并行独立思考 + 并行比较笔记
 
 **2026-08-25 · 生效**

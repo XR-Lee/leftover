@@ -37,6 +37,10 @@ This directory is the leftover git root (`github.com/XR-Lee/leftover`). Do not i
 - Estimated windows must not contribute `waste`.
 - `waste` is lag divided by hours-to-reset. Do not score the whole unused pool
   as urgent at the instant a short window resets.
+- `score_quota.total` is the allocation window (weekly, else monthly, else a
+  session-only bucket). A live 5h/session window must not set `total` and must
+  not ahead-gate the agent. A 5h at 100% is `session_blocked` (skip), then a
+  tie-break only when allocation totals match to 0.001.
 - Probe failures degrade; they do not crash pick.
 - Every agent probe shares one `routing.quota_probe_timeout` deadline (20 seconds by default). Internal pagination and fallback probes must consume the remaining budget, not start fresh deadlines.
 - Synchronous probes must use the bounded daemon probe pool, not asyncio's default executor; timeout and Ctrl-C must not delay event-loop shutdown. A timed-out worker may finish its own bounded I/O in the background.
@@ -116,12 +120,13 @@ cd leftover
 python tests/test_macbot.py
 python tests/test_routing.py
 python tests/test_e2e.py
+python tests/test_telegram.py
 python tests/test_reliability.py
 python tests/test_state_reliability.py
 python -m compileall -q leftover tests
 ```
 
-`test_macbot.py` is the product contract (intent, score, pick JSON, `--print` chain, ACP lifecycle, quiet in-flight tool must not exit 124, REPL tab completes commands and `@name`). `test_routing.py` is probes, classification, timeout/fallback policy, and ACP process cleanup. `test_e2e.py` is group modes on mock ACP. `test_reliability.py` covers quota deadlines, ledger concurrency, stream-json EOF hangs, and per-turn exec metadata. `test_state_reliability.py` covers multi-process state merging and atomic reads.
+`test_macbot.py` is the product contract (intent, score, pick JSON, `--print` chain, ACP lifecycle, quiet in-flight tool must not exit 124, REPL tab completes commands and `@name`). `test_routing.py` is probes, classification, timeout/fallback policy, and ACP process cleanup. `test_e2e.py` is group modes on mock ACP. `test_telegram.py` covers thought isolation, bounded status metadata, and complete HTML chunks. `test_reliability.py` covers quota deadlines, ledger concurrency, stream-json EOF hangs, and per-turn exec metadata. `test_state_reliability.py` covers multi-process state merging and atomic reads.
 
 A quota-parser change that only updates `quota.py` is incomplete. Add a fixture-shaped payload next to the existing `parse_*` tests.
 
@@ -174,7 +179,7 @@ Vendor CLIs are not Python dependencies. `doctor` tells the operator what is mis
 
 ## Release checklist (when a repo exists)
 
-1. Run the five test files above plus `compileall`.
+1. Run the six test files above plus `compileall`.
 2. `leftover doctor` on a machine with at least one CLI.
 3. Diff `BUILTIN_AGENTS` ACP/exec argv against `test_builtin_acp_commands`.
 4. Confirm `install-skills` still symlinks, not copies. `leftover scope off`

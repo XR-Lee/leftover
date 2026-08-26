@@ -16,8 +16,9 @@ from ..config import AgentSpec
 @dataclass
 class Event:
     """A streamed fragment from an agent."""
-    kind: str          # "text" | "thought" | "tool" | "status" | "error" | "done"
+    kind: str          # content kinds plus pool lifecycle updates
     text: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

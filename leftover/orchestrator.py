@@ -16,7 +16,7 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Iterable, Sequence
+from typing import Awaitable, Callable, Iterable, Protocol, Sequence
 
 from .agents import AgentPool, Event, Turn
 from .config import AgentSpec, Config
@@ -31,9 +31,11 @@ _GROUP_FRAME = (
     "You are {label}, a subagent leftover spawned for a multi-model discussion.\n"
     "The other subagents are: {others}.\n"
     "{persona}\n"
-    "Address the human. Do not impersonate the others. Add something they "
-    "did not say, or disagree with a reason. Keep it tight unless the task "
-    "needs depth or you are implementing."
+    "Address the human. leftover is routing, not your reader. Do not "
+    "impersonate the others. Add something they did not say, or disagree "
+    "with a reason. Keep it tight. As the task gets harder, compress "
+    "harder: depth is a sharper claim, not a longer briefing. Implementing "
+    "still needs the change and why."
 )
 
 _HEAVY_EXTRA = (
@@ -100,6 +102,21 @@ class Plan:
 
 # Called before an agent starts speaking; returns a sink for its stream.
 TurnSink = Callable[[AgentSpec], Awaitable[Callable[[object], Awaitable[None]] | None]]
+
+
+class GroupProgress(Protocol):
+    """Transport-neutral lifecycle observer for a multi-agent run."""
+
+    async def begin_phase(
+            self, *, mode: str, title: str, index: int, total: int,
+            seats: Sequence[tuple[AgentSpec, str]], parallel: bool) -> None: ...
+
+    def sink(self, seat: AgentSpec, role: str = "") -> TurnSink: ...
+
+    async def finish(
+            self, seat: AgentSpec, turn: Turn, role: str = "") -> None: ...
+
+    async def end_phase(self) -> None: ...
 
 _CANCEL_DRAIN_SECONDS = 0.25
 log = logging.getLogger("leftover.orchestrator")
@@ -295,7 +312,9 @@ class Orchestrator:
 
     # --- execution -----------------------------------------------------------
 
-    async def execute(self, plan: Plan, sink: TurnSink | None = None) -> list[Turn]:
+    async def execute(
+            self, plan: Plan, sink: TurnSink | None = None,
+            progress: GroupProgress | None = None) -> list[Turn]:
         self.transcript.add("You", plan.prompt)
         runner = {
             "ask": self._run_sequence,
@@ -305,7 +324,7 @@ class Orchestrator:
             "debate": self._run_debate,
             "relay": self._run_relay,
         }[plan.mode]
-        return await runner(plan, sink)
+        return await runner(plan, sink, progress)
 
     async def _speak(self, spec: AgentSpec | None, builder, sink: TurnSink | None,
                      exclude: Iterable[str] = (), attempts: int | None = None,
@@ -327,7 +346,7 @@ class Orchestrator:
 
     async def _emit_turn(self, turn: Turn, sink: TurnSink | None,
                          budget: _DeliveryBudget | None = None) -> None:
-        """Flush one buffered parallel debate answer without interleaving text."""
+        """Flush one buffered group answer without interleaving text."""
         if sink is None:
             return
         timeout = self.config.routing.event_sink_timeout
@@ -348,6 +367,17 @@ class Orchestrator:
             on_event = await deliver(lambda: sink(turn.agent))
             if on_event is None:
                 return
+            include_status = bool(
+                getattr(sink, "leftover_turn_status", False)
+                or getattr(on_event, "leftover_turn_status", False))
+            caption = self._turn_status(
+                role=turn.meta.get("discussion_role", ""),
+                round_no=turn.meta.get("discussion_round"),
+                seconds=turn.seconds,
+                tools=len(turn.tools),
+            )
+            if caption and include_status:
+                await deliver(lambda: on_event(Event("status", caption)))
             for tool in turn.tools:
                 await deliver(lambda tool=tool: on_event(Event("tool", tool)))
             if turn.text:
@@ -365,29 +395,142 @@ class Orchestrator:
             turn.meta["delivery_error"] = detail
             log.warning("%s event delivery failed: %s", turn.agent.label, detail)
 
-    async def _run_sequence(self, plan: Plan, sink: TurnSink | None) -> list[Turn]:
+    @staticmethod
+    def _turn_status(*, role: object = "", round_no: object = None,
+                     seconds: float = 0.0, tools: int = 0) -> str:
+        context: list[str] = []
+        shown_role = str(role or "").strip().lower().replace("_", " ")
+        if shown_role:
+            context.append(shown_role)
+        if round_no:
+            context.append(f"round {round_no}")
+        if seconds:
+            context.append(f"{seconds:.0f}s")
+        if tools:
+            context.append(f"{tools} tool" + ("s" if tools != 1 else ""))
+        return " · ".join(context)
+
+    def _live_status_sink(
+            self, sink: TurnSink | None, *, role: str,
+            round_no: int | None = None) -> TurnSink | None:
+        """Add one final caption to an explicitly marked live answer sink."""
+        if sink is None:
+            return None
+
+        async def start(spec: AgentSpec):
+            on_event = await sink(spec)
+            if on_event is None:
+                return None
+            include_status = bool(
+                getattr(sink, "leftover_turn_status", False)
+                or getattr(on_event, "leftover_turn_status", False))
+            if not include_status:
+                return on_event
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            tool_count = 0
+            caption_sent = False
+
+            async def contextual(ev) -> None:
+                nonlocal caption_sent, tool_count
+                kind = str(getattr(ev, "kind", "") or "")
+                if kind == "tool" and getattr(ev, "text", ""):
+                    tool_count += 1
+                if kind == "done" and not caption_sent:
+                    caption_sent = True
+                    caption = self._turn_status(
+                        role=role,
+                        round_no=round_no,
+                        seconds=max(0.0, loop.time() - started),
+                        tools=tool_count,
+                    )
+                    if caption:
+                        await on_event(Event("status", caption))
+                await on_event(ev)
+
+            if getattr(on_event, "leftover_lifecycle", False):
+                contextual.leftover_lifecycle = True  # type: ignore[attr-defined]
+            return contextual
+
+        return start
+
+    async def _run_sequence(
+            self, plan: Plan, sink: TurnSink | None,
+            progress: GroupProgress | None = None) -> list[Turn]:
         turns: list[Turn] = []
         attempts = None if plan.mode == "ask" else 2
         extra = plan.meta.get("extra", "")
-        for spec in (plan.agents or [None]):
-            floor = list(turns)
-            turns.append(await self._speak(
-                spec,
-                lambda s, f=floor, e=extra: self._compose(
-                    s, plan.prompt, extra=e, floor=f),
-                sink,
-                exclude={t.agent.key for t in turns if t.agent},
-                attempts=attempts,
-            ))
+        specs = list(plan.agents or [None])
+        observed = progress is not None and plan.mode != "ask" \
+            and all(spec is not None for spec in specs)
+        roles = [f"speaker {index + 1}/{len(specs)}"
+                 for index in range(len(specs))]
+        if observed:
+            await progress.begin_phase(
+                mode=plan.mode, title="shared context", index=1, total=1,
+                seats=[(spec, role) for spec, role in zip(specs, roles)
+                       if spec is not None],
+                parallel=False,
+            )
+        completed = False
+        try:
+            for index, spec in enumerate(specs):
+                floor = list(turns)
+                if observed and spec is not None:
+                    live_sink = progress.sink(spec, roles[index])
+                elif plan.mode != "ask":
+                    live_sink = self._live_status_sink(
+                        sink,
+                        role=f"SPEAKER {index + 1}",
+                        round_no=1,
+                    )
+                else:
+                    live_sink = sink
+                turn = await self._speak(
+                    spec,
+                    lambda s, f=floor, e=extra: self._compose(
+                        s, plan.prompt, extra=e, floor=f),
+                    live_sink,
+                    exclude={t.agent.key for t in turns if t.agent},
+                    attempts=attempts,
+                )
+                if plan.mode != "ask" and spec is not None:
+                    turn.meta = dict(turn.meta)
+                    turn.meta.update(
+                        discussion_role=f"SPEAKER {index + 1}",
+                        discussion_round=1,
+                    )
+                if observed and spec is not None:
+                    await progress.finish(spec, turn, roles[index])
+                turns.append(turn)
+            completed = True
+        finally:
+            if observed:
+                await progress.end_phase()
+        if observed and completed:
+            delivery = _DeliveryBudget(
+                self.config.routing.event_sink_timeout)
+            for turn in turns:
+                await self._emit_turn(turn, sink, delivery)
         return turns
 
-    async def _run_parallel(self, plan: Plan, sink: TurnSink | None) -> list[Turn]:
+    async def _run_parallel(
+            self, plan: Plan, sink: TurnSink | None,
+            progress: GroupProgress | None = None) -> list[Turn]:
         sem = asyncio.Semaphore(max(1, int(self.config.max_parallel)))
         named = {s.key for s in plan.agents}
         claimed_spares: set[str] = set()
         fallback_lock = asyncio.Lock()
         delivery = _DeliveryBudget(self.config.routing.event_sink_timeout)
         rank_task: asyncio.Task[list[AgentSpec]] | None = None
+        role = "member"
+        if progress is not None:
+            await progress.begin_phase(
+                mode=plan.mode, title="independent answers",
+                index=1, total=1,
+                seats=[(spec, role) for spec in plan.agents],
+                parallel=True,
+            )
 
         async def ranked_agents() -> list[AgentSpec]:
             nonlocal rank_task
@@ -397,10 +540,11 @@ class Orchestrator:
             return await asyncio.shield(rank_task)
 
         async def one(index: int, spec: AgentSpec) -> tuple[int, Turn]:
+            live_sink = progress.sink(spec, role) if progress is not None else None
             async with sem:
                 turn, decision = await self.router.run(
                     lambda s: self._compose(s, plan.prompt),
-                    primary=spec, sink=None, max_attempts=1,
+                    primary=spec, sink=live_sink, max_attempts=1,
                     ordered_chain=[spec])
 
             if not turn.ok and not self.router._terminal_turn(turn):
@@ -430,7 +574,7 @@ class Orchestrator:
                         fallback_turn, fallback_decision = await self.router.run(
                             fallback_prompt,
                             primary=replacement,
-                            sink=None,
+                            sink=live_sink,
                             max_attempts=1,
                             ordered_chain=[replacement],
                         )
@@ -445,9 +589,12 @@ class Orchestrator:
                         decision.chosen = fallback_decision.chosen
 
             self.last_decision = decision
+            turn.meta = dict(turn.meta)
+            turn.meta["discussion_role"] = "MEMBER"
             return index, turn
 
         slots: list[Turn | None] = [None] * len(plan.agents)
+        completion_order: list[Turn] = []
         tasks = [
             asyncio.create_task(one(index, spec))
             for index, spec in enumerate(plan.agents)
@@ -456,13 +603,24 @@ class Orchestrator:
             for completed in asyncio.as_completed(tasks):
                 index, turn = await completed
                 slots[index] = turn
-                await self._emit_turn(turn, sink, delivery)
+                if progress is not None:
+                    await progress.finish(plan.agents[index], turn, role)
+                    completion_order.append(turn)
+                else:
+                    await self._emit_turn(turn, sink, delivery)
         except BaseException:
             cleanup = list(tasks)
             if rank_task is not None:
                 cleanup.append(rank_task)
             await _cancel_and_drain(cleanup)
             raise
+        finally:
+            if progress is not None:
+                await progress.end_phase()
+
+        if progress is not None:
+            for turn in completion_order:
+                await self._emit_turn(turn, sink, delivery)
 
         turns = [turn for turn in slots if turn is not None]
         for t in turns:
@@ -470,9 +628,11 @@ class Orchestrator:
                 self.transcript.add(t.agent.label, t.text)
         return turns
 
-    async def _run_debate(self, plan: Plan, sink: TurnSink | None) -> list[Turn]:
+    async def _run_debate(
+            self, plan: Plan, sink: TurnSink | None,
+            progress: GroupProgress | None = None) -> list[Turn]:
         if len(plan.agents) < 2:
-            return await self._run_sequence(plan, sink)
+            return await self._run_sequence(plan, sink, progress)
         pro, con, *rest = plan.agents
         judge = rest[0] if rest else None
         rounds = max(1, min(int(plan.meta.get(
@@ -504,11 +664,14 @@ class Orchestrator:
                 spec, plan.prompt, e, f, history=history,
                 include_persona=False)
 
-        async def invoke(spec: AgentSpec, prompt_builder) -> Turn:
+        async def invoke(
+                spec: AgentSpec, prompt_builder,
+                live_sink: TurnSink | None = None) -> Turn:
             try:
                 return await await_bounded(
                     self._speak(
-                        spec, prompt_builder, None, attempts=1, record=False,
+                        spec, prompt_builder, live_sink,
+                        attempts=1, record=False,
                         ordered_chain=[spec]),
                     timeout,
                 )
@@ -541,11 +704,22 @@ class Orchestrator:
                 round_reserved = reserved | {spec.key for spec in specs.values()}
                 attempted_spares: set[str] = set()
                 fallback_lock = asyncio.Lock()
+                if progress is not None:
+                    await progress.begin_phase(
+                        mode=plan.mode, title="arguments",
+                        index=round_no,
+                        total=rounds + (1 if judge is not None else 0),
+                        seats=[(specs[side], side.lower()) for side in sides],
+                        parallel=True,
+                    )
 
                 async def resolve_side(index: int, side: str) \
                         -> tuple[int, str, Turn]:
                     prompt_builder = builder(side, round_no, floor)
-                    turn = await invoke(specs[side], prompt_builder)
+                    seat = specs[side]
+                    live_sink = (progress.sink(seat, side.lower())
+                                 if progress is not None else None)
+                    turn = await invoke(seat, prompt_builder, live_sink)
                     if not turn.ok and not self.router._terminal_turn(turn):
                         while (not turn.ok
                                and not self.router._terminal_turn(turn)):
@@ -556,13 +730,15 @@ class Orchestrator:
                                     attempted_spares.add(replacement.key)
                             if replacement is None:
                                 break
-                            turn = await invoke(replacement, prompt_builder)
+                            turn = await invoke(
+                                replacement, prompt_builder, live_sink)
                     turn.meta = dict(turn.meta)
                     turn.meta.update(
                         discussion_role=side, discussion_round=round_no)
                     return index, side, turn
 
                 round_turns: list[Turn | None] = [None, None]
+                completion_order: list[Turn] = []
                 round_tasks = [
                     asyncio.create_task(resolve_side(index, side))
                     for index, side in enumerate(sides)
@@ -573,10 +749,21 @@ class Orchestrator:
                         round_turns[index] = turn
                         if turn.ok:
                             assigned[side] = turn.agent
-                        await self._emit_turn(turn, sink, delivery)
+                        if progress is not None:
+                            await progress.finish(
+                                specs[side], turn, side.lower())
+                            completion_order.append(turn)
+                        else:
+                            await self._emit_turn(turn, sink, delivery)
                 except BaseException:
                     await _cancel_and_drain(round_tasks)
                     raise
+                finally:
+                    if progress is not None:
+                        await progress.end_phase()
+                if progress is not None:
+                    for turn in completion_order:
+                        await self._emit_turn(turn, sink, delivery)
                 turns.extend(turn for turn in round_turns if turn is not None)
 
             if judge is not None:
@@ -591,21 +778,36 @@ class Orchestrator:
                     return self._compose(
                         spec, plan.prompt, e, f, history=history,
                         include_persona=False)
-                verdict = await invoke(judge, judge_builder)
-                if not verdict.ok:
-                    blocked = reserved | {a.key for a in assigned.values()}
-                    blocked.add(judge.key)
-                    attempted_spares: set[str] = set()
-                    while (not verdict.ok
-                           and not self.router._terminal_turn(verdict)):
-                        replacement = spare(blocked, attempted_spares)
-                        if replacement is None:
-                            break
-                        attempted_spares.add(replacement.key)
-                        verdict = await invoke(replacement, judge_builder)
-                verdict.meta = dict(verdict.meta)
-                verdict.meta.update(discussion_role="JUDGE")
-                turns.append(verdict)
+                if progress is not None:
+                    await progress.begin_phase(
+                        mode=plan.mode, title="verdict",
+                        index=rounds + 1, total=rounds + 1,
+                        seats=[(judge, "judge")], parallel=False,
+                    )
+                live_sink = (progress.sink(judge, "judge")
+                             if progress is not None else None)
+                try:
+                    verdict = await invoke(judge, judge_builder, live_sink)
+                    if not verdict.ok:
+                        blocked = reserved | {a.key for a in assigned.values()}
+                        blocked.add(judge.key)
+                        attempted_spares: set[str] = set()
+                        while (not verdict.ok
+                               and not self.router._terminal_turn(verdict)):
+                            replacement = spare(blocked, attempted_spares)
+                            if replacement is None:
+                                break
+                            attempted_spares.add(replacement.key)
+                            verdict = await invoke(
+                                replacement, judge_builder, live_sink)
+                    verdict.meta = dict(verdict.meta)
+                    verdict.meta.update(discussion_role="JUDGE")
+                    turns.append(verdict)
+                    if progress is not None:
+                        await progress.finish(judge, verdict, "judge")
+                finally:
+                    if progress is not None:
+                        await progress.end_phase()
                 await self._emit_turn(verdict, sink, delivery)
         finally:
             await _cancel_and_drain(warm_tasks)
@@ -619,7 +821,9 @@ class Orchestrator:
             self.transcript.add(f"{turn.agent.label} [{suffix.strip()}]", turn.text)
         return turns
 
-    async def _run_heavy(self, plan: Plan, sink: TurnSink | None) -> list[Turn]:
+    async def _run_heavy(
+            self, plan: Plan, sink: TurnSink | None,
+            progress: GroupProgress | None = None) -> list[Turn]:
         """Independent parallel takes, then parallel compare-notes.
 
         Workers discuss while the leader synthesizes from the independent
@@ -627,7 +831,7 @@ class Orchestrator:
         leader may edit the working directory, and only in synthesis.
         """
         if len(plan.agents) < 2:
-            return await self._run_sequence(plan, sink)
+            return await self._run_sequence(plan, sink, progress)
 
         seats = list(plan.agents)
         reserved = {agent.key for agent in plan.agents}
@@ -660,10 +864,13 @@ class Orchestrator:
                     spec, plan.prompt, e, f, history=history,
                     include_persona=p))
 
-        async def invoke(spec: AgentSpec, prompt_builder) -> Turn:
+        async def invoke(
+                spec: AgentSpec, prompt_builder,
+                live_sink: TurnSink | None = None) -> Turn:
             async with sem:
                 return await self._speak(
-                    spec, prompt_builder, None, attempts=1, record=False,
+                    spec, prompt_builder, live_sink,
+                    attempts=1, record=False,
                     ordered_chain=[spec])
 
         def spare(blocked: set[str], attempted: set[str]) -> AgentSpec | None:
@@ -685,7 +892,9 @@ class Orchestrator:
             async def resolve(index: int, seat: int, spec: AgentSpec,
                               role: str) -> tuple[int, int, Turn]:
                 prompt_builder = builder(role, floor)
-                turn = await invoke(spec, prompt_builder)
+                live_sink = (progress.sink(spec, role.lower())
+                             if progress is not None else None)
+                turn = await invoke(spec, prompt_builder, live_sink)
                 if not turn.ok and not self.router._terminal_turn(turn):
                     while (not turn.ok
                            and not self.router._terminal_turn(turn)):
@@ -696,7 +905,8 @@ class Orchestrator:
                                 attempted_spares.add(replacement.key)
                         if replacement is None:
                             break
-                        turn = await invoke(replacement, prompt_builder)
+                        turn = await invoke(
+                            replacement, prompt_builder, live_sink)
                 turn.meta = dict(turn.meta)
                 turn.meta.update(
                     discussion_role=role, discussion_round=round_no)
@@ -711,17 +921,49 @@ class Orchestrator:
                 for completed in asyncio.as_completed(tasks):
                     index, seat, turn = await completed
                     slots[index] = turn
+                    original = entries[index][1]
+                    role = entries[index][2]
                     if turn.ok:
                         seats[seat] = turn.agent
                         reserved.add(turn.agent.key)
-                    await self._emit_turn(turn, sink, delivery)
+                    if progress is not None:
+                        await progress.finish(
+                            original, turn, role.lower())
+                    else:
+                        await self._emit_turn(turn, sink, delivery)
             except BaseException:
                 await _cancel_and_drain(tasks)
                 raise
             return [turn for turn in slots if turn is not None]
 
+        async def run_round(
+            title: str,
+            entries: list[tuple[int, AgentSpec, str]],
+            floor: list[Turn],
+            round_no: int,
+        ) -> list[Turn]:
+            if progress is not None:
+                await progress.begin_phase(
+                    mode=plan.mode, title=title,
+                    index=round_no, total=2,
+                    seats=[(spec, role.lower())
+                           for _, spec, role in entries],
+                    parallel=True,
+                )
+            round_turns: list[Turn] = []
+            try:
+                round_turns = await parallel_round(entries, floor, round_no)
+            finally:
+                if progress is not None:
+                    await progress.end_phase()
+            if progress is not None:
+                for turn in round_turns:
+                    await self._emit_turn(turn, sink, delivery)
+            return round_turns
+
         try:
-            independent = await parallel_round(
+            independent = await run_round(
+                "independent",
                 [(i, spec, "LEADER" if i == 0 else "WORKER")
                  for i, spec in enumerate(seats)],
                 [],
@@ -730,7 +972,8 @@ class Orchestrator:
             turns.extend(independent)
             if any(turn.ok for turn in independent):
                 leader_label = seats[0].label
-                compared = await parallel_round(
+                compared = await run_round(
+                    "compare-notes",
                     [(0, seats[0], "SYNTHESIS"),
                      *[(i, spec, "DISCUSS")
                        for i, spec in enumerate(seats) if i != 0]],
@@ -751,13 +994,16 @@ class Orchestrator:
                 f"{turn.agent.label} [{suffix.strip()}]", turn.text)
         return turns
 
-    async def _run_relay(self, plan: Plan, sink: TurnSink | None) -> list[Turn]:
+    async def _run_relay(
+            self, plan: Plan, sink: TurnSink | None,
+            progress: GroupProgress | None = None) -> list[Turn]:
         """Heavy-work pipeline: plan, implement, review."""
         stages = [
             ("Write a concrete implementation plan. List the files you would "
              "touch and what changes each needs. Do not write the code yet.",),
             ("Carry out the plan above in the working directory. Use your tools "
-             "to actually read and edit files. Report what you changed.",),
+             "to actually read and edit files. Write to the human: what "
+             "changed and what they should do next.",),
             ("Review the work above as a skeptical senior engineer. Verify it "
              "against the original request, run or inspect what you can, and "
              "list any real defects. If it is sound, say so plainly.",),
@@ -765,16 +1011,44 @@ class Orchestrator:
         if not plan.agents:
             return []
         cast = [plan.agents[i % len(plan.agents)] for i in range(len(stages))]
+        roles = ("plan", "implement", "review")
         reserved = {agent.key for agent in cast}
         used: set[str] = set()
         turns: list[Turn] = []
-        for spec, (instruction,) in zip(cast, stages):
+        delivery = _DeliveryBudget(self.config.routing.event_sink_timeout)
+        for index, (spec, (instruction,), role) in enumerate(
+                zip(cast, stages, roles), start=1):
             floor = list(turns)
-            turn = await self._speak(
-                spec,
-                lambda s, i=instruction, f=floor: self._compose(s, plan.prompt, i, f),
-                sink, exclude=(reserved - {spec.key}) | used, attempts=2)
+            if progress is not None:
+                await progress.begin_phase(
+                    mode=plan.mode, title=role,
+                    index=index, total=len(stages),
+                    seats=[(spec, role)], parallel=False,
+                )
+            live_sink = (
+                progress.sink(spec, role)
+                if progress is not None else self._live_status_sink(
+                    sink, role=role.upper())
+            )
+            try:
+                turn = await self._speak(
+                    spec,
+                    lambda s, i=instruction, f=floor: self._compose(
+                        s, plan.prompt, i, f),
+                    live_sink,
+                    exclude=(reserved - {spec.key}) | used,
+                    attempts=2,
+                )
+                turn.meta = dict(turn.meta)
+                turn.meta.update(discussion_role=role.upper())
+                if progress is not None:
+                    await progress.finish(spec, turn, role)
+            finally:
+                if progress is not None:
+                    await progress.end_phase()
             turns.append(turn)
+            if progress is not None:
+                await self._emit_turn(turn, sink, delivery)
             if turn.ok:
                 used.add(turn.agent.key)
         return turns

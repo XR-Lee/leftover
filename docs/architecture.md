@@ -53,11 +53,11 @@ The package still ships `agora bot` (Telegram) on the same orchestrator, behind 
 | Quota | `quota.py` | probes, `classify()`, ledger, Window/Quota serde |
 | Router | `router.py` | rank, fallback inside one request, health |
 | Rhythm | `rhythm.py` | `/quota` calendar-vs-usage text |
-| Orchestrator | `orchestrator.py` | group modes + shared transcript |
+| Orchestrator | `orchestrator.py` | group modes + shared transcript + optional progress observer |
 | Transcript | `transcript.py` | last N messages, 1200-char trim |
 | Pool | `agents/` | one live runner per agent; ACP→exec on start failure |
 | Config | `config.py` | `~/.config/leftover/leftover.toml` then agora.toml; builtins |
-| UI | `ui.py` | seat/failover chrome, `StreamSink` |
+| UI | `ui.py` | seat/failover chrome, phase-aware group `Roster`, `StreamSink` |
 | Skill | `skills/leftover/SKILL.md` | how a vendor CLI re-enters leftover; presence is `leftover scope` |
 | Doctor | `doctor.py` | roster, cached remaining, install hints, paths |
 
@@ -117,6 +117,41 @@ launch a duplicate.
 4. `Router.run` walks `ordered_chain` (the pick), skipping benched keys. It does not re-inject per-agent `fallback` when the chain is pinned.
 5. `observe` classifies error **and** short result text. Quota refusal benches until `resets_at` or `quota_blind_cooldown`.
 6. REPL follow-up on a live ACP session sends the bare user line. First turn on a new session gets WORK/PLAN_ONLY plus trimmed leftover history.
+
+### Group progress observer
+
+`orchestrator.GroupProgress` is a transport-neutral optional observer.
+`Orchestrator.execute(..., progress=None)` has no terminal UI side effects;
+CLI `_discuss` and `agora console` opt in by creating a `ui.Roster` and passing
+it to the orchestrator.
+Built-in buffered answer sinks separately opt in with
+`leftover_turn_status=True` to a compact `status` caption for role, round,
+elapsed time and tool count. Unmarked sinks keep the prior `tool` / `text` /
+`error` / `done` event protocol.
+
+| Mode | Observed phases and answer order |
+|---|---|
+| `/rt` | one sequential `shared context` phase; roles are `speaker i/n` |
+| `/all` | one parallel `independent answers` phase; `member` answers are emitted as grouped blocks in completion order |
+| `/debate` | parallel `arguments` phases (`for` / `against`), then a sequential `verdict` (`judge`) |
+| `/heavy` | parallel `independent` (`leader` / `worker`), then parallel `compare-notes` (`synthesis` / `discuss`); answers emit in seat order after each phase |
+| `/relay` | three sequential phases: `plan`, `implement`, `review` |
+
+The roster header reports mode, phase `x/y`, phase name, finished/failed counts,
+parallel/sequential shape and elapsed time. Each stable seat reports CLI
+badge/name, role, lifecycle state, compact activity, elapsed time and tool
+count. A fallback leaves the original row as `replaced` with `continued by
+<CLI>` and continues under the same seat identity. Terminal display states are
+ready/done, failed, timeout, stopped and empty. Runtime terminal and redirected
+output uses append-only phase/row logs plus a heartbeat, so a blocked writer
+cannot later erase an answer with cursor control. Width-aware preview rows clip
+by terminal cells and hide roles when space is tight; destructive snapshots are
+limited to the synchronous in-memory renderer used by deterministic tests.
+
+Pool lifecycle events (`queued`, `preparing`, `running`, with a structured
+`turn_id`) are emitted only when an event callback opts in with
+`leftover_lifecycle=True`. Normal sinks and transports therefore do not receive
+the extra lifecycle stream.
 
 ## Turn lifecycle and completion
 

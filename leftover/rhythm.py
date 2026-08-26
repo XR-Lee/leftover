@@ -119,7 +119,9 @@ def same_window(a: Window, b: Window) -> bool:
 def just_reset(window: Window, now: float) -> bool:
     if window.source == ESTIMATED:
         return False
-    if window.used_percent > 1:
+    # Any reported usage is a live percentage, including a 1% window
+    # that just refreshed. Only an empty early window is a footnote.
+    if window.used_percent > 0:
         return False
     cal = calendar_pct(window, now)
     if cal is not None:
@@ -377,7 +379,7 @@ def render_windows(spec: AgentSpec, quota: Quota, prev: Quota | None,
         foot.append(label_of(primary) + " " + " · ".join(bits) if bits
                     else label_of(primary))
     for window in fresh:
-        foot.append(f"{label_of(window)} just reset")
+        foot.append(f"{label_of(window)} {fmt_pct(window.used_percent)} just reset")
     if foot:
         lines.append("  ·  ".join(foot) if len(foot) > 1 else foot[0])
     if (quota.note and windows

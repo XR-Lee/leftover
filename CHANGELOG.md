@@ -4,6 +4,55 @@ Notable changes per release. Dates are release dates.
 
 ## Unreleased
 
+## 0.1.3 — 2026-08-26
+
+Group progress you can actually watch. Workers talk to the human.
+
+### Added
+
+- **Phase-aware group progress.** Multi-model `/heavy`, `/rt`, `/all`,
+  `/debate`, and `/relay` runs now show mode, phase, parallel/sequential shape,
+  finished/failed totals and elapsed time, with stable seats for CLI, role,
+  lifecycle, compact activity and tool count. Runtime output uses append-only
+  phase/seat updates with heartbeats and never sends destructive cursor control.
+  Preview rows clip to terminal-cell width. Fallback marks the original row
+  `replaced` and names the continuing CLI. The roster follows the
+  real control flow: roundtable and relay stages are sequential, broadcast and
+  both heavy phases are parallel, and debate switches from parallel arguments
+  to a sequential verdict. `/all` preserves completion order; the terminal
+  `/heavy` roster emits seat order after each phase, while observer-free
+  transports keep completion-order delivery. This is an opt-in `GroupProgress`
+  observer owned by terminal frontends, so
+  `Orchestrator.execute(..., progress=None)` and unmarked observer-free sinks
+  remain UI-neutral. Built-in answer sinks separately opt in to compact
+  role/round/timing captions. Not a leftover pager. A one-CLI `/heavy`
+  continues to use ordinary single-turn progress.
+
+### Changed
+
+- **Worker answers address the human.** Coding/plan/heavy first turns no
+  longer tell the worker to report to leftover or to avoid addressing the
+  user. leftover is routing. Harder tasks must compress, not grow
+  process-speak. D22.
+
+- **lag+waste ranks the allocation window, not `max(5h, weekly)`.**
+  Weekly (else monthly) is leftover quota; 5h/session is a rate limit.
+  A full 5h is skipped. A behind 5h only breaks ties. A hot 5h no longer
+  zeros an overdue weekly, and a dying 5h no longer outranks a more
+  behind weekly or monthly pool. `--why` still shows every window;
+  `total` follows the allocation one.
+
+### Fixed
+
+- **OpenAI / Codex just-refreshed windows still show a percentage.**
+  Sub2API reports a reset 5h window as `0%` / `0s` and stamps
+  `resets_at` with the observation time (account extra often still says
+  `window_minutes=0`). leftover was dropping that as an inactive shell.
+  The `0%` stays; previous-window req/$ are not carried over. A window
+  that already has usage (even `1%` early in a new 7d) is drawn as a
+  live percent instead of a `just reset` footnote. Empty just-reset
+  footnotes now include the percent (`5h 0% just reset`).
+
 ## 0.1.2 — 2026-08-25
 
 Local multi-model collab. A busy turn is no longer cut at 900s.

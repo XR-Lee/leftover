@@ -615,17 +615,19 @@ def _sub2api_window(name: str, used: float, *, resets_at: float | None,
         if length:
             started_at = resets_at - length
     elif remaining is not None and remaining <= 0:
-        # Sub2API emits a 0% / 0-second shell for windows that are not active.
-        # Its reset timestamp tracks the observation time, so treating it as a
-        # completed reset would invent a fresh reported window.
-        if used <= 0 and (resets_at is None or resets_at <= now):
-            return None
-        if resets_at is None or resets_at <= now:
+        # After a refresh Sub2API reports 0% / 0s and stamps resets_at with
+        # the observation time. That is a live 0%, not an inactive window.
+        # Drop the observation clock so leftover quota still shows 0%
+        # instead of hiding an already-expired shell.
+        if used <= 0 or resets_at is None or resets_at <= now:
             resets_at = None
         elif length:
             started_at = resets_at - length
     elif resets_at is not None and resets_at <= now:
-        return None
+        if used <= 0:
+            resets_at = None
+        else:
+            return None
     elif resets_at is not None and length:
         started_at = resets_at - length
     return Window(
@@ -645,14 +647,6 @@ def _sub2api_window_disabled(extra: dict[str, Any], name: str) -> bool:
             and minutes <= 0)
 
 
-def _sub2api_inactive_shell(used: float, remaining: float | None,
-                            resets_at: float | None) -> bool:
-    """True only for the empty, expired bucket emitted for an inactive window."""
-    return (used <= 0
-            and remaining is not None and remaining <= 0
-            and (resets_at is None or resets_at <= time.time()))
-
-
 def parse_sub2api_usage(payload: Any, *, account_name: str = "",
                         agent: str = "gpt",
                         account_extra: dict[str, Any] | None = None) -> Quota | None:
@@ -662,6 +656,9 @@ def parse_sub2api_usage(payload: Any, *, account_name: str = "",
     if not isinstance(data, dict):
         return None
     detail = f"sub2api {account_name}".strip() if account_name else "sub2api"
+    # Callers still pass account extra; /usage is the live number. A 0%
+    # after refresh must not be dropped because extra says disabled.
+    _ = account_extra
     windows: list[Window] = []
     for key, name in (("five_hour", "5h"), ("seven_day", "weekly")):
         bucket = data.get(key)
@@ -677,10 +674,6 @@ def parse_sub2api_usage(payload: Any, *, account_name: str = "",
         remaining = bucket.get("remaining_seconds")
         rem = float(remaining) if isinstance(remaining, (int, float)) else None
         resets_at = _parse_ts(bucket.get("resets_at"))
-        if (account_extra is not None
-                and _sub2api_window_disabled(account_extra, name)
-                and _sub2api_inactive_shell(float(pct), rem, resets_at)):
-            continue
         window = _sub2api_window(
             name, float(pct),
             resets_at=resets_at,
@@ -688,14 +681,16 @@ def parse_sub2api_usage(payload: Any, *, account_name: str = "",
         if window is None:
             continue
         stats = bucket.get("window_stats") if isinstance(bucket.get("window_stats"), dict) else {}
-        req = stats.get("requests")
-        if isinstance(req, (int, float)):
-            window.requests = int(req)
-        cost = stats.get("cost")
-        if cost is None:
-            cost = stats.get("user_cost")
-        if isinstance(cost, (int, float)):
-            window.cost_usd = float(cost)
+        just_refreshed = float(pct) <= 0 and rem is not None and rem <= 0
+        if not just_refreshed:
+            req = stats.get("requests")
+            if isinstance(req, (int, float)):
+                window.requests = int(req)
+            cost = stats.get("cost")
+            if cost is None:
+                cost = stats.get("user_cost")
+            if isinstance(cost, (int, float)):
+                window.cost_usd = float(cost)
         windows.append(window)
     if not windows:
         return None

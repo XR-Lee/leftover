@@ -75,19 +75,26 @@ BANNER = "leftover  ·  /heavy /plan /cu /quota /scope /cd /reset /quit"
 PROGRESS_HEARTBEAT_SECONDS = 30.0
 PROGRESS_ACTIVITY_SECONDS = 1.5
 
+# leftover is plumbing. The human in the parent conversation is the reader.
+# Harder tasks must compress, not grow process-speak. D22.
+VOICE = (
+    "leftover is routing, not your reader. Write to the human: lead with "
+    "the outcome or decision, then only facts that change what they do next. "
+    "As the task gets harder, compress harder. Do not grow process-speak, "
+    "leftover jargon, or a status report for leftover."
+)
 WORK = (
     "You are a subagent spawned by leftover, the user's only conversation. "
     "Do the work now in this working directory: read/edit files, run commands. "
     "Do not only describe a plan. Do not ask the user to confirm tool use. "
     "Do not run leftover — you are already the routed worker. "
-    "Report what you changed when done. Do not address the user as if you "
-    "are the top-level assistant."
+    + VOICE
 )
 PLAN_ONLY = (
     "You are a planning subagent spawned by leftover. Plan only. "
     "Do not edit files or run mutating commands. Do not run leftover. "
-    "List files to touch and the change for each. Report the plan back "
-    "to leftover."
+    "List files to touch and the change for each. "
+    + VOICE
 )
 HEAVY = (
     "You are leftover heavy: Grok-Heavy-shaped local collab on this Mac. "
@@ -96,7 +103,8 @@ HEAVY = (
     "or building with you. "
     "If this is collaborative writing or development, make the change in "
     "the working directory and explain it. "
-    "Do not run leftover."
+    "Do not run leftover. "
+    + VOICE
 )
 
 
@@ -335,11 +343,17 @@ def format_why(pick: Pick) -> str:
                 f"{'—':<16}  (not scored){mark}")
             continue
         if score.windows:
-            best = max(score.windows, key=lambda window: window.total)
+            best = next(
+                (window for window in score.windows
+                 if window.name == score.focus),
+                max(score.windows, key=lambda window: window.total),
+            )
             remaining = max(0.0, 100.0 - best.used_percent)
             remain = f"{ui.remaining_bar(remaining)} {remaining:3.0f}%"
             window = (f"{best.name} {best.used_percent:.0f}% · "
                       f"{best.hours_left:.1f}h left")
+            if score.ahead > 0.0:
+                window += " · ahead"
         else:
             remain = "—"
             window = score.detail or "no live window"
@@ -1063,17 +1077,21 @@ async def _discuss(cfg: Config, router: Router, transcript: Transcript,
     async def sink(spec: AgentSpec):
         return ui.StreamSink(spec.label, out=sys.stdout)
 
+    sink.leftover_turn_status = True  # type: ignore[attr-defined]
+
     meta: dict[str, str] = {}
     if mode == "debate":
         meta["rounds"] = str(cfg.debate_rounds)
     if parsed.kind == "heavy":
         meta["extra"] = _HEAVY_EXTRA
-    async with _Progress(
-            f"{mode} panel", heartbeat_seconds=heartbeat_seconds) as progress:
-        turns = await orch.execute(
-            Plan(mode, parsed.prompt, agents, meta),
-            progress.sink(
-                sink, announce_attempt=mode not in {"debate", "heavy"}))
+    view = ui.Roster(
+        mode=mode,
+        heartbeat_seconds=(PROGRESS_HEARTBEAT_SECONDS
+                           if heartbeat_seconds is None
+                           else heartbeat_seconds),
+    )
+    turns = await orch.execute(
+        Plan(mode, parsed.prompt, agents, meta), sink, progress=view)
     sys.stdout.write(ui.dim(f"  {summarise(turns)}") + "\n\n")
     persist_health(cfg, router, load_state(cfg))
     return bool(turns) and all(

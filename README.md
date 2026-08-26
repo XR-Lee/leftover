@@ -51,9 +51,18 @@ you> should we extract a worker?
 ```
 
 Two or more installed CLIs think independently in parallel, then compare
-notes in parallel. Grok is the leader when it is installed and synthesizes
-the conclusion; only the leader writes the working directory. One CLI still
-works: leftover degrades to a single heavy worker instead of failing.
+notes in parallel. While a multi-model group mode runs, leftover shows a
+compact phase roster: mode, phase, execution shape, finished/failed counts and
+elapsed time, plus stable seats with each CLI's role, lifecycle, activity and
+tool count.
+Terminal and redirected progress use append-only phase/seat updates with a
+heartbeat, so status output cannot race later answer blocks with cursor control.
+Fallback marks the original seat `replaced` and names the continuing CLI.
+In the terminal roster path, Heavy answers dump in seat order after each
+phase. Grok is the leader when it is installed and synthesizes the conclusion;
+only the leader writes the working directory. One CLI still works: leftover
+degrades to a single heavy worker with ordinary single-turn progress instead
+of failing.
 
 Questions and collab phrases (`should we`, `一起写`, `该不该`, a `?`) route
 here. `fix the tests` stays coding. `/rt` `/debate` `/relay` `/all` stay
@@ -108,13 +117,13 @@ you> /quit
 | Command | What |
 |---|---|
 | (type) | coding, pick, continue in this conversation |
-| `/heavy …` | local multi-model collab: parallel independent takes, then parallel compare-notes |
+| `/heavy …` | parallel `independent` (`leader` / `worker`), then parallel `compare-notes` (`synthesis` / `discuss`) |
 | `/plan …` | Claude plans |
 | `/cu …` | Codex computer use |
-| `/rt …` | roundtable |
-| `/debate …` | two argue, third judges |
-| `/relay …` | plan → implement → review |
-| `/all …` | parallel, independent |
+| `/rt …` | one sequential `shared context` phase (`speaker i/n`) |
+| `/debate …` | parallel `for` / `against` arguments, then a sequential `judge` verdict |
+| `/relay …` | three sequential phases: `plan` → `implement` → `review` |
+| `/all …` | parallel `independent answers` (`member`), emitted in completion order |
 | `/quota` `/cd` `/reset` `/who` `/quit` | quota, workdir, reset, exit |
 | `/scope` or `leftover scope` | leftover's skill in other CLIs: on or off, per CLI |
 | `--tui` | exec into the winner's own UI (usher's path) |
@@ -149,7 +158,7 @@ chat product.
 - A full-turn or ACP-idle timeout ends that request and is never replayed on another backend. The turn deadline is silence since the last visible update or in-flight tool, not a wall clock from start. Idle hang detection pauses while a tool is in-flight (a quiet `pytest` is work, not a hang) and resumes when that tool completes. Fast startup, authentication, quota, and transient failures may still follow the configured fallback chain.
 - Quiet `--print` routes report route/attempt/tool progress and a 30-second heartbeat on stderr. Stdout remains answer-only.
 - Skill handoffs wait on the returned process handle; they never defer the next check from a model-generated duration estimate. If an exec leader exits while descendants retain its pipes, leftover reaps that process group and returns the captured answer immediately.
-- `/all` workers and `/debate` advocates run in parallel, but each completed answer is emitted as one grouped block. Debate roles and event delivery have finite deadlines.
+- Group progress follows the real control flow: `/rt` and `/relay` phases are sequential; `/all`, `/debate` arguments, and both `/heavy` phases are parallel; the debate verdict is sequential. Completed answers stay grouped. `/all` preserves completion order; the terminal `/heavy` roster emits seat order after each phase, while observer-free transports preserve completion-order delivery. Debate roles and event delivery have finite deadlines.
 - Shutdown rejects work that was already queued and bounds transport cleanup. `/cd` waits for active work, then later operations start only in the new directory.
 
 Seat line (usher-shaped, leftover axis):
@@ -164,7 +173,7 @@ Seat line (usher-shaped, leftover axis):
 - **waste** = `behind-schedule fraction / hours until reset`
 - **total** = `0.5 * lag + 1.0 * waste`
 
-A fresh short window starts at zero urgency. If it remains unused, its lag and catch-up rate rise; near reset it still beats a relaxed monthly pool. Estimated budgets have `waste = 0`.
+Ranking uses the allocation window: weekly if the vendor publishes one, otherwise monthly. A 5h/session window is a rate limit, not leftover quota — full means skip; otherwise it only breaks ties when allocation scores match to 0.001. A session-only agent (no weekly/monthly in the payload) still scores on that 5h window. A reported window without a reset clock stays visible but adds no routing urgency. If the allocation window is already ahead of calendar (with a 0.5-point rounding allowance), that agent is held at zero urgency. A behind 5h cannot pull a weekly or monthly pool farther ahead, and cannot outrank another agent whose allocation window is more behind. Estimated budgets have `waste = 0`.
 
 ## What it touches
 
@@ -190,6 +199,7 @@ every host contacted, and every auto-approve flag.
 python tests/test_macbot.py
 python tests/test_routing.py
 python tests/test_e2e.py
+python tests/test_telegram.py
 python tests/test_reliability.py
 python tests/test_state_reliability.py
 ```
