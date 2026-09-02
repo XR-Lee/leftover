@@ -4,6 +4,20 @@ Notable changes per release. Dates are release dates.
 
 ## Unreleased
 
+### Fixed
+
+- **leftover scope off no longer leaves leftover in vendor CLIs.**
+  Pre-rename `skills/macbot` links are unlinked with the canonical
+  `skills/leftover` switch. `--pick` re-reads that switch; when it is
+  off, `run` / `spawn` / `announce` are empty so a cached skill cannot
+  spawn leftover again. An explicit empty `--agent` (old skill expanding
+  unset `$LEFTOVER_SELF`) is the same bypass. When leftover is on and
+  the chosen agent is the caller, `run` is also empty so leftover
+  cannot leftover --print itself. leftover-spawned workers get
+  `LEFTOVER_SELF`. A pick that omits `--agent` still routes unless
+  leftover is off everywhere. Text already injected into a live vendor
+  session still needs a fresh CLI.
+
 ## 0.1.3 — 2026-08-26
 
 Group progress you can actually watch. Workers talk to the human.

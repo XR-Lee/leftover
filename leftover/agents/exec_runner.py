@@ -12,7 +12,7 @@ import os
 from typing import Any, AsyncIterator
 
 from ..config import AgentSpec
-from .base import BaseRunner, Event, OnEvent
+from .base import BaseRunner, Event, OnEvent, child_env
 from .process_tree import (
     ProcessTree,
     isolated_subprocess_kwargs,
@@ -351,7 +351,7 @@ class ExecRunner(BaseRunner):
         else:
             argv.append(prompt)
 
-        env = {**os.environ, **spec.env}
+        env = child_env(spec)
         proc, tree = await self._spawn(
             *argv,
             stdin=(asyncio.subprocess.PIPE

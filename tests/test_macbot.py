@@ -1114,6 +1114,13 @@ def test_cli_routing_progress_is_human_only() -> None:
     original_decide = macbot_mod.decide
     original_run_print = macbot_mod.run_print
     original_heartbeat = macbot_mod.PROGRESS_HEARTBEAT_SECONDS
+    from leftover import scope as scope_mod
+    original_snapshot = scope_mod.snapshot
+    original_reconcile = scope_mod.reconcile
+    scope_path = Path("/tmp/codex/skills/leftover/SKILL.md")
+    scope_mod.snapshot = lambda **_kw: [
+        scope_mod.Row("gpt", "Codex", scope_path, True)]
+    scope_mod.reconcile = lambda **_kw: []
     macbot_mod.config_mod.load = lambda _path: cfg
     macbot_mod.decide = slow_decide
     macbot_mod.run_print = fake_run_print
@@ -1161,6 +1168,8 @@ def test_cli_routing_progress_is_human_only() -> None:
         macbot_mod.run_print = original_run_print
         macbot_mod.decide = original_decide
         macbot_mod.config_mod.load = original_load
+        scope_mod.snapshot = original_snapshot
+        scope_mod.reconcile = original_reconcile
 
 
 async def test_routing_progress_stops_after_cancel() -> None:
@@ -1243,6 +1252,23 @@ def test_skill_install_is_symlink() -> None:
           and "after a handoff handle has already been returned" in skill
           and "If `run` is missing, the equivalent is" not in skill,
           "legacy command reconstruction is still allowed")
+    desc = next(
+        line for line in skill.splitlines() if line.startswith("description:"))
+    check("skill does not hijack every turn in the leftover repo",
+          "Use when starting work" not in skill
+          and "leftover scope is on" not in desc
+          and "Do not use when this prompt already says you are a leftover subagent"
+          in skill)
+    check("skill never passes a blank --agent",
+          "Never leave `--agent` empty" in skill
+          and "--agent grok" in skill
+          and "--agent \"$LEFTOVER_SELF\"" not in skill)
+    agent_match_at = skill.find("- `agent` matches you")
+    run_null_at = skill.find("- `run` is null:")
+    check("skill does the work itself before it stops on a null run",
+          agent_match_at != -1 and run_null_at != -1
+          and agent_match_at < run_null_at,
+          f"agent_match={agent_match_at}, run_null={run_null_at}")
     with tempfile.TemporaryDirectory() as tmp:
         src = Path(tmp) / "SKILL.md"
         dest = Path(tmp) / "claude" / "skills" / "leftover" / "SKILL.md"
@@ -1349,6 +1375,301 @@ def test_skill_scope_toggles_vendor_cli_influence() -> None:
         json_text = dispatch([], home=home, as_json=True, interactive=False)
         check("scope --json is the homes list",
               json.loads(json_text)["homes"][0]["key"] == "claude")
+
+
+def test_skill_scope_migrates_owned_legacy_paths() -> None:
+    print("\n[macbot.8c] scope removes legacy macbot discovery paths")
+    from leftover.scope import (
+        apply, dispatch, install_all, payload, skill_homes, skill_source,
+        status)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        src = skill_source()
+        claude = home / ".claude" / "skills" / "leftover" / "SKILL.md"
+        legacy_claude = home / ".claude" / "skills" / "macbot" / "SKILL.md"
+        legacy_claude.parent.mkdir(parents=True)
+        legacy_claude.symlink_to(src)
+
+        row = status("claude", home=home, src=src)
+        blob = payload(home=home, src=src)
+        claude_blob = next(
+            item for item in blob["homes"] if item["key"] == "claude")
+        check("legacy-only install does not turn the canonical switch on",
+              row is not None and not row.on and row.path == claude
+              and row.legacy_paths == (legacy_claude,)
+              and claude_blob["on"] is False
+              and claude_blob["legacy_paths"] == [str(legacy_claude)],
+              repr(claude_blob))
+
+        apply(False, ["claude"], home=home, src=src)
+        check("off removes an owned legacy symlink",
+              not legacy_claude.is_symlink() and not claude.exists())
+
+        legacy_claude.parent.mkdir(parents=True, exist_ok=True)
+        legacy_claude.symlink_to(src)
+        apply(True, ["claude"], home=home, src=src)
+        check("on migrates legacy macbot to canonical leftover",
+              claude.is_symlink() and claude.resolve() == src.resolve()
+              and not legacy_claude.is_symlink())
+
+        legacy_gpt = home / ".codex" / "skills" / "macbot" / "SKILL.md"
+        legacy_gpt.parent.mkdir(parents=True)
+        legacy_gpt.symlink_to(src)
+        install_all(home=home, src=src)
+        canonical = [item.path(home) for item in skill_homes()]
+        check("install-skills migrates legacy entries for every CLI",
+              all(path.is_symlink() for path in canonical)
+              and not legacy_gpt.is_symlink())
+
+        unmanaged = home / ".cursor" / "skills" / "macbot" / "SKILL.md"
+        unmanaged.parent.mkdir(parents=True, exist_ok=True)
+        unmanaged.write_text("---\nname: somebody-else\n---\nkeep me\n")
+        apply(False, ["cursor"], home=home, src=src)
+        check("scope never deletes an unmanaged macbot skill",
+              unmanaged.read_text().endswith("keep me\n"))
+
+        legacy_grok = home / ".grok" / "skills" / "macbot" / "SKILL.md"
+        old_checkout = (home / "old-checkout" / "leftover" / "skills"
+                        / "leftover" / "SKILL.md")
+        legacy_grok.parent.mkdir(parents=True, exist_ok=True)
+        legacy_grok.symlink_to(old_checkout)
+        check("legacy fixture is a broken owned symlink",
+              legacy_grok.is_symlink() and not legacy_grok.exists())
+        apply(False, ["grok"], home=home, src=src)
+        check("off also removes a broken owned legacy symlink",
+              not legacy_grok.is_symlink())
+
+        leftover_only = home / ".grok" / "skills" / "macbot" / "SKILL.md"
+        leftover_only.parent.mkdir(parents=True, exist_ok=True)
+        leftover_only.symlink_to(src)
+        dispatch([], home=home, src=src, interactive=False)
+        check("leftover scope listing drops leftover-owned macbot when leftover is off",
+              not leftover_only.is_symlink() and not leftover_only.exists())
+
+
+def test_skill_scope_respects_cli_config_roots() -> None:
+    print("\n[macbot.8d] scope honors vendor config-home overrides")
+    from leftover.scope import skill_homes
+
+    env_names = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME")
+    original = {name: os.environ.get(name) for name in env_names}
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            configured = {
+                "claude": root / "claude-config",
+                "gpt": root / "codex-config",
+                "grok": root / "grok-config",
+            }
+            os.environ["CLAUDE_CONFIG_DIR"] = str(configured["claude"])
+            os.environ["CODEX_HOME"] = str(configured["gpt"])
+            os.environ["GROK_HOME"] = str(configured["grok"])
+            homes = {item.key: item for item in skill_homes()}
+            check("config env values are complete roots before skills/leftover",
+                  all(homes[key].path() == value / "skills" / "leftover"
+                      / "SKILL.md"
+                      for key, value in configured.items()))
+
+            explicit = root / "explicit-home"
+            check("an explicit home ignores process config overrides",
+                  homes["claude"].path(explicit)
+                  == explicit / ".claude" / "skills" / "leftover" / "SKILL.md"
+                  and homes["gpt"].path(explicit)
+                  == explicit / ".codex" / "skills" / "leftover" / "SKILL.md"
+                  and homes["grok"].path(explicit)
+                  == explicit / ".grok" / "skills" / "leftover" / "SKILL.md")
+    finally:
+        for name, value in original.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def test_pick_rechecks_scope_before_publishing_handoff() -> None:
+    print("\n[macbot.8e] cached skills obey the latest scope switch")
+    from leftover import macbot as macbot_mod
+    from leftover import scope as scope_mod
+
+    spec = AgentSpec(key="gpt", label="Codex", emoji="G")
+    cfg = Config(
+        agents=[spec],
+        routing=Routing(strategy="order", order=["gpt"],
+                        coding_keys=["gpt"], plan_key="gpt"),
+    )
+    scope_path = Path("/tmp/codex/skills/leftover/SKILL.md")
+    original_load = macbot_mod.config_mod.load
+    original_decide = macbot_mod.decide
+    original_status = scope_mod.status
+    original_reconcile = scope_mod.reconcile
+    original_snapshot = scope_mod.snapshot
+    calls = {"decide": 0, "status": 0}
+
+    async def fake_decide(cfg_arg, parsed, cwd, router=None) -> Pick:
+        calls["decide"] += 1
+        return Pick(spec, ["gpt"], {}, "test", parsed.kind, parsed.prompt)
+
+    def run_pick() -> tuple[int, dict]:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = macbot_mod.main([
+                "--pick", "--json", "--agent", "gpt", "fix tests"])
+        return code, json.loads(stdout.getvalue())
+
+    macbot_mod.config_mod.load = lambda _path: cfg
+    macbot_mod.decide = fake_decide
+    scope_mod.reconcile = lambda **_kw: []
+    try:
+        def off_status(token: str):
+            calls["status"] += 1
+            return scope_mod.Row("gpt", "Codex", scope_path, False)
+
+        scope_mod.status = off_status
+        code, blob = run_pick()
+        check("off bypasses routing even when a cached skill invokes pick",
+              code == 0 and calls == {"decide": 0, "status": 1}
+              and blob["kind"] == "coding" and blob["agent"] == "gpt"
+              and blob["run"] is None and blob["spawn"] is None
+              and blob["announce"] == ""
+              and blob["scope"]["active"] is False,
+              repr(blob))
+
+        calls.update(decide=0, status=0)
+
+        def on_status(token: str):
+            calls["status"] += 1
+            return scope_mod.Row("gpt", "Codex", scope_path, True)
+
+        scope_mod.status = on_status
+        code, blob = run_pick()
+        check("on + caller is chosen agent publishes no leftover --print",
+              code == 0 and calls == {"decide": 1, "status": 2}
+              and blob["agent"] == "gpt"
+              and blob["reason"] == "test"
+              and blob["run"] is None and blob["spawn"] is None
+              and blob["announce"] == ""
+              and blob["scope"]["active"] is True,
+              repr(blob))
+
+        calls.update(decide=0, status=0)
+        grok_spec = AgentSpec(key="grok", label="Grok", emoji="X")
+
+        async def fake_decide_other(cfg_arg, parsed, cwd, router=None) -> Pick:
+            calls["decide"] += 1
+            return Pick(grok_spec, ["grok"], {}, "test", parsed.kind, parsed.prompt)
+
+        macbot_mod.decide = fake_decide_other
+        code, blob = run_pick()
+        check("on hands off to someone else with leftover --print",
+              code == 0 and calls == {"decide": 1, "status": 2}
+              and blob["agent"] == "grok"
+              and blob["run"][:4] == ["leftover", "--print", "--use", "grok"]
+              and blob["scope"]["active"] is True,
+              repr(blob))
+        macbot_mod.decide = fake_decide
+
+        calls.update(decide=0, status=0)
+        states = iter((True, False))
+
+        def changing_status(token: str):
+            calls["status"] += 1
+            return scope_mod.Row(
+                "gpt", "Codex", scope_path, next(states))
+
+        scope_mod.status = changing_status
+        code, blob = run_pick()
+        check("an off toggle during decide wins before handoff is returned",
+              code == 0 and calls == {"decide": 1, "status": 2}
+              and blob["agent"] == "gpt" and blob["run"] is None
+              and blob["scope"]["active"] is False
+              and "work directly" in blob["reason"],
+              repr(blob))
+
+        calls.update(decide=0, status=0)
+        scope_mod.snapshot = lambda **_kw: [
+            scope_mod.Row("gpt", "Codex", scope_path, False),
+            scope_mod.Row("grok", "Grok", Path("/tmp/grok/skills/leftover/SKILL.md"),
+                          False),
+        ]
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = macbot_mod.main(["--pick", "--json", "fix tests"])
+        blob = json.loads(stdout.getvalue())
+        check("pick without --agent still bypasses when every CLI is off",
+              code == 0 and calls["decide"] == 0
+              and blob["run"] is None
+              and blob["scope"]["active"] is False,
+              repr(blob))
+
+        calls.update(decide=0, status=0)
+        scope_mod.snapshot = lambda **_kw: [
+            scope_mod.Row("gpt", "Codex", scope_path, False),
+            scope_mod.Row("grok", "Grok", Path("/tmp/grok/skills/leftover/SKILL.md"),
+                          True),
+        ]
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = macbot_mod.main(
+                ["--pick", "--json", "--agent", "", "fix tests"])
+        blob = json.loads(stdout.getvalue())
+        check("explicit empty --agent bypasses even when another CLI is on",
+              code == 0 and calls["decide"] == 0
+              and blob["run"] is None and blob["spawn"] is None
+              and blob["announce"] == ""
+              and blob["scope"]["active"] is False,
+              repr((calls, blob)))
+
+        calls.update(decide=0, status=0)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = macbot_mod.main(["--pick", "--json", "fix tests"])
+        blob = json.loads(stdout.getvalue())
+        check("omitted --agent still routes when some CLI is on",
+              code == 0 and calls["decide"] == 1
+              and blob["agent"] == "gpt"
+              and blob["run"][:4] == ["leftover", "--print", "--use", "gpt"],
+              repr((calls, blob)))
+
+        calls.update(decide=0, status=0)
+        scope_mod.status = off_status
+        os.environ["LEFTOVER_SELF"] = "gpt"
+        try:
+            code, blob = run_pick_without_agent()
+            check("LEFTOVER_SELF is caller identity when --agent is omitted",
+                  code == 0 and calls == {"decide": 0, "status": 1}
+                  and blob.get("self") == "gpt"
+                  and blob["run"] is None
+                  and blob["spawn"] is None
+                  and blob["announce"] == ""
+                  and blob["scope"]["active"] is False,
+                  repr((calls, blob)))
+        finally:
+            os.environ.pop("LEFTOVER_SELF", None)
+    finally:
+        scope_mod.status = original_status
+        scope_mod.reconcile = original_reconcile
+        scope_mod.snapshot = original_snapshot
+        macbot_mod.decide = original_decide
+        macbot_mod.config_mod.load = original_load
+
+
+def run_pick_without_agent() -> tuple[int, dict]:
+    from leftover import macbot as macbot_mod
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        code = macbot_mod.main(["--pick", "--json", "fix tests"])
+    return code, json.loads(stdout.getvalue())
+
+
+def test_spawned_cli_gets_leftover_self() -> None:
+    print("\n[macbot.8f] leftover-spawned CLIs know who they already are")
+    from leftover.agents.base import child_env
+
+    spec = AgentSpec(key="grok", label="Grok", emoji="X", env={"FOO": "1"})
+    env = child_env(spec)
+    check("worker env names who leftover spawned",
+          env["LEFTOVER_SELF"] == "grok" and env["FOO"] == "1")
 
 
 def test_quota_serde() -> None:
@@ -3387,6 +3708,10 @@ def main() -> int:
     asyncio.run(test_routing_progress_stops_after_cancel())
     test_skill_install_is_symlink()
     test_skill_scope_toggles_vendor_cli_influence()
+    test_skill_scope_migrates_owned_legacy_paths()
+    test_skill_scope_respects_cli_config_roots()
+    test_pick_rechecks_scope_before_publishing_handoff()
+    test_spawned_cli_gets_leftover_self()
     test_quota_serde()
     asyncio.run(test_quota_disk_cache())
     asyncio.run(test_run_print_uses_current_workdir())

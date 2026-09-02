@@ -1,25 +1,38 @@
 ---
 name: leftover
-description: Route coding, planning, computer-use, roundtable, broadcast, debate, or relay work onto the right local subscription CLIs (Codex, Grok Build, Cursor Grok, Antigravity, Claude). Use when starting work, when unsure which agent should spend quota, when the user says leftover, macbot, /plan, /cu, /rt, /all, /debate, /relay, names multiple agents, or asks you to hand off to another CLI.
+description: Route leftover or macbot tagged work onto Codex, Grok Build, Cursor, Antigravity, or Claude. Use only when the user names leftover or macbot, or they ask /plan, /cu, /heavy, /rt, /all, /debate, /relay, name multiple agents, or ask to hand off to another CLI. Do not use when this prompt already says you are a leftover subagent, leftover --pick already ran this turn, leftover scope is off, or the user said not to use leftover routing.
 ---
 
 # leftover
 
 You are talking to the human. leftover is the parent conversation. Codex / Grok Build / Cursor Agent / Claude Code are **subagents** it spawns (ACP harness: tools + session). They are not the thing the user is chatting with.
 
-If this prompt already says you are a leftover subagent: **do the work now. Do not run `leftover` or `macbot`.** You are still talking to the human. leftover only routed you. Lead with the outcome; do not write leftover a status report.
+Stop and do the user's task yourself if any of these is true:
 
-Before doing a non-trivial coding, planning, computer-use, or multi-agent discussion task yourself, run:
+- This prompt already says you are a leftover subagent, leftover heavy, or leftover already routed you.
+- leftover --pick already ran in this turn, or its JSON already arrived.
+- leftover --pick JSON has `scope.active` false or `run` null because leftover scope is off.
+- The user told you not to use leftover routing.
+
+Do not run `leftover` or `macbot` in those cases. Lead with the outcome; do not write leftover a status report.
+
+Otherwise, before doing a non-trivial coding, planning, computer-use, or multi-agent discussion task yourself, run leftover --pick **once**, with a literal `--agent` from the table. Never leave `--agent` empty. Never expand an unset `$LEFTOVER_SELF` into a blank flag.
 
 ```bash
-leftover --pick --json --agent "$LEFTOVER_SELF" "$TASK"
+leftover --pick --json --agent grok "$TASK"
 ```
+
+Replace `grok` with the row that matches who you already are.
+
+This pick re-reads `leftover scope` from disk. Vendor CLIs may retain a skill
+they discovered before it was switched off, or discover it through another
+CLI's compatibility directory; the returned `scope` field is authoritative.
 
 This pick is also a foreground command. If the execution tool returns a live
 handle before the JSON arrives, immediately block on that same handle; do not
 estimate when routing will finish and do not start a second pick.
 
-If `leftover` is not on PATH, try `macbot --pick --json --agent "$LEFTOVER_SELF" "$TASK"` or `python3 -m leftover`.
+If `leftover` is not on PATH, try `macbot --pick --json --agent grok "$TASK"` or `python3 -m leftover --pick --json --agent grok "$TASK"`, still using the table value.
 
 `--agent` is **who you already are**. It is not an `@` mention and does not force routing.
 
@@ -35,11 +48,19 @@ If `leftover` is not on PATH, try `macbot --pick --json --agent "$LEFTOVER_SELF"
 
 ## What to do with the JSON
 
-- `run` is null: report `reason` and stop. The requested route is unavailable.
+- `scope.active` is `false`: leftover was switched off for this CLI after the
+  skill was discovered. Do the user's task yourself in the current CLI. Do not
+  show `announce`, do not execute `run`, and do not invoke leftover again.
+- `agent` matches you (`gpt` if you are Codex, etc.): **do the work yourself**.
+  Do not spawn another copy of yourself. Do not run `leftover --print`, even
+  when `run` is present. `run` is null in this case so an older skill that
+  stops on a null run cannot leftover --print you again.
+- `run` is null: if `scope.active` is false or `agent` matches you, do the
+  work yourself. Otherwise report `reason` and stop. Never reconstruct
+  leftover --print.
 - `kind` is `computer_use` and `run` is present: hand off to Codex CLI (`gpt`) via `run` below. If you already *are* Codex, do the work with computer-use tools on this Mac. Do not send computer use to `grok`, `claude`, or `cursor-agent`.
 - `kind` is `roundtable`, `broadcast`, `debate`, `relay`, or `heavy` and `run` is present: this is a leftover group run (or a single heavy worker if only one CLI is installed), not a silent switch of voice. Show `announce`, execute `run`, wait for every turn, and give the human its stdout. Do this even when an individual `agent` would otherwise match you.
 - `agent` is null: report `reason` and stop.
-- `agent` matches you (`gpt` if you are Codex, etc.): **do the work yourself**. Do not spawn another copy of yourself. Do not run `leftover --print`.
 - `agent` is someone else: show `announce`, then run the `run` argv from the JSON (headless). Wait for it to finish. Give the human the stdout. If stderr has a `routed:` line, mention that quietly. **Do not exec `spawn`** — that is a TUI and the answer will not come back to this chat.
 - Show the human exactly `announce` from the JSON, as one quiet line (example: `leftover · Cursor`). That is the routing entry — which subagent is doing this turn. Do not print `chain`, `reason`, arrows, or a preamble like "我来对齐". Never silently switch voices.
 

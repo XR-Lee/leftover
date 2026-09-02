@@ -15,7 +15,7 @@ This directory is the leftover git root (`github.com/XR-Lee/leftover`). Do not i
 - `leftover` is the product entry. `agora` remains for doctor / frozen Telegram.
 - Additive flags may ship in 0.1.x. Removing `--pick` / `--print` / `--use` / `--agent` / `--tui` / `--why` is a breaking change. `-p` is an alias of `--print`. `leftover scope` is additive (D19). `--heavy` / `kind: heavy` are additive (D20). Heavy execution is parallel independent + compare-notes (D21).
 - `--agent` must never become an alias of `--use`.
-- `leftover --pick --json` field names `kind`, `agent`, `agents`, `announce`, `run`, `completion`, `spawn`, `chain`, `reason` are a skill ABI. Rename only with a skill bump and a test.
+- `leftover --pick --json` field names `kind`, `agent`, `agents`, `announce`, `run`, `completion`, `spawn`, `chain`, `reason`, `scope` are a skill ABI. Rename only with a skill bump and a test. `scope.active=false` must bypass routing before probes, keep the caller on itself, and return null `run` / `spawn` so a cached skill cannot leftover --print itself. An empty `--agent` is that same bypass. A self-pick (`agent` equals `self`) also returns null `run`.
 - Bare `--json` (no `-p`) stays a pick dump. `leftover -p --json` is a run envelope (`agent`, `kind`, `exit_code`, `output`, `attempts`).
 - `leftover quota --json` is the `/quota` windows (`source`, `used_percent`, `resets_at`, `note`). `leftover --why --json` is the lag+waste table (`lag`, `waste`, `total`). Neither is a pick dump. Neither grows a strength field.
 
@@ -183,6 +183,7 @@ Vendor CLIs are not Python dependencies. `doctor` tells the operator what is mis
 2. `leftover doctor` on a machine with at least one CLI.
 3. Diff `BUILTIN_AGENTS` ACP/exec argv against `test_builtin_acp_commands`.
 4. Confirm `install-skills` still symlinks, not copies. `leftover scope off`
-   must unlink only leftover's skill path.
+   must unlink the canonical path plus only recognizably leftover-owned legacy
+   `skills/macbot` entries. A foreign `macbot` skill must survive.
 5. Note any vendor field rename in `notes/platform-notes.md`.
 6. Do not tag a release from the mixed parent folder.

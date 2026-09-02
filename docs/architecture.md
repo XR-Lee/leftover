@@ -47,7 +47,7 @@ The package still ships `agora bot` (Telegram) on the same orchestrator, behind 
 | Piece | File | Responsibility |
 |---|---|---|
 | CLI | `macbot.py` (CLI module) | argv, REPL, `--pick` JSON, `-p`/`--print`, `--tui`, `--why`, `--timeout`, skills |
-| Skill scope | `scope.py` | leftover's skill in other CLIs; `leftover scope` / `/scope` |
+| Skill scope | `scope.py` | canonical per-caller switch, legacy `skills/macbot` migration, `leftover scope` / `/scope` |
 | Intent | `intent.py` | slash / `@` / CU phrases → `Intent` |
 | Score | `score.py` | lag, waste, one number per agent |
 | Quota | `quota.py` | probes, `classify()`, ledger, Window/Quota serde |
@@ -58,7 +58,7 @@ The package still ships `agora bot` (Telegram) on the same orchestrator, behind 
 | Pool | `agents/` | one live runner per agent; ACP→exec on start failure |
 | Config | `config.py` | `~/.config/leftover/leftover.toml` then agora.toml; builtins |
 | UI | `ui.py` | seat/failover chrome, phase-aware group `Roster`, `StreamSink` |
-| Skill | `skills/leftover/SKILL.md` | how a vendor CLI re-enters leftover; presence is `leftover scope` |
+| Skill | `skills/leftover/SKILL.md` | how a vendor CLI re-enters leftover and honors the live scope result |
 | Doctor | `doctor.py` | roster, cached remaining, install hints, paths |
 
 State on disk:
@@ -87,8 +87,17 @@ Config search order: `~/.config/leftover/leftover.toml`, `~/.config/macbot/macbo
 | `completion` | process-exit wait contract for the parent execution handle |
 | `spawn` | vendor TUI argv; skills must not run this |
 | `self` | echo of `--agent` |
+| `scope` | canonical caller switch (`active`, `path`, and any owned legacy paths) |
 
 `--agent` is who is asking. `--use` is who should go first.
+When `scope.active` is false, the current vendor handles the task directly and
+must not announce or execute a leftover handoff. `run`, `spawn`, and
+`announce` are empty. The gate runs before quota probing and is checked again
+before the pick is printed, because vendor skill directories overlap and live
+sessions can retain an older skill listing. An explicit empty `--agent`
+bypasses the same way. A pick that omits `--agent` still routes unless
+leftover is off for every CLI. When leftover is on and `agent` equals
+`self`, `run` is also empty so the caller cannot leftover --print itself.
 
 ### Parent handoff wait contract
 

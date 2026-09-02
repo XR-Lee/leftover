@@ -71,6 +71,12 @@ usher 那条路（exec 进官方 TUI）。父对话仍是 `you>`。这不是 D8 
 **不采用：** leftover 自己画聊天 pager；把 `--tui` 改成这个面板；用 toml
 当真相。
 
+**补 2026-09-02：** 关是 `skills/leftover` 加上 leftover 自己的旧
+`skills/macbot`。`--pick` 在 off 时 `run` / `spawn` / `announce` 必须空；
+留 `leftover --print` 会让缓存 skill 把同一家 CLI 再拉起来。旧 skill 的
+`--agent "$LEFTOVER_SELF"` 在直连 CLI 里是空字符串，闸门必须当 off 处理。
+选中调用者自己时 `run` 也必须空。已注入的会话清不掉，要新开。
+
 ---
 
 ## D18 — 长期只加深三件护城河，不把 leftover 做成第二个终端产品

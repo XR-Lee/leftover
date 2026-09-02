@@ -32,7 +32,7 @@ from acp.schema import (
 
 from .. import __version__
 from ..config import AgentSpec
-from .base import AcpIdleTimeout, BaseRunner, Event, OnEvent
+from .base import AcpIdleTimeout, BaseRunner, Event, OnEvent, child_env
 from .process_tree import ProcessTree, terminate_process_tree
 
 _DONE = object()
@@ -712,7 +712,7 @@ class AcpRunner(BaseRunner):
                         bridge,
                         command,
                         *args,
-                        env={**os.environ, **spec.env},
+                        env=child_env(spec),
                         cwd=requested_workdir,
                         transport_kwargs={"stderr": None},
                         observers=[bridge.observe_stream],

@@ -320,6 +320,109 @@ class Pick:
         }
 
 
+def _scope_payload(row: scope_mod.Row) -> dict[str, Any]:
+    return {
+        "active": row.on,
+        "path": str(row.path),
+        "legacy_paths": [str(path) for path in row.legacy_paths],
+    }
+
+
+def _scope_bypass_payload(
+        row: scope_mod.Row, prompt: str, requested_kind: str) -> dict[str, Any]:
+    """Tell a cached skill to keep the task in its current vendor CLI.
+
+    ``run`` and ``spawn`` stay null. Returning leftover --print here is what
+    made a leftover-off CLI spawn leftover, which spawned the same CLI again.
+    Old skills stop on a null run; new skills also read ``scope.active``.
+    """
+    return {
+        "kind": requested_kind,
+        "requested_kind": requested_kind,
+        "agent": row.key or None,
+        "agents": None,
+        "label": row.label,
+        "announce": "",
+        "chain": [row.key] if row.key else [],
+        "reason": (
+            f"leftover scope is off for {row.label}; "
+            "work directly in the current CLI"),
+        "sticky": False,
+        "prompt": prompt,
+        "scores": {},
+        "spawn": None,
+        "run": None,
+        "completion": None,
+        "scope": _scope_payload(row),
+    }
+
+
+def _caller_token(agent_arg: str | None) -> str:
+    return (
+        (agent_arg or "").strip()
+        or os.environ.get("LEFTOVER_SELF", "").strip())
+
+
+def _unknown_caller_row() -> scope_mod.Row:
+    return scope_mod.Row("", "current CLI", Path("."), False)
+
+
+def _caller_scope(agent_arg: str | None) -> scope_mod.Row | None:
+    """Resolve leftover scope for whoever is asking --pick.
+
+    --agent is the skill ABI. leftover --print stamps LEFTOVER_SELF so a
+    spawned worker still has an identity when the skill omits the flag.
+
+    An explicit empty --agent (old skill expanding unset $LEFTOVER_SELF)
+    must bypass: leftover --print here is leftover spawning leftover.
+    A pick that omits --agent stays a human routing query unless leftover
+    is off everywhere.
+    """
+    token = _caller_token(agent_arg)
+    if token:
+        return scope_mod.status(token)
+    if agent_arg is not None:
+        return _unknown_caller_row()
+    rows = scope_mod.snapshot()
+    if rows and not any(row.on for row in rows):
+        return _unknown_caller_row()
+    return None
+
+
+def _suppress_self_handoff(
+        blob: dict[str, Any], self_key: str | None) -> dict[str, Any]:
+    """Do not leftover --print the caller back to itself.
+
+    Old skills execute ``run`` before they notice ``agent`` is themselves.
+    That leftover --print starts the same CLI, which --pick's again.
+    """
+    if not self_key or blob.get("kind") in DISCUSS:
+        return blob
+    if blob.get("agent") != self_key:
+        return blob
+    blob = dict(blob)
+    blob["run"] = None
+    blob["spawn"] = None
+    blob["announce"] = ""
+    blob["completion"] = None
+    return blob
+
+
+def _pick_scope_blob(
+        agent_arg: str | None,
+        parsed: intent_mod.Intent) -> tuple[scope_mod.Row | None, dict[str, Any] | None]:
+    caller_scope = _caller_scope(agent_arg)
+    if caller_scope is None or caller_scope.on:
+        return caller_scope, None
+    scope_mod.reconcile()
+    blob = _scope_bypass_payload(
+        caller_scope, parsed.prompt, parsed.kind)
+    self_key = scope_mod.resolve(_caller_token(agent_arg))
+    if self_key:
+        blob["self"] = self_key
+    return caller_scope, blob
+
+
 def format_why(pick: Pick) -> str:
     """Human lag+waste table. Same shape as usher `--why`, different axis."""
     sticky = "  sticky" if pick.sticky else ""
@@ -1230,6 +1333,7 @@ def _exec(spec: AgentSpec, prompt: str) -> int:
         sys.stderr.write(
             f"leftover: {spec.key} TUI does not take an argv prompt.\n"
             f"paste this after it starts:\n\n{prompt}\n\n")
+    os.environ["LEFTOVER_SELF"] = spec.key
     os.execvp(binary, [binary, *argv[1:]])
     return 1
 
@@ -1496,8 +1600,8 @@ def main(argv: list[str] | None = None) -> int:
                         heavy=getattr(args, "heavy", False))
 
     dump_pick = (
-        (args.json and not args.headless)
-        or args.command == "pick" or args.pick
+        ((args.json and not args.headless and not args.why)
+         or args.command == "pick" or args.pick)
     )
     if (dump_pick or args.dry_run or args.why or args.headless or args.tui):
         if not text:
@@ -1505,6 +1609,11 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr)
             return 2
         parsed = apply_use(intent_mod.parse(text), args.use)
+        if dump_pick:
+            _, bypass = _pick_scope_blob(args.agent, parsed)
+            if bypass is not None:
+                print(json.dumps(bypass, indent=2, ensure_ascii=False))
+                return 0
         show_routing_progress = (
             args.headless
             and not dump_pick
@@ -1522,9 +1631,20 @@ def main(argv: list[str] | None = None) -> int:
                 print(format_why(pick))
             return 0 if pick.available else 2
         if dump_pick:
+            # A scope toggle can land while quota probes are running. Re-read
+            # immediately before publishing a handoff so the latest disk state
+            # wins rather than the state captured at command start.
+            caller_scope, bypass = _pick_scope_blob(args.agent, parsed)
+            if bypass is not None:
+                print(json.dumps(bypass, indent=2, ensure_ascii=False))
+                return 0
             blob = pick.as_dict()
-            if args.agent:
-                blob["self"] = args.agent
+            self_key = scope_mod.resolve(_caller_token(args.agent))
+            if self_key:
+                blob["self"] = self_key
+            if caller_scope is not None:
+                blob["scope"] = _scope_payload(caller_scope)
+            blob = _suppress_self_handoff(blob, self_key)
             print(json.dumps(blob, indent=2, ensure_ascii=False))
             return 0 if pick.available else 2
         if args.dry_run:

@@ -147,10 +147,25 @@ leftover scope --json
 ```
 
 On a TTY the panel is five rows: `space` toggles, `j`/`k` move, `a` all on,
-`n` none, `q` done. Each toggle immediately links or unlinks
-`~/.codex|/.grok|/.claude|/.cursor|/.agents/skills/leftover/`. Disk is the
-source of truth. `--tui` is still the vendor TUI; this panel is not a second
-chat product.
+`n` none, `q` done. Each toggle updates that CLI's canonical
+`~/.codex|/.grok|/.claude|/.cursor|/.agents/skills/leftover/` link and removes
+an owned pre-rename `skills/macbot/` link. That canonical link is the requested
+state on disk.
+
+Some vendor CLIs cache skills or scan another vendor's compatibility
+directory. For that reason every `--pick --agent <self>` re-checks the
+canonical switch before and after routing. `off` therefore stops the next pick
+even when an old session still remembers the skill: the JSON has
+`scope.active` false and empty `run` / `spawn` / `announce`, so leftover
+cannot spawn leftover. An old skill that passes `--agent ""` gets the same
+bypass. When leftover is on and the chosen agent is the caller, `run` is
+empty so leftover cannot leftover --print itself. A pick that omits
+`--agent` still routes unless leftover is off for every CLI. Text already
+injected into an existing session cannot be removed from its context; start
+a fresh vendor session to remove it completely. A session started while the
+skill was off may also need a restart if that vendor does not hot-reload
+newly linked skills.
+`--tui` is still the vendor TUI; this panel is not a second chat product.
 
 ## Runtime guarantees
 

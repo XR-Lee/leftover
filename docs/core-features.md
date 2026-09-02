@@ -23,7 +23,7 @@ It does not draw a pager, sandbox, diff viewer, or subagent tree. Those stay ins
 | Headless activity | `--print` stderr while the worker runs | `_Progress` / ACP `plan`+thought | `test_progress_is_visible_*`, plan payloads |
 | Headless JSON | `leftover -p --json "…"` | run envelope | `test_print_json_envelope_and_stdin` |
 | Headless timeout | `leftover -p --timeout 2m "…"` | silence since last progress; exit 124 | parse + requires `-p`; busy/in-flight work slides the window (`test_print_long_running_tool_does_not_exit_124`, `test_acp_progress_extends_turn_timeout`) |
-| Skill handoff | `leftover --pick --json --agent $SELF "…"` | `decide`, `Pick.as_dict` | `--agent` vs `--use`, group `run` argv, process-exit completion + parent poll while `--print` lives |
+| Skill handoff | `leftover --pick --json --agent grok "…"` | live scope gate, `decide`, `Pick.as_dict` | off / empty `--agent` / self-pick bypass with null `run`; `--agent` vs `--use`, group `run` argv, process-exit completion + parent poll while `--print` lives |
 | Preview | `macbot --dry-run "…"` | `_print_pick` | pick chain |
 | Why table | `macbot --why "…"` | `format_why` | lag/waste + remaining bar; no strength |
 | Why JSON | `leftover --why --json "…"` | `why_payload` | same columns; not a pick dump |

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
@@ -11,6 +12,17 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Protocol
 from uuid import uuid4
 
 from ..config import AgentSpec
+
+
+def child_env(spec: AgentSpec) -> dict[str, str]:
+    """Environment for a leftover-spawned vendor CLI.
+
+    LEFTOVER_SELF is who leftover already routed. A leftover skill that still
+    runs leftover --pick can pass that as --agent instead of a blank flag.
+    """
+    env = {**os.environ, **spec.env}
+    env["LEFTOVER_SELF"] = spec.key
+    return env
 
 
 @dataclass

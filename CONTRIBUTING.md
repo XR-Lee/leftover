@@ -30,9 +30,15 @@ Python 3.10 through 3.13.
 - `/cu` is Codex only.
 - Cursor stays on `--model grok-4.6`; Antigravity stays on a first-party
   `gemini-*` model. Neither may be pointed at another vendor's models.
-- `leftover --pick --json` `run` is `leftover --print …`, never a vendor TUI.
+- `leftover --pick --json` `run` is `leftover --print …` when leftover is on
+  and the chosen agent is not the caller, never a vendor TUI. When leftover
+  scope is off, `--agent` is empty, or the chosen agent is the caller,
+  `run` / `spawn` / `announce` are empty. Group kinds still return a
+  leftover `--print` `run` even if the caller is on the panel.
 - Classified quota text is a failure, not an answer.
-- `install-skills` writes symlinks. `leftover scope off` unlinks only leftover's own skill path.
+- `install-skills` writes symlinks. `leftover scope off` unlinks leftover's
+  canonical skill path plus leftover-owned legacy `skills/macbot`. A foreign
+  `macbot` skill must survive.
 - Public name is leftover. `macbot` is an alias only.
 - A secret never travels as an argv element. Keychain writes go in on stdin.
 - `/quota` renders in English; its clock is the machine's unless

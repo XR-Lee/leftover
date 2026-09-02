@@ -52,7 +52,8 @@ connection exists.
 | `~/.local/share/leftover/ledger.json` | turn counts used for estimated budgets |
 | `~/.local/share/leftover/history` | REPL readline history |
 | `~/.claude/.credentials.json` (mode `0600`) or Keychain `Claude Code-credentials` | a refreshed Claude OAuth token, written back to whichever store it was read from |
-| `~/.codex/skills/leftover/`, `~/.claude/skills/…`, `~/.agents/skills/…`, `~/.grok/skills/…`, `~/.cursor/skills/…` | leftover skill symlink; `leftover install-skills` / `leftover scope on` create it, `leftover scope off` removes only that leftover path |
+| `~/.codex/skills/leftover/`, `~/.claude/skills/…`, `~/.agents/skills/…`, `~/.grok/skills/…`, `~/.cursor/skills/…` | leftover skill symlink; `leftover install-skills` / `leftover scope on` create it, `leftover scope off` removes it |
+| the same skill roots under legacy `skills/macbot/` | pre-rename leftover installs only; a scope toggle removes the entry only when its symlink target or file markers identify it as leftover-owned |
 
 Nothing is written anywhere else, and nothing is uploaded.
 
